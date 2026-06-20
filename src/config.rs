@@ -43,6 +43,9 @@ pub struct Config {
 
 impl Default for Config {
     fn default() -> Self {
+        #[cfg(windows)]
+        let shell = vec![std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".to_owned())];
+        #[cfg(not(windows))]
         let shell = vec![std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_owned())];
 
         Config {
