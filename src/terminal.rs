@@ -1539,7 +1539,12 @@ impl Engine {
                 HPA => ignore!(),
                 HPR => ignore!(),
                 REP => ignore!(),
-                DA => ignore!(),
+                DA => {
+                    // Primary Device Attributes 応答（VT102 相当）。これを返さ
+                    // ないと fish 等が応答待ちで約10秒フリーズする。
+                    use std::io::Write as _;
+                    FdIo(&self.pty).write_all(b"\x1b[?6c").unwrap();
+                }
                 VPR => ignore!(),
                 TBC => ignore!(),
                 MC => ignore!(),

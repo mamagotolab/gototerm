@@ -43,10 +43,22 @@ impl Font {
             let bitmap = glyph.bitmap();
             let metrics = glyph.metrics();
 
+            let width = bitmap.width() as u32;
+            let height = bitmap.rows() as u32;
+
+            // 空グリフ（スペース等）では freetype の buffer が null になり、
+            // bitmap.buffer() 内の slice::from_raw_parts が新しい rustc の
+            // 非null前提に引っかかって panic する。空のときは触らない。
+            let data = if width == 0 || height == 0 {
+                Vec::new()
+            } else {
+                bitmap.buffer().to_vec()
+            };
+
             let raw_image = RawImage2d {
-                data: bitmap.buffer().to_vec().into(),
-                width: bitmap.width() as u32,
-                height: bitmap.rows() as u32,
+                data: data.into(),
+                width,
+                height,
                 format: glium::texture::ClientFormat::U8,
             };
 

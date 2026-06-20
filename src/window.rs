@@ -1,17 +1,20 @@
-use glium::{glutin, Display};
-use glutin::{
-    dpi::PhysicalPosition,
-    event::{ElementState, ModifiersState, MouseButton, VirtualKeyCode, WindowEvent},
-    event_loop::ControlFlow,
+use winit::{
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
+    event_loop::{ControlFlow, EventLoopWindowTarget},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    window::{CursorIcon, Window},
 };
 
 use crate::terminal::{Mode, Terminal, TerminalSize};
 use crate::view::{TerminalView, Viewport};
+use crate::Display;
 
-type Event = glutin::event::Event<'static, ()>;
+type Event = winit::event::Event<()>;
 type CursorPosition = PhysicalPosition<f64>;
 
 pub struct TerminalWindow {
+    window: Window,
     display: Display,
     terminal: Terminal,
     clipboard: arboard::Clipboard,
@@ -37,18 +40,19 @@ struct MouseState {
 
 impl TerminalWindow {
     #[allow(unused)]
-    pub fn new(display: Display, cwd: Option<&std::path::Path>) -> Self {
-        let size = display.gl_window().window().inner_size();
+    pub fn new(window: Window, display: Display, cwd: Option<&std::path::Path>) -> Self {
+        let size = window.inner_size();
         let full = Viewport {
             x: 0,
             y: 0,
             w: size.width,
             h: size.height,
         };
-        Self::with_viewport(display, full, cwd)
+        Self::with_viewport(window, display, full, cwd)
     }
 
     pub fn with_viewport(
+        window: Window,
         display: Display,
         viewport: Viewport,
         cwd: Option<&std::path::Path>,
@@ -74,12 +78,14 @@ impl TerminalWindow {
         };
 
         // Use I-beam mouse cursor
-        display
-            .gl_window()
-            .window()
-            .set_cursor_icon(glutin::window::CursorIcon::Text);
+        window.set_cursor_icon(CursorIcon::Text);
+
+        // 日本語入力（IME）を有効化する。これを呼ばないと winit が
+        // text-input-v3 を enable せず、fcitx5 等に入力が渡らない。
+        window.set_ime_allowed(true);
 
         TerminalWindow {
+            window,
             display,
             terminal,
             clipboard: arboard::Clipboard::new().expect("clipboard"),
@@ -134,11 +140,11 @@ impl TerminalWindow {
     // Change cursor icon according to the current mouse_track mode
     pub fn refresh_cursor_icon(&mut self) {
         let icon = if self.mode.mouse_track {
-            glutin::window::CursorIcon::Arrow
+            CursorIcon::Default
         } else {
-            glutin::window::CursorIcon::Text
+            CursorIcon::Text
         };
-        self.display.gl_window().window().set_cursor_icon(icon);
+        self.window.set_cursor_icon(icon);
     }
 
     // Returns true if the PTY is closed, false otherwise
@@ -210,13 +216,15 @@ impl TerminalWindow {
                 let cursor = if self.history_head >= 0 && state.mode().cursor_visible {
                     let cursor = state.cursor();
 
-                    self.display
-                        .gl_window()
-                        .window()
-                        .set_ime_position(PhysicalPosition {
-                            x: self.viewport().x + cursor.col as u32 * cell_size.w,
-                            y: self.viewport().y + (cursor.row + 1) as u32 * cell_size.h,
-                        });
+                    // 変換候補ウィンドウをカーソルのセル位置に出すための矩形。
+                    // これにより候補が入力中の文字を隠さない（over-the-spot）。
+                    self.window.set_ime_cursor_area(
+                        PhysicalPosition::new(
+                            self.viewport().x + cursor.col as u32 * cell_size.w,
+                            self.viewport().y + cursor.row as u32 * cell_size.h,
+                        ),
+                        PhysicalSize::new(cell_size.w, cell_size.h),
+                    );
 
                     Some(cursor)
                 } else {
@@ -375,55 +383,50 @@ impl TerminalWindow {
         }
     }
 
-    pub fn on_event(&mut self, event: &Event, control_flow: &mut ControlFlow) {
+    pub fn on_event(&mut self, event: &Event, elwt: &EventLoopWindowTarget<()>) {
         match event {
             Event::WindowEvent { event, .. } => match event {
                 WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
+                    elwt.exit();
                 }
 
                 &WindowEvent::Focused(gain) => self.focus_changed(gain),
 
                 &WindowEvent::Resized(new_size) => {
+                    // glium 0.34 の手書きサーフェスは自動リサイズされない。
+                    // ここで明示的に合わせないと、描画が初期サイズのまま潰れる。
+                    self.display.resize((new_size.width, new_size.height));
                     let mut viewport = self.viewport();
                     viewport.w = new_size.width;
                     viewport.h = new_size.height;
                     self.set_viewport(viewport);
                 }
 
-                &WindowEvent::ModifiersChanged(new_states) => {
-                    self.modifiers = new_states;
+                WindowEvent::ModifiersChanged(new_states) => {
+                    self.modifiers = new_states.state();
                 }
 
-                &WindowEvent::ReceivedCharacter(ch) => {
-                    // Handle these characters on WindowEvent::KeyboardInput event
-                    if ch == '-'
-                        || ch == '='
-                        || ch == '\x7F'
-                        || ch == '\x03'
-                        || ch == '\x08'
-                        || ch == '\x0C'
-                        || ch == '\x16'
-                        || ch == '\x1B'
-                    {
-                        return;
+                // IME（日本語入力など）の状態を処理する。
+                WindowEvent::Ime(ime) => match ime {
+                    // 変換中の未確定文字列。カーソル位置にインライン表示する。
+                    Ime::Preedit(text, _) => {
+                        let text = text.clone();
+                        self.view.update_contents(|view| view.preedit = text);
                     }
-
-                    if ch.is_control() {
-                        log::debug!("input: {:?}", ch);
+                    // 確定した文字列を PTY に流し、変換中表示を消す。
+                    Ime::Commit(text) => {
+                        self.terminal.pty_write(text.as_bytes());
+                        self.view.update_contents(|view| view.preedit.clear());
                     }
+                    Ime::Enabled | Ime::Disabled => {
+                        self.view.update_contents(|view| view.preedit.clear());
+                    }
+                },
 
-                    let mut buf = [0_u8; 4];
-                    let utf8 = ch.encode_utf8(&mut buf).as_bytes();
-                    self.terminal.pty_write(utf8);
-                }
-
-                WindowEvent::KeyboardInput { input, .. }
-                    if input.state == ElementState::Pressed =>
+                WindowEvent::KeyboardInput { event, .. }
+                    if event.state == ElementState::Pressed =>
                 {
-                    if let Some(key) = input.virtual_keycode {
-                        self.on_key_press(key);
-                    }
+                    self.on_key_press(event);
                 }
 
                 WindowEvent::CursorMoved { position, .. } => {
@@ -454,6 +457,7 @@ impl TerminalWindow {
                                 MouseButton::Left => 0,
                                 MouseButton::Middle => 1,
                                 MouseButton::Right => 2,
+                                MouseButton::Back | MouseButton::Forward => 0,
                                 MouseButton::Other(button_id) => {
                                     // FIXME : Support multi button mouse?
                                     log::warn!("unknown mouse button : {}", button_id);
@@ -464,9 +468,9 @@ impl TerminalWindow {
 
                         #[rustfmt::skip]
                         let mods =
-                            if self.modifiers.shift() { 0b00000100 } else { 0 }
-                        |   if self.modifiers.alt()   { 0b00001000 } else { 0 }
-                        |   if self.modifiers.ctrl()  { 0b00010000 } else { 0 };
+                            if self.modifiers.shift_key()   { 0b00000100 } else { 0 }
+                        |   if self.modifiers.alt_key()     { 0b00001000 } else { 0 }
+                        |   if self.modifiers.control_key() { 0b00010000 } else { 0 };
 
                         let CursorPosition { x, y } = self.mouse.cursor_pos;
                         let cell_size = self.view.cell_size();
@@ -502,7 +506,7 @@ impl TerminalWindow {
                 }
 
                 WindowEvent::MouseWheel {
-                    delta: glutin::event::MouseScrollDelta::LineDelta(dx, dy),
+                    delta: MouseScrollDelta::LineDelta(dx, dy),
                     ..
                 } => {
                     let mouse = &mut self.mouse;
@@ -516,7 +520,7 @@ impl TerminalWindow {
                     mouse.wheel_delta_x %= 1.0;
                     mouse.wheel_delta_y %= 1.0;
 
-                    if self.modifiers.shift() {
+                    if self.modifiers.shift_key() {
                         // Scroll up history
                         let state = self.terminal.state.lock().unwrap();
                         let min = -(state.history_size() as isize);
@@ -545,174 +549,133 @@ impl TerminalWindow {
                     }
                 }
 
+                WindowEvent::RedrawRequested => {
+                    let mut surface = self.display.draw();
+                    self.draw(&mut surface);
+                    surface.finish().expect("finish");
+                }
+
                 _ => {}
             },
 
-            Event::MainEventsCleared => {
+            Event::AboutToWait => {
                 if self.check_update() {
-                    *control_flow = ControlFlow::Exit;
+                    elwt.exit();
                     return;
                 }
-                self.display.gl_window().window().request_redraw();
-            }
-
-            Event::RedrawRequested(_) => {
-                let mut surface = self.display.draw();
-                self.draw(&mut surface);
-                surface.finish().expect("finish");
+                // 内容が変わったフレームだけ再描画を要求する。アイドル時は
+                // スワップせず、ウィンドウが隠れていてもループが固まらない。
+                if self.view.needs_redraw() {
+                    self.window.request_redraw();
+                }
+                // 約16ms(=60fps)後に再びポーリングする。Poll の全力空転を避けつつ
+                // PTY 出力を遅延なく拾い、ping にも定期的に応答できる。
+                elwt.set_control_flow(ControlFlow::WaitUntil(
+                    std::time::Instant::now() + std::time::Duration::from_millis(16),
+                ));
             }
 
             _ => {}
         }
     }
 
-    fn on_key_press(&mut self, keycode: VirtualKeyCode) {
-        use ModifiersState as Mod;
-        const EMPTY: u32 = Mod::empty().bits();
-        const CTRL: u32 = Mod::CTRL.bits();
-        const CTRL_SHIFT: u32 = Mod::CTRL.bits() | Mod::SHIFT.bits();
+    fn on_key_press(&mut self, key_event: &KeyEvent) {
+        // Ctrl+英字を制御コード(0x01..=0x1A)へ。ReceivedCharacter 廃止の代替。
+        fn ctrl_letter_code(code: KeyCode) -> Option<u8> {
+            use KeyCode::*;
+            let n: u8 = match code {
+                KeyA => 1, KeyB => 2, KeyC => 3, KeyD => 4, KeyE => 5,
+                KeyF => 6, KeyG => 7, KeyH => 8, KeyI => 9, KeyJ => 10,
+                KeyK => 11, KeyL => 12, KeyM => 13, KeyN => 14, KeyO => 15,
+                KeyP => 16, KeyQ => 17, KeyR => 18, KeyS => 19, KeyT => 20,
+                KeyU => 21, KeyV => 22, KeyW => 23, KeyX => 24, KeyY => 25,
+                KeyZ => 26,
+                _ => return None,
+            };
+            Some(n)
+        }
+
+        let keycode = match key_event.physical_key {
+            PhysicalKey::Code(code) => code,
+            PhysicalKey::Unidentified(_) => return,
+        };
+
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
 
         // normally text selection is cleared when user types something,
         // but there are some exceptions. history_head is cleared too.
         let mut clear = true;
 
-        match (self.modifiers.bits(), keycode) {
-            (EMPTY, VirtualKeyCode::Escape) => {
+        // 制御シーケンスを送る特殊キーを先に処理。handled=false なら
+        // 通常文字として KeyEvent.text をそのまま PTY に流す。
+        let mut handled = true;
+        match (ctrl, shift, keycode) {
+            (false, _, KeyCode::Escape) => {
                 self.history_head = 0;
                 self.mouse.pressed_pos = None;
                 self.mouse.released_pos = None;
                 self.terminal.pty_write(b"\x1B");
             }
 
-            (CTRL, VirtualKeyCode::Minus) => {
-                // font size -
-                self.increase_font_size(-1);
-            }
-            (CTRL, VirtualKeyCode::Equals) => {
-                // font size +
-                self.increase_font_size(1);
-            }
+            (true, false, KeyCode::Minus) => self.increase_font_size(-1),
+            (true, false, KeyCode::Equal) => self.increase_font_size(1),
 
-            // Backspace
-            (EMPTY, VirtualKeyCode::Back) => {
-                // Note: send DEL instead of BS
-                self.terminal.pty_write(b"\x7f");
-            }
+            // Backspace: send DEL instead of BS
+            (false, _, KeyCode::Backspace) => self.terminal.pty_write(b"\x7f"),
+            (false, _, KeyCode::Delete) => self.terminal.pty_write(b"\x1b[3~"),
 
-            (EMPTY, VirtualKeyCode::Delete) => {
-                self.terminal.pty_write(b"\x1b[3~");
-            }
+            (false, _, KeyCode::Enter) => self.terminal.pty_write(b"\r"),
+            (false, _, KeyCode::Tab) => self.terminal.pty_write(b"\t"),
 
-            (EMPTY, VirtualKeyCode::Up) => {
-                self.terminal.pty_write(b"\x1b[\x41");
-            }
-            (EMPTY, VirtualKeyCode::Down) => {
-                self.terminal.pty_write(b"\x1b[\x42");
-            }
-            (EMPTY, VirtualKeyCode::Right) => {
-                self.terminal.pty_write(b"\x1b[\x43");
-            }
-            (EMPTY, VirtualKeyCode::Left) => {
-                self.terminal.pty_write(b"\x1b[\x44");
-            }
+            (false, _, KeyCode::ArrowUp) => self.terminal.pty_write(b"\x1b[\x41"),
+            (false, _, KeyCode::ArrowDown) => self.terminal.pty_write(b"\x1b[\x42"),
+            (false, _, KeyCode::ArrowRight) => self.terminal.pty_write(b"\x1b[\x43"),
+            (false, _, KeyCode::ArrowLeft) => self.terminal.pty_write(b"\x1b[\x44"),
 
-            (EMPTY, VirtualKeyCode::PageUp) => {
-                self.terminal.pty_write(b"\x1b[5~");
-            }
-            (EMPTY, VirtualKeyCode::PageDown) => {
-                self.terminal.pty_write(b"\x1b[6~");
-            }
+            (false, _, KeyCode::PageUp) => self.terminal.pty_write(b"\x1b[5~"),
+            (false, _, KeyCode::PageDown) => self.terminal.pty_write(b"\x1b[6~"),
 
-            (EMPTY, VirtualKeyCode::Minus) => {
-                self.terminal.pty_write(b"-");
-            }
-            (EMPTY, VirtualKeyCode::Equals) => {
-                self.terminal.pty_write(b"=");
-            }
-
-            (CTRL, VirtualKeyCode::C) => {
-                self.terminal.pty_write(b"\x03");
-            }
-
-            (CTRL_SHIFT, VirtualKeyCode::C) => {
+            // Ctrl+Shift+C/V/L: コピー・ペースト・履歴クリア
+            (true, true, KeyCode::KeyC) => {
                 clear = false;
                 self.copy_clipboard();
             }
-
-            (CTRL, VirtualKeyCode::V) => {
-                self.terminal.pty_write(b"\x16");
-            }
-
-            (CTRL_SHIFT, VirtualKeyCode::V) => {
-                self.paste_clipboard();
-            }
-
-            (CTRL, VirtualKeyCode::L) => {
-                self.terminal.pty_write(b"\x0c");
-            }
-
-            (CTRL_SHIFT, VirtualKeyCode::L) => {
+            (true, true, KeyCode::KeyV) => self.paste_clipboard(),
+            (true, true, KeyCode::KeyL) => {
                 self.history_head = 0;
                 let mut state = self.terminal.state.lock().unwrap();
                 state.clear_history();
             }
 
-            (EMPTY, VirtualKeyCode::F1) => {
-                self.terminal.pty_write(b"\x1BOP");
-            }
-            (EMPTY, VirtualKeyCode::F2) => {
-                self.terminal.pty_write(b"\x1BOQ");
-            }
-            (EMPTY, VirtualKeyCode::F3) => {
-                self.terminal.pty_write(b"\x1BOR");
-            }
-            (EMPTY, VirtualKeyCode::F4) => {
-                self.terminal.pty_write(b"\x1BOS");
-            }
-            (EMPTY, VirtualKeyCode::F5) => {
-                self.terminal.pty_write(b"\x1B[15~");
-            }
-            (EMPTY, VirtualKeyCode::F6) => {
-                self.terminal.pty_write(b"\x1B[17~");
-            }
-            (EMPTY, VirtualKeyCode::F7) => {
-                self.terminal.pty_write(b"\x1B[18~");
-            }
-            (EMPTY, VirtualKeyCode::F8) => {
-                self.terminal.pty_write(b"\x1B[19~");
-            }
-            (EMPTY, VirtualKeyCode::F9) => {
-                self.terminal.pty_write(b"\x1B[20~");
-            }
-            (EMPTY, VirtualKeyCode::F10) => {
-                self.terminal.pty_write(b"\x1B[21~");
-            }
-            (EMPTY, VirtualKeyCode::F11) => {
-                self.terminal.pty_write(b"\x1B[23~");
-            }
-            (EMPTY, VirtualKeyCode::F12) => {
-                self.terminal.pty_write(b"\x1B[24~");
-            }
-            (EMPTY, VirtualKeyCode::F13) => {
-                self.terminal.pty_write(b"\x1B[1;2P");
-            }
-            (EMPTY, VirtualKeyCode::F14) => {
-                self.terminal.pty_write(b"\x1B[1;2Q");
-            }
-            (EMPTY, VirtualKeyCode::F15) => {
-                self.terminal.pty_write(b"\x1B[1;2R");
-            }
-            (EMPTY, VirtualKeyCode::F16) => {
-                self.terminal.pty_write(b"\x1B[1;2S");
-            }
+            (false, _, KeyCode::F1) => self.terminal.pty_write(b"\x1BOP"),
+            (false, _, KeyCode::F2) => self.terminal.pty_write(b"\x1BOQ"),
+            (false, _, KeyCode::F3) => self.terminal.pty_write(b"\x1BOR"),
+            (false, _, KeyCode::F4) => self.terminal.pty_write(b"\x1BOS"),
+            (false, _, KeyCode::F5) => self.terminal.pty_write(b"\x1B[15~"),
+            (false, _, KeyCode::F6) => self.terminal.pty_write(b"\x1B[17~"),
+            (false, _, KeyCode::F7) => self.terminal.pty_write(b"\x1B[18~"),
+            (false, _, KeyCode::F8) => self.terminal.pty_write(b"\x1B[19~"),
+            (false, _, KeyCode::F9) => self.terminal.pty_write(b"\x1B[20~"),
+            (false, _, KeyCode::F10) => self.terminal.pty_write(b"\x1B[21~"),
+            (false, _, KeyCode::F11) => self.terminal.pty_write(b"\x1B[23~"),
+            (false, _, KeyCode::F12) => self.terminal.pty_write(b"\x1B[24~"),
 
-            (_, keycode) => {
-                log::trace!("key pressed: ({:?}) {:?}", self.modifiers, keycode);
+            // Ctrl+英字（Shiftなし）は制御コードへ。Ctrl+C/L/V もここで処理。
+            (true, false, code) => match ctrl_letter_code(code) {
+                Some(b) => self.terminal.pty_write(&[b]),
+                None => handled = false,
+            },
 
-                use VirtualKeyCode::*;
-                if let LControl | RControl | LShift | RShift = keycode {
-                    clear = false;
-                }
+            _ => handled = false,
+        }
+
+        if !handled {
+            match &key_event.text {
+                // 通常文字（英数字・記号・全角等の非IME入力）をそのまま送る
+                Some(text) => self.terminal.pty_write(text.as_bytes()),
+                // 修飾キー単体などテキストを生まないキーでは選択を消さない
+                None => clear = false,
             }
         }
 

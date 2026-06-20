@@ -119,7 +119,7 @@ fn find_config_file() -> Option<PathBuf> {
             Some(p)
         })?;
 
-    xdg_config_home.push("toyterm");
+    xdg_config_home.push("gototerm");
     xdg_config_home.push("config.toml");
     Some(xdg_config_home)
 }

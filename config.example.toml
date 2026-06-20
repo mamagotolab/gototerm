@@ -1,0 +1,39 @@
+# gototerm 設定例（日本語・半透明・Ghostty 風）
+# -----------------------------------------------------------------------------
+# このファイルを ~/.config/gototerm/config.toml にコピーして使ってください。
+#   mkdir -p ~/.config/gototerm
+#   cp config.example.toml ~/.config/gototerm/config.toml
+#
+# 書いた項目だけがデフォルト値を上書きします（全項目は src/config.rs を参照）。
+# 色は RRGGBBAA 形式。末尾2桁がアルファ（FF=不透明 〜 00=完全透明）。
+# -----------------------------------------------------------------------------
+
+# フォント（先頭=主フォント、2番目以降=フォールバック）
+# 英数字・アイコン用に等幅フォント、日本語用に Noto Sans CJK JP を併用する。
+# これらに無いグリフは、埋め込みの M PLUS 1 Code が最終フォールバックになる。
+#
+# ※パスはディストリによって異なる。自分の環境の実体を確認して書き換えること:
+#     fc-match -f '%{file}\n' 'JetBrainsMono Nerd Font'
+#     fc-match -f '%{file}\n' 'Noto Sans CJK JP'
+fonts_regular = [
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+]
+fonts_bold = [
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Bold.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+]
+fonts_faint = [
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+]
+
+# 文字サイズ（ピクセル）。ディスプレイのスケールに応じて調整する。
+# 起動後に Ctrl+= / Ctrl+- でライブ調整も可能。
+font_size = 17
+
+# 背景の不透明度。末尾2桁 = アルファ。
+# CC = 204/255 = 0.80（背景を80%不透明＝20%透過）。コンポジタ側のブラーと
+# 併用すると Ghostty の background-opacity = 0.80 とほぼ同じ見た目になる。
+# 完全不透明にするなら末尾を FF（0x000000FF）にする。
+color_background = 0x000000CC

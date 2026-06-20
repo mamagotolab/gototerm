@@ -1,5 +1,6 @@
-use glium::{glutin, index, texture, uniform, uniforms, Display};
-use glutin::dpi::{PhysicalPosition, PhysicalSize};
+use crate::Display;
+use glium::{index, texture, uniform, uniforms};
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::rc::Rc;
@@ -47,6 +48,8 @@ pub struct TerminalView {
     pub lines: Vec<Line>,
     pub images: Vec<PositionedImage>,
     pub cursor: Option<Cursor>,
+    // IME 変換中（未確定）の文字列。確定すると空になる。
+    pub preedit: String,
     pub selection_range: Option<(usize, usize)>,
     pub scroll_bar: Option<(u32, u32)>,
     pub bg_color: Color,
@@ -87,8 +90,8 @@ impl TerminalView {
         let draw_params = glium::DrawParameters {
             blend: glium::Blend::alpha_blending(),
             viewport: {
-                let inner_size = display.gl_window().window().inner_size();
-                Some(viewport.to_glium_rect(inner_size))
+                let (w, h) = display.get_framebuffer_dimensions();
+                Some(viewport.to_glium_rect(PhysicalSize::new(w, h)))
             },
             ..glium::DrawParameters::default()
         };
@@ -134,6 +137,7 @@ impl TerminalView {
             lines: Vec::new(),
             images: Vec::new(),
             cursor: None,
+            preedit: String::new(),
             selection_range: None,
             scroll_bar,
             bg_color: Color::Black,
@@ -161,6 +165,13 @@ impl TerminalView {
         self.updated = true;
     }
 
+    /// 再描画が必要か（前回の draw 以降に内容が変わったか）。
+    /// 変化が無いフレームでスワップしないことで、ウィンドウが隠れたときの
+    /// 「コンポジタ待ちでスワップがブロック→無応答」を防ぐ。
+    pub fn needs_redraw(&self) -> bool {
+        self.updated
+    }
+
     pub fn viewport(&self) -> Viewport {
         self.viewport
     }
@@ -169,8 +180,8 @@ impl TerminalView {
         log::debug!("viewport changed: {:?}", new_viewport);
         self.viewport = new_viewport;
 
-        let inner_size = self.display.gl_window().window().inner_size();
-        self.draw_params.viewport = Some(self.viewport.to_glium_rect(inner_size));
+        let (w, h) = self.display.get_framebuffer_dimensions();
+        self.draw_params.viewport = Some(self.viewport.to_glium_rect(PhysicalSize::new(w, h)));
 
         self.updated = true;
     }
@@ -458,17 +469,89 @@ impl TerminalView {
             }
         }
 
-        let vb_fg = glium::VertexBuffer::new(&self.display, &self.vertices_fg).unwrap();
-        self.draw_queries_fg.push(DrawQuery {
-            vertices: vb_fg,
-            texture: texture.clone(),
-        });
+        // IME 変換中の文字列（preedit）をカーソル位置にインライン描画する。
+        // 確定前であることが分かるよう、各文字を下線つきで重ねて描く。
+        if !self.preedit.is_empty() {
+            if let Some(cursor) = self.cursor {
+                use unicode_width::UnicodeWidthChar;
 
-        let vb_bg = glium::VertexBuffer::new(&self.display, &self.vertices_bg).unwrap();
-        self.draw_queries_bg.push(DrawQuery {
-            vertices: vb_bg,
-            texture,
-        });
+                let style = FontStyle::Regular;
+                let row = cursor.row as u32;
+                let baseline = self.cell_max_over as u32 + row * cell_size.h;
+                let mut leftline = cursor.col as u32 * cell_size.w;
+
+                let fg = Color::White;
+                let bg = self.bg_color;
+
+                for ch in self.preedit.chars() {
+                    let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+                    if ch_width == 0 {
+                        continue;
+                    }
+                    let cell_width_px = cell_size.w * ch_width as u32;
+
+                    // 背景（カーソルブロック等を塗りつぶす）
+                    let rect = PixelRect {
+                        x: leftline as i32,
+                        y: (row * cell_size.h) as i32,
+                        w: cell_width_px,
+                        h: cell_size.h,
+                    };
+                    let vs = rect_vertices(rect.to_gl(viewport), fg, bg);
+                    self.vertices_bg.extend_from_slice(&vs);
+
+                    // 下線（変換中の目印）
+                    let underline = PixelRect {
+                        x: leftline as i32,
+                        y: ((row + 1) * cell_size.h) as i32 - 2,
+                        w: cell_width_px,
+                        h: 2,
+                    };
+                    let vs = rect_vertices(underline.to_gl(viewport), fg, fg);
+                    self.vertices_fg.extend_from_slice(&vs);
+
+                    // グリフ
+                    if let Ok(Some((region, metrics))) =
+                        self.cache.get_or_insert(ch, style, &self.fonts, timestamp)
+                    {
+                        if !region.is_empty() {
+                            let bearing_x = (metrics.horiBearingX >> 6) as u32;
+                            let bearing_y = (metrics.horiBearingY >> 6) as u32;
+                            let rect = PixelRect {
+                                x: leftline as i32 + bearing_x as i32,
+                                y: baseline as i32 - bearing_y as i32,
+                                w: region.w,
+                                h: region.h,
+                            };
+                            let gl_rect = rect.to_gl(viewport);
+                            let uv_rect = region.to_uv(texture.width(), texture.height());
+                            let vs = glyph_vertices(gl_rect, uv_rect, fg, bg, 0);
+                            self.vertices_fg.extend_from_slice(&vs);
+                        }
+                    }
+
+                    leftline += cell_width_px;
+                }
+            }
+        }
+
+        // glium 0.34 では空スライスから VertexBuffer を作るとエラーになり、
+        // unwrap で落ちる。頂点が無いフレーム（起動直後など）は積まない。
+        if !self.vertices_fg.is_empty() {
+            let vb_fg = glium::VertexBuffer::new(&self.display, &self.vertices_fg).unwrap();
+            self.draw_queries_fg.push(DrawQuery {
+                vertices: vb_fg,
+                texture: texture.clone(),
+            });
+        }
+
+        if !self.vertices_bg.is_empty() {
+            let vb_bg = glium::VertexBuffer::new(&self.display, &self.vertices_bg).unwrap();
+            self.draw_queries_bg.push(DrawQuery {
+                vertices: vb_bg,
+                texture,
+            });
+        }
 
         self.updated = false;
     }
@@ -488,12 +571,24 @@ impl TerminalView {
 
         use glium::Surface as _;
 
+        // フレームバッファ全体を背景色でクリアする。ビューポート矩形と
+        // フレームバッファ実サイズがズレても、右端・下端がちらつかない。
+        {
+            let bg = color_to_rgba(self.bg_color);
+            let r = ((bg >> 24) & 0xff) as f32 / 255.0;
+            let g = ((bg >> 16) & 0xff) as f32 / 255.0;
+            let b = ((bg >> 8) & 0xff) as f32 / 255.0;
+            let a = (bg & 0xff) as f32 / 255.0;
+            surface.clear_color_srgb(r, g, b, a);
+        }
+
         for query in iter_bg.chain(iter_fg) {
+            // 文字は等倍で描くので Nearest にしてにじみを抑え、輪郭をくっきりさせる。
             let sampler = query
                 .texture
                 .sampled()
-                .magnify_filter(uniforms::MagnifySamplerFilter::Linear)
-                .minify_filter(uniforms::MinifySamplerFilter::Linear);
+                .magnify_filter(uniforms::MagnifySamplerFilter::Nearest)
+                .minify_filter(uniforms::MinifySamplerFilter::Nearest);
             let uniforms = uniform! { tex: sampler, timestamp: elapsed };
 
             surface

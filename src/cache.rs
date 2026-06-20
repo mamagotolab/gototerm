@@ -1,5 +1,6 @@
 use freetype::GlyphMetrics;
-use glium::{texture, Display};
+use crate::Display;
+use glium::texture;
 use lru::LruCache;
 use std::rc::Rc;
 
