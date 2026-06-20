@@ -1,195 +1,157 @@
-# toyterm
+# gototerm
 
-toyterm is a toy terminal emulator for Linux.
+**日本語入力のストレスが少ない、軽量ターミナルエミュレータ。**
 
-![screenshot02.png](docs/screenshot02.png)
+gototerm（ゴートターム）は、日本語を打つ人のために作られた Linux 向けターミナルです。
+変換中の文字がカーソル位置にそのまま表示され、変換候補も入力位置に出る ——
+「いつもの端末は日本語入力がもたつく・ズレる」という小さなストレスを減らすことを第一に設計しています。
 
-## Features/Limitations
+> [algon-320 氏の toyterm](https://github.com/algon-320/toyterm)（MIT License）をベースに、
+> モダンな Wayland 環境への対応と日本語入力まわりを大きく作り直したフォークです。
 
-- hardware accelerated graphics
-- support for SIXEL graphics
-- support for X11 clipboard (copying & pasting)
-- manual font fallback: you can specify the order of fonts for each style
-- support for mouse reporting
-- (optional) support for multiplexing
-- toyterm assumes UTF-8 encoding
-- following basic functions are TODO
-    - automatic font selection by integrating with fontconfig
-    - support for operating systems other than Linux
+---
 
-## Usage
+## なぜ gototerm か
 
-To install:
+- **日本語入力が素直** — 変換中の文字（preedit）を端末内のカーソル位置にインライン表示。変換候補もカーソルに追従（fcitx5 等の Wayland text-input-v3 に対応）。
+- **軽い** — GPU 必須の重量級端末に比べてメモリが小さい（実測でメモリ約 1/3、バイナリも約半分）。
+- **半透明＋ぼかし対応** — 背景の不透明度を細かく指定でき、Wayland コンポジタのブラーと相性良し。
+- **全角幅に配慮** — East Asian Width（曖昧幅）を設定で切り替え可能。日本語の表組みが崩れにくい。
+
+---
+
+## インストール
+
+### 必要なもの
+
+- Rust ツールチェイン（`cargo`）
+- FreeType / fontconfig（フォント描画）
+- Wayland 環境（X11 でも XWayland 経由で動作）
+
+### ビルドと導入
+
 ```sh
-$ git clone https://github.com/algon-320/toyterm
-$ cd toyterm
-$ tic -x -o "$HOME/.terminfo/" toyterm.info
-$ cargo install --path .
+git clone <このリポジトリ>
+cd gototerm
+
+# ① terminfo を必ず入れる（重要）
+tic -x toyterm.info
+
+# ② ビルド＆インストール
+cargo install --path .
 ```
 
-- To enable multiplexing feature, please add "--features multiplex" to the last line.
-- To install the terminfo globally, please do `$ sudo tic -x toyterm.info` instead.
+> ⚠️ **terminfo（`tic -x toyterm.info`）は必須です。**
+> これを入れないと nvim 等のアプリが端末の能力を認識できず、
+> 画面に `B` のような文字が大量に漏れて崩れます。最初に必ず実行してください。
+> （`TERM=toyterm-256color` として動作します。グローバル導入は `sudo tic -x toyterm.info`）
 
-To configure:
+---
+
+## 設定マニュアル
+
+設定ファイルは **`~/.config/gototerm/config.toml`** です。自動生成されないので自分で作成します。
+同梱の [`config.example.toml`](./config.example.toml) をコピーするのが簡単です。
+
 ```sh
-$ mkdir -p "$HOME/.config/toyterm"
-$ cp ./config.toml "$HOME/.config/toyterm"
-$ $EDITOR "$HOME/.config/toyterm/config.toml"
+mkdir -p ~/.config/gototerm
+cp config.example.toml ~/.config/gototerm/config.toml
 ```
 
-To uninstall:
-```sh
-$ rm "$HOME/.terminfo/t/toyterm-256color"
-$ cargo uninstall toyterm
-$ rm -r "$HOME/.config/toyterm"
+書いた項目だけがデフォルト値を上書きします。
+
+### フォント
+
+`fonts_*` には**フォントファイルの絶対パス**を配列で指定します（フォント名ではありません）。
+先頭が主フォント、2 番目以降がフォールバック。これらに無いグリフは内蔵フォント（M PLUS 1 Code）が最終フォールバックになります。
+
+```toml
+fonts_regular = [
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",  # 英数字・アイコン
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",       # 日本語
+]
+fonts_bold  = [ "...Bold.ttf",   "...Bold.ttc" ]
+fonts_faint = [ "...Regular.ttf", "...Regular.ttc" ]
 ```
 
-- If you would like to remove the globally installed terminfo, please try `$ sudo rm /usr/share/terminfo/t/toyterm-256color` too.
+パスは環境で異なります。実体は次で確認できます:
 
-## Keybinding
+```sh
+fc-match -f '%{file}\n' 'JetBrainsMono Nerd Font'
+fc-match -f '%{file}\n' 'Noto Sans CJK JP'
+```
 
-|Key|Function|
-|:----------|:-------|
-|Ctrl + `-` |Decrease font size|
-|Ctrl + `=` |Increase font size|
-|Ctrl + Shift + `c` |Copy selected text|
-|Ctrl + Shift + `v` |Paste clipboard text|
-|Ctrl + Shift + `l` |Clear history|
-|Up key|Send `\x1b[[A`|
-|Down key|Send `\x1b[[B`|
-|Right key|Send `\x1b[[C`|
-|Left key|Send `\x1b[[D`|
-|PageUp key|Send `\x1b[5~`|
-|PageDown key|Send `\x1b[6~`|
-|Delete key|Send `\x1b[3~`|
-|Backspace key|Send `\x7f`|
-|Mouse Wheel|Same effect as arrow keys (Up/Down/Right/Left)|
-|Shift + Mouse Wheel|Scroll history|
+### 文字サイズ・その他
 
-If feature `multiplex` is enalbed:
-|Key|Function|
-|:---------------|:-------|
-|Ctrl + `a`, `c` |Create a new window|
-|Ctrl + `a`, `n` |Switch to next window|
-|Ctrl + `a`, `p` |Switch to prev window|
-|Ctrl + `a`, `%` |Split current pane vertically|
-|Ctrl + `a`, `"` |Split current pane horizontally|
-|Ctrl + `a`, `z` |Maximize current pane|
-|Ctrl + `a`, `s` |Save current layout|
-|Ctrl + `a`, `r` |Restore saved layout|
-|Ctrl + `a`, `x` |Close currently focused pane|
-|Ctrl + `a`, Up/Down/Left/Right |Focus up/down/left/right pane|
-|Ctrl + `a`, Ctrl + Up |Move the partition up (i.e. Decrease the width of upper pane)|
-|Ctrl + `a`, Ctrl + Down |Move the partition down (i.e. Increase the width of upper pane)|
-|Ctrl + `a`, Ctrl + Left |Move the partition left (i.e. Decrease the width of left pane)|
-|Ctrl + `a`, Ctrl + Right |Move the partition right (i.e. Increase the width of right pane)|
-|Ctrl + `a`, Ctrl + `a` |Send `\x01` (Ctrl + `a`)|
+```toml
+font_size = 17                     # ピクセル。スケールに応じて調整。Ctrl+= / Ctrl+- でライブ変更も可
+shell = ["/usr/bin/fish"]          # 起動するシェル（省略時は $SHELL）
+east_asian_width_ambiguous = 1     # 曖昧幅文字を全角(2マス)扱いなら 1、半角扱いなら 0
+scroll_bar_width = 5               # スクロールバーの幅(px)。0 で非表示
+```
 
-## Control Functions
+---
 
-toyterm aims to support the standard control functions described in
-[ECMA-48](https://www.ecma-international.org/publications-and-standards/standards/ecma-48/).
-Some private functions, widely used by modern terminals, may be supported as well.
-Currently toyterm supports the following functions.
+## 色の設定
 
-### C0 functions
+色はすべて **`0xRRGGBBAA`**（赤・緑・青・**アルファ**）の 32bit 整数で指定します。
+末尾 2 桁の **アルファ**が不透明度で、`FF` = 不透明、`00` = 完全透明です。
 
-- BS
-- CR
-- ESC
-- FF
-- HT
-- LF
-- VT
+### 背景の半透明（不透明度）
 
-### C1 functions
+`color_background` の末尾 2 桁で透け具合を決めます。Wayland コンポジタ側のブラーと併用すると綺麗です。
 
-- CSI
+```toml
+color_background = 0x000000B0   # B0 = 176/255 ≈ 0.69（約 30% 透過）
+# 目安: FF=不透明 / CC≈0.80 / B0≈0.69 / A0≈0.63 / 80=半分
+```
 
-### Control Sequences
+### 配色（前景・選択・16 色）
 
-- CHA
-- CUB
-- CUD
-- CUF
-- CUP
-- CUU
-- DCH
-- DL
-- DSR
-- ECH
-- ED
-- EL
-- HVP
-- ICH
-- IL
-- RM
-- SGR
-    - Default: `\e[0m`, `\e[m`
-    - Bold: `\e[1m`
-    - Faint: `\e[2m`
-    - Blinking (slow): `\e[5m`
-    - Blinking (rapid): `\e[6m`
-    - Negative: `\e[7m`
-    - Consealed: `\e[8m`
-    - Foreground Black, Red, Green, Yellow, Blue, Magenta, Cyan, White: `\e[30m`..`\e[37m`
-    - Foreground Black, Red, Green, Yellow, Blue, Magenta, Cyan, White (Bright): `\e[90m`..`\e[97m`
-    - Foreground Default: `\e[39m`
-    - Foreground Gaming: `\e[70m`
-    - Foreground RGB: `\e[38;2;{R};{G};{B}m`
-    - Foreground 256 color: `\e[38;5;{idx}m`
-    - Background Black, Red, Green, Yellow, Blue, Magenta, Cyan, White: `\e[40m`..`\e[47m`
-    - Background Black, Red, Green, Yellow, Blue, Magenta, Cyan, White (Bright): `\e[100m`..`\e[107m`
-    - Background Default: `\e[49m`
-    - Background Gaming: `\e[80m`
-    - Background RGB: `\e[48;2;{R};{G};{B}m`
-    - Background 256 color: `\e[48;5;{idx}m`
-- SM
-- VPA
+| 設定キー | 役割 | 既定値 |
+|---|---|---|
+| `color_foreground` | 文字色 | `0xFFFFFFFF` |
+| `color_background` | 背景色（＋透過） | `0x000000FF` |
+| `color_selection` | 選択範囲の背景 | `0x505050FF` |
+| `color_black` 〜 `color_white` | 通常の 8 色 | ANSI 標準 |
+| `color_bright_black` 〜 `color_bright_white` | 明るい 8 色 | ANSI 標準 |
+| `scroll_bar_fg_color` / `scroll_bar_bg_color` | スクロールバー | 灰系 |
 
-- SetScrollRegion (DECSTBM): `\e[{top};{bottom}r`
-- SelectCursorStyle:
-    - Default (Block): `\e[0 q`
-    - Block: `\e[2 q`
-    - Underline: `\e[4 q`
-    - Bar: `\e[6 q`
+一部だけ上書きする例（Tokyo Night 風）:
 
-## Device Control Function
+```toml
+color_foreground = 0xC0CAF5FF
+color_green      = 0x9ECE6AFF
+color_blue       = 0x7AA2F7FF
+color_magenta    = 0xBB9AF7FF
+```
 
-- DCS `q` (sixel string...) ST
-    - see <https://www.vt100.net/docs/vt3xx-gp/chapter14.html> for the representation
+---
 
-### Other Sequences
+## キー操作
 
-- SaveCursor (DECSC): `\e7`
-- RestoreCursor (DECRC): `\e8`
+| キー | 動作 |
+|---|---|
+| `Ctrl + =` / `Ctrl + -` | フォント拡大 / 縮小 |
+| `Ctrl + Shift + C` / `Ctrl + Shift + V` | コピー / ペースト |
+| `Ctrl + Shift + L` | スクロールバックの履歴を消去 |
+| `Shift + マウスホイール` | 履歴スクロール |
 
-## Modes
+---
 
-toyterm supports the following modes.
+## 対応・非対応
 
-- Cursor Visible Mode (`?25`)
-    - Set: cursor is visible.
-    - Reset: cursor is invisible.
-- Sixel Scrolling Mode (`?80`)
-    - Set: a sixel image is displayed at the current cursor position.
-    - Reset: a sixel image is displayed at the upper left corner of the screen.
-- Normal Mouse Tracking (`?1000`)
-    - Set: enable sending mouse report
-    - Reset: disable sending mouse report
-- SGR Extended Mode Mouse Tracking (`?1006`)
-    - Set: enable SGR extended mode mouse tracking, change response of mouse click
-    - Reset: disable SGR extended mode mouse tracking
-- Alternate Screen Buffer Mode (`?1049`)
-    - Set: clear the screen, save the cursor position, and switch to the alternate screen.
-    - Reset: restore the saved cursor position, and switch back to the primary screen.
-- Bracketed Paste Mode (`?2004`)
-    - Set: insert `\x1b[200~` at the beginning and `\x1b[201~` at the end of a pasted text.
-    - Reset: a pasted text is send to the terminal as if it was typed by user.
+- ✅ 日本語入力（IME・インライン変換）、UTF-8、SIXEL 画像、マウスレポート、ハードウェア描画
+- ✅ ECMA-48 準拠の主要な制御機能、SGR（RGB / 256 色）、Alternate Screen、Bracketed Paste 等
+- ⚠️ VT 対応は実用十分だが完全ではない。重い装飾系 TUI プラグインでは表示が崩れることがある
+- ⚠️ 現状 Linux 専用（Windows 対応は作業中）
 
-## License
+---
 
-This software is licensed under MIT License.
+## ライセンス・謝辞
 
-The embedded fonts (M PLUS 1 Code) are redistributed under the Open Font License (OFL).
-See also `src/font/OFL.txt` for more details.
+MIT License。本ソフトウェアは [algon-320 氏の toyterm](https://github.com/algon-320/toyterm)
+（Copyright 2022 algon-320, MIT License）をベースにしています。元の著作権表示は `LICENSE` に保持しています。
+
+内蔵フォント（M PLUS 1 Code）は Open Font License (OFL) で再配布しています。
+詳細は `src/font/OFL.txt` を参照してください。
