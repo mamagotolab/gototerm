@@ -1,16 +1,18 @@
-use nix::errno::Errno;
-use nix::unistd::Pid;
 use std::cmp::{max, min};
 use std::collections::VecDeque;
-use std::io::Result;
+use std::io::{Read as _, Write as _};
 use std::ops::{Range, RangeBounds};
-use std::os::unix::io::{AsRawFd as _, FromRawFd as _, OwnedFd};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
+use portable_pty::{Child, ChildKiller, CommandBuilder, MasterPty, PtySize};
+
 use crate::control_function;
-use crate::pipe_channel;
-use crate::utils::io::FdIo;
 use crate::utils::utf8;
+
+/// PTY master への書き込み口。入力（メインスレッド）と各種応答（読取スレッド）の
+/// 両方から使うため Arc<Mutex> で共有する。
+type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
 
 #[derive(Debug, Clone)]
 pub struct PositionedImage {
@@ -538,39 +540,48 @@ enum Command {
         buff_sz: TerminalSize,
         cell_sz: CellSize,
     },
-    SendSigterm,
 }
 
-#[derive(Debug)]
 pub struct Terminal {
-    pty: OwnedFd,
-    control_req: pipe_channel::Sender<Command>,
-    control_res: pipe_channel::Receiver<i32>,
+    writer: SharedWriter,
+    master: Box<dyn MasterPty + Send>,
+    killer: Box<dyn ChildKiller + Send + Sync>,
+    control_tx: mpsc::Sender<Command>,
+    #[allow(dead_code)]
+    cell_sz: CellSize,
     pub state: Arc<Mutex<State>>,
 }
 
 impl Terminal {
     pub fn new(size: TerminalSize, cell_size: CellSize, cwd: &std::path::Path) -> Self {
-        let (pty, child_pid) = init_pty(cwd).unwrap();
+        let pty_system = portable_pty::native_pty_system();
+        let pair = pty_system.openpty(pty_size(size, cell_size)).expect("openpty");
 
-        let (control_req_tx, control_req_rx) = pipe_channel::channel();
-        let (control_res_tx, control_res_rx) = pipe_channel::channel();
+        // シェルを起動する
+        let mut child = pair
+            .slave
+            .spawn_command(build_command(cwd))
+            .expect("spawn shell");
+        let killer = child.clone_killer();
 
-        let engine = Engine::new(
-            child_pid,
-            pty.try_clone().expect("dup"),
-            control_req_rx,
-            control_res_tx,
-            size,
-            cell_size,
-        );
-        let state = engine.state();
+        let reader = pair.master.try_clone_reader().expect("pty reader");
+        let writer: SharedWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer")));
+        let master = pair.master;
+        // slave を閉じ、子プロセス終了時に reader が EOF を受け取れるようにする
+        drop(pair.slave);
+
+        let state = Arc::new(Mutex::new(State::new(size)));
+        let (control_tx, control_rx) = mpsc::channel();
+
+        let engine = Engine::new(reader, writer.clone(), control_rx, child, size, cell_size, state.clone());
         std::thread::spawn(move || engine.start());
 
         Terminal {
-            pty,
-            control_req: control_req_tx,
-            control_res: control_res_rx,
+            writer,
+            master,
+            killer,
+            control_tx,
+            cell_sz: cell_size,
             state,
         }
     }
@@ -578,19 +589,19 @@ impl Terminal {
     /// Writes the given data on PTY master
     pub fn pty_write(&mut self, data: &[u8]) {
         log::trace!("pty_write: {:x?}", data);
-        use std::io::Write as _;
-        FdIo(&self.pty).write_all(data).unwrap();
+        let _ = self.writer.lock().unwrap().write_all(data);
     }
 
     pub fn request_resize(&mut self, buff_sz: TerminalSize, cell_sz: CellSize) {
         log::debug!("request_resize: {}x{} (cell)", buff_sz.rows, buff_sz.cols);
-        self.control_req.send(Command::Resize { buff_sz, cell_sz });
-        self.control_res.recv();
+        // カーネル側の端末サイズを即時更新（子へ SIGWINCH が飛ぶ）
+        let _ = self.master.resize(pty_size(buff_sz, cell_sz));
+        // グリッド側のリサイズは読取スレッドへ依頼（次の出力を解釈する前に適用）
+        let _ = self.control_tx.send(Command::Resize { buff_sz, cell_sz });
     }
 
     pub fn send_sigterm(&mut self) {
-        self.control_req.send(Command::SendSigterm);
-        self.control_res.recv();
+        let _ = self.killer.kill();
     }
 
     pub fn exit_status(&self) -> Option<i32> {
@@ -599,8 +610,8 @@ impl Terminal {
     }
 
     #[cfg(feature = "multiplex")]
-    pub fn get_pgid(&self) -> Pid {
-        nix::unistd::tcgetpgrp(self.pty.as_raw_fd()).expect("tcgetpgrp")
+    pub fn get_pgid(&self) -> i32 {
+        self.master.process_group_leader().unwrap_or(-1)
     }
 }
 
@@ -684,10 +695,10 @@ impl Cursor {
 }
 
 struct Engine {
-    pid: Pid,
-    pty: OwnedFd,
-    control_req: pipe_channel::Receiver<Command>,
-    control_res: pipe_channel::Sender<i32>,
+    reader: Box<dyn std::io::Read + Send>,
+    writer: SharedWriter,
+    control_rx: mpsc::Receiver<Command>,
+    child: Box<dyn Child + Send + Sync>,
     cell_sz: CellSize,
     state: Arc<Mutex<State>>,
     parser: control_function::Parser,
@@ -697,33 +708,16 @@ struct Engine {
 }
 
 impl Engine {
-    fn set_term_window_size(pty_master: &OwnedFd, size: TerminalSize) -> Result<()> {
-        let winsize = nix::pty::Winsize {
-            ws_row: size.rows as u16,
-            ws_col: size.cols as u16,
-            // TODO
-            ws_xpixel: 0,
-            ws_ypixel: 0,
-        };
-
-        nix::ioctl_write_ptr_bad!(tiocswinsz, nix::libc::TIOCSWINSZ, nix::pty::Winsize);
-        unsafe { tiocswinsz(pty_master.as_raw_fd(), &winsize as *const nix::pty::Winsize) }?;
-
-        Ok(())
-    }
-
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        pid: Pid,
-        pty: OwnedFd,
-        control_req: pipe_channel::Receiver<Command>,
-        control_res: pipe_channel::Sender<i32>,
+        reader: Box<dyn std::io::Read + Send>,
+        writer: SharedWriter,
+        control_rx: mpsc::Receiver<Command>,
+        child: Box<dyn Child + Send + Sync>,
         sz: TerminalSize,
         cell_sz: CellSize,
+        state: Arc<Mutex<State>>,
     ) -> Self {
-        Self::set_term_window_size(&pty, sz).unwrap();
-
-        let state = Arc::new(Mutex::new(State::new(sz)));
-
         // Initialize tabulation stops
         let mut tabstops = Vec::new();
         for i in 0..sz.cols {
@@ -738,10 +732,10 @@ impl Engine {
         };
 
         Self {
-            pid,
-            pty,
-            control_req,
-            control_res,
+            reader,
+            writer,
+            control_rx,
+            child,
             cell_sz,
             state,
             parser: control_function::Parser::default(),
@@ -751,15 +745,11 @@ impl Engine {
         }
     }
 
-    fn state(&self) -> Arc<Mutex<State>> {
-        self.state.clone()
-    }
-
     fn resize(&mut self, sz: TerminalSize, cell_sz: CellSize) {
         log::debug!("resize to {}x{} (cell)", sz.rows, sz.cols);
 
-        Self::set_term_window_size(&self.pty, sz).unwrap();
-
+        // カーネル側のサイズは Terminal::request_resize 側で master.resize 済み。
+        // ここではグリッド・タブストップ・保存カーソルを更新する。
         self.cell_sz = cell_sz;
 
         // Update tabulation stops
@@ -779,96 +769,50 @@ impl Engine {
     }
 
     fn start(mut self) {
-        let pty_fd = self.pty.as_raw_fd();
-        let ctl_fd = self.control_req.get_fd();
-
         let mut buf = vec![0_u8; 0x1000];
         let mut begin = 0;
 
-        use nix::poll::{poll, PollFd, PollFlags};
-        let mut fds = [
-            PollFd::new(pty_fd, PollFlags::POLLIN),
-            PollFd::new(ctl_fd, PollFlags::POLLIN),
-        ];
-
         loop {
-            use nix::sys::signal::{kill, Signal};
-
-            log::trace!("polling");
-            if let Err(err) = poll(&mut fds, -1) {
-                if let Errno::EINTR | Errno::EAGAIN = err {
-                    continue;
-                }
-                log::error!("poll failed: {err}");
-                let _ = kill(self.pid, Signal::SIGHUP);
-                break;
-            }
-
-            let pty_revents = fds[0].revents();
-            let ctl_revents = fds[1].revents();
-
-            if let Some(flags) = ctl_revents {
-                if flags.contains(PollFlags::POLLIN) {
-                    match self.control_req.recv() {
-                        Command::Resize { buff_sz, cell_sz } => {
-                            self.resize(buff_sz, cell_sz);
-                            self.control_res.send(0);
-                        }
-                        Command::SendSigterm => {
-                            let _ = kill(self.pid, Signal::SIGTERM);
-                            let _ = nix::sys::wait::waitpid(self.pid, None).unwrap();
-                            self.control_res.send(0);
-                            break;
-                        }
-                    }
-                } else if flags.contains(PollFlags::POLLERR) || flags.contains(PollFlags::POLLHUP) {
-                    let _ = kill(self.pid, Signal::SIGHUP);
+            let nb = match self.reader.read(&mut buf[begin..]) {
+                Ok(0) => break, // EOF: 子プロセスが終了した
+                Ok(nb) => nb,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    log::error!("PTY read: {}", e);
                     break;
                 }
-            }
+            };
 
-            if let Some(flags) = pty_revents {
-                if flags.contains(PollFlags::POLLIN) {
-                    let nb = match nix::unistd::read(pty_fd, &mut buf[begin..]) {
-                        Ok(0) => break,
-                        Ok(nb) => nb,
-                        Err(err) => {
-                            log::error!("PTY read: {}", err);
-                            continue;
-                        }
-                    };
-
-                    let end = begin + nb;
-                    let bytes = &buf[0..end];
-
-                    let rem = utf8::process_utf8(bytes, |res| match res {
-                        Ok(s) => self.process(s),
-
-                        // Process invalid sequence as U+FFFD (REPLACEMENT CHARACTER)
-                        Err(invalid) => {
-                            log::debug!("invalid UTF-8 sequence: {:?}", invalid);
-                            self.process("\u{FFFD}");
-                        }
-                    });
-                    let rem_len = rem.len();
-
-                    // Move remaining bytes to the begining
-                    // (these bytes will be parsed in the next process_utf8 call)
-                    buf.copy_within((end - rem_len)..end, 0);
-                    begin = rem_len;
-                } else if flags.contains(PollFlags::POLLERR) || flags.contains(PollFlags::POLLHUP) {
-                    let _ = kill(self.pid, Signal::SIGHUP);
-                    break;
+            // このバッチを解釈する前に、保留中のリサイズを反映する
+            // （master.resize は送信側で済んでいるので、ここはグリッド側のみ）
+            while let Ok(cmd) = self.control_rx.try_recv() {
+                match cmd {
+                    Command::Resize { buff_sz, cell_sz } => self.resize(buff_sz, cell_sz),
                 }
             }
+
+            let end = begin + nb;
+            let bytes = &buf[0..end];
+
+            let rem = utf8::process_utf8(bytes, |res| match res {
+                Ok(s) => self.process(s),
+
+                // Process invalid sequence as U+FFFD (REPLACEMENT CHARACTER)
+                Err(invalid) => {
+                    log::debug!("invalid UTF-8 sequence: {:?}", invalid);
+                    self.process("\u{FFFD}");
+                }
+            });
+            let rem_len = rem.len();
+
+            // Move remaining bytes to the begining
+            // (these bytes will be parsed in the next process_utf8 call)
+            buf.copy_within((end - rem_len)..end, 0);
+            begin = rem_len;
         }
 
-        use nix::sys::wait::WaitStatus;
-        let status = match nix::sys::wait::waitpid(self.pid, None) {
-            Ok(WaitStatus::Exited(_, status)) => status,
-            Ok(WaitStatus::Signaled(_, sig, _)) => 128 + (sig as i32),
-            _ => 1,
-        };
+        // 子プロセスの終了コードを取得
+        let status = self.child.wait().map(|s| s.exit_code() as i32).unwrap_or(1);
 
         let mut state = self.state.lock().unwrap();
         state.exit_status = Some(status);
@@ -1109,17 +1053,17 @@ impl Engine {
                 DSR(ps) => match ps {
                     5 => {
                         // ready, no malfunction detected
-                        use std::io::Write as _;
-                        FdIo(&self.pty).write_all(b"\x1b[0\x6E").unwrap();
+                        let _ = self.writer.lock().unwrap().write_all(b"\x1b[0\x6E");
                     }
                     6 => {
                         let (row, col) = state.cursor.pos();
 
                         // a report of the active position
-                        use std::io::Write as _;
-                        FdIo(&self.pty)
-                            .write_fmt(format_args!("\x1b[{};{}\x52", row + 1, col + 1))
-                            .unwrap();
+                        let _ = self
+                            .writer
+                            .lock()
+                            .unwrap()
+                            .write_fmt(format_args!("\x1b[{};{}\x52", row + 1, col + 1));
                     }
                     _ => unreachable!(),
                 },
@@ -1542,8 +1486,7 @@ impl Engine {
                 DA => {
                     // Primary Device Attributes 応答（VT102 相当）。これを返さ
                     // ないと fish 等が応答待ちで約10秒フリーズする。
-                    use std::io::Write as _;
-                    FdIo(&self.pty).write_all(b"\x1b[?6c").unwrap();
+                    let _ = self.writer.lock().unwrap().write_all(b"\x1b[?6c");
                 }
                 VPR => ignore!(),
                 TBC => ignore!(),
@@ -1711,58 +1654,31 @@ fn buffer_scroll_up_if_needed(state: &mut State, cell_sz: CellSize) {
     }
 }
 
-/// Opens PTY device and spawn a shell
-/// `init_pty` returns a pair (PTY master, PID of shell)
-fn init_pty(cwd: &std::path::Path) -> Result<(OwnedFd, Pid)> {
-    use nix::unistd::ForkResult;
-
-    // Safety: single threaded here
-    let res = unsafe { nix::pty::forkpty(None, None)? };
-
-    match res.fork_result {
-        // Shell side
-        ForkResult::Child => {
-            std::env::set_current_dir(cwd).expect("chdir");
-            exec_shell()?;
-            unreachable!();
-        }
-
-        // Terminal side
-        ForkResult::Parent { child: shell_pid } => {
-            // Safety: res.master is not used in other places
-            let fd = unsafe { OwnedFd::from_raw_fd(res.master) };
-            Ok((fd, shell_pid))
-        }
+/// PTY のサイズ（セル数＋ピクセル）。ピクセルは TIOCSWINSZ 相当の情報として渡す。
+fn pty_size(sz: TerminalSize, cell_sz: CellSize) -> PtySize {
+    PtySize {
+        rows: sz.rows as u16,
+        cols: sz.cols as u16,
+        pixel_width: (sz.cols as u32 * cell_sz.w) as u16,
+        pixel_height: (sz.rows as u32 * cell_sz.h) as u16,
     }
 }
 
-/// Setup process states and execute shell
-fn exec_shell() -> Result<()> {
-    use std::ffi::CString;
+/// 設定のシェルを起動するコマンドを組み立てる（クロスプラットフォーム）。
+fn build_command(cwd: &std::path::Path) -> CommandBuilder {
+    let shell = &crate::TOYTERM_CONFIG.shell;
 
-    // Restore the default handler for SIGPIPE (terminate)
-    use nix::sys::signal::{sigaction, SaFlags, SigAction, SigHandler, SigSet, Signal};
-    let sigdfl = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
-    unsafe { sigaction(Signal::SIGPIPE, &sigdfl).expect("sigaction") };
+    let mut cmd = CommandBuilder::new(&shell[0]);
+    for arg in &shell[1..] {
+        cmd.arg(arg);
+    }
 
-    let args: Vec<CString> = crate::TOYTERM_CONFIG
-        .shell
-        .iter()
-        .map(|arg| CString::new(arg.to_owned()).unwrap())
-        .collect();
+    // 現在の環境を引き継ぎつつ TERM を設定する。
+    for (key, val) in std::env::vars() {
+        cmd.env(key, val);
+    }
+    cmd.env("TERM", "toyterm-256color");
 
-    let mut vars: std::collections::HashMap<String, String> = std::env::vars().collect();
-
-    vars.insert("TERM".to_owned(), "toyterm-256color".to_owned());
-
-    let envs: Vec<CString> = vars
-        .into_iter()
-        .map(|(key, val)| {
-            let keyval_bytes = format!("{}={}\0", key, val).into_bytes();
-            CString::from_vec_with_nul(keyval_bytes).unwrap()
-        })
-        .collect();
-
-    nix::unistd::execve(&args[0], &args, &envs)?;
-    unreachable!();
+    cmd.cwd(cwd);
+    cmd
 }

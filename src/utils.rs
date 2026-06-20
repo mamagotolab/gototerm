@@ -1,28 +1,5 @@
 #![allow(unused)]
 
-pub mod io {
-    use std::os::unix::io::{AsRawFd as _, OwnedFd};
-
-    pub struct FdIo<'a>(pub &'a OwnedFd);
-
-    impl<'a> std::io::Write for FdIo<'a> {
-        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            let nb = nix::unistd::write(self.0.as_raw_fd(), bytes)?;
-            Ok(nb)
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> std::io::Read for FdIo<'a> {
-        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-            let nb = nix::unistd::read(self.0.as_raw_fd(), buf)?;
-            Ok(nb)
-        }
-    }
-}
-
 pub mod utf8 {
     pub fn process_utf8<'b, F>(buf: &'b [u8], mut callback: F) -> &[u8]
     where

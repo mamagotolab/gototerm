@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 log = { version = "0.4.17", features = ["release_max_level_warn"] }
 env_logger = "0.11"
-nix = "0.24.1"
+portable-pty = "0.8"
 unicode-width = "0.1.9"
 glium = "0.34"
 winit = "0.29"
@@ -27,6 +27,10 @@ lru = { version = "0.7.8", default-features = false }
 
 chrono = { optional = true, version = "0.4.22", default-features = false, features = ["clock"] }
 serde_json = { optional = true, version = "1.0.83" }
+
+# nix は Unix 専用機能（multiplex の pgid 取得など）でのみ使用
+[target.'cfg(unix)'.dependencies]
+nix = "0.24.1"
 
 [features]
 default = []
