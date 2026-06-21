@@ -471,6 +471,12 @@ impl VtTerminal {
         self.term.lock().unwrap().mode().intersects(TermMode::MOUSE_MODE)
     }
 
+    /// 代替画面(Alt Screen)中か。nvim/less 等の全画面 TUI で true。
+    pub fn alt_screen(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().unwrap().mode().contains(TermMode::ALT_SCREEN)
+    }
+
     pub fn sgr_mouse(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term.lock().unwrap().mode().contains(TermMode::SGR_MOUSE)
@@ -487,10 +493,17 @@ impl VtTerminal {
         self.dirty.store(true, Ordering::SeqCst);
     }
 
-    /// スクロールバック表示を delta 行ぶん動かす（正で過去方向）。
+    /// スクロールバック表示を delta 行ぶん動かす（正で過去方向＝上）。
     pub fn scroll(&self, delta: i32) {
         use alacritty_terminal::grid::Scroll;
         self.term.lock().unwrap().scroll_display(Scroll::Delta(delta));
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// スクロールバックを最下部（現在）に戻す。キー入力時に呼ぶ。
+    pub fn scroll_to_bottom(&self) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.lock().unwrap().scroll_display(Scroll::Bottom);
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -541,14 +554,19 @@ impl VtTerminal {
         let blank = TCell::head(' ', 1, GraphicAttribute::default());
         let mut rows: Vec<Vec<TCell>> = vec![vec![blank; columns]; screen_lines];
 
+        // 履歴スクロール量。スクロール中、display_iter は履歴を「負の行番号」で
+        // 返すため、表示行 = グリッド行 + display_offset で 0..screen_lines に直す。
+        let display_offset = term.grid().display_offset() as i32;
+
         let content = term.renderable_content();
 
         for indexed in content.display_iter {
-            let line = indexed.point.line.0; // 可視領域は 0..screen_lines
+            let row = indexed.point.line.0 + display_offset; // 0..screen_lines に正規化
             let col = indexed.point.column.0;
-            if line < 0 || line as usize >= screen_lines || col >= columns {
+            if row < 0 || row as usize >= screen_lines || col >= columns {
                 continue;
             }
+            let line = row;
             let cell = &indexed;
 
             // 全角・スペーサ
@@ -632,8 +650,9 @@ impl VtTerminal {
                     CursorShape::Beam => CursorStyle::Bar,
                     _ => CursorStyle::Block,
                 };
-                let row = rc.point.line.0;
-                if row < 0 {
+                // カーソルもスクロール量で正規化。履歴を遡って画面外に出たら隠す。
+                let row = rc.point.line.0 + display_offset;
+                if row < 0 || row as usize >= screen_lines {
                     None
                 } else {
                     Some(TCursor::at(row as usize, rc.point.column.0, style))
@@ -864,6 +883,50 @@ mod tests {
         // カーソルは画像の高さ分(12px/20px=1行)だけ下がっている
         let row = term.lock().unwrap().grid().cursor.point.line.0;
         assert!(row >= 1, "カーソルが画像の下へ送られている (row={row})");
+    }
+
+    #[test]
+    fn scrollback_shows_history_after_scroll() {
+        use alacritty_terminal::grid::Scroll;
+        use alacritty_terminal::term::{Config, Term};
+        use vte::ansi::Processor;
+
+        let (writer, _buf) = dummy_writer();
+        let winsize = Arc::new(Mutex::new(window_size(20, 5, 10, 20)));
+        let proxy = EventProxy { writer, winsize };
+        let mut term = Term::new(Config::default(), &GridSize { cols: 20, lines: 5 }, proxy);
+        let mut processor: Processor = Processor::new();
+
+        // 画面(5行)より多い 20 行を出力 → 履歴に積まれる
+        let mut data = Vec::new();
+        for n in 0..20 {
+            data.extend_from_slice(format!("L{n}\r\n").as_bytes());
+        }
+        processor.advance(&mut term, &data);
+
+        // snapshot と同じく「表示行 = グリッド行 + display_offset」で画面トップ(行0)を読む。
+        // スクロールした履歴は display_iter 上では負の行番号で来るため、offset を足す。
+        let top_line = |term: &Term<EventProxy>| -> String {
+            let offset = term.grid().display_offset() as i32;
+            let content = term.renderable_content();
+            let mut s = String::new();
+            for ind in content.display_iter {
+                if ind.point.line.0 + offset == 0 {
+                    s.push(ind.c);
+                }
+            }
+            s.trim_end().to_string()
+        };
+
+        // Delta(正) = 過去(上)方向。3行さかのぼると画面トップが変わる。
+        let before = top_line(&term);
+        term.scroll_display(Scroll::Delta(3));
+        let after = top_line(&term);
+        assert_ne!(before, after, "スクロールで画面トップ行が変わるはず");
+
+        // 最上部まで遡ると先頭行 L0 が画面トップに来る。
+        term.scroll_display(Scroll::Delta(1000));
+        assert_eq!(top_line(&term), "L0", "最上部で先頭行 L0 が画面トップ");
     }
 
     #[test]

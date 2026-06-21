@@ -471,23 +471,34 @@ impl TerminalWindow {
                     }
                 }
 
-                WindowEvent::MouseWheel {
-                    delta: MouseScrollDelta::LineDelta(dx, dy),
-                    ..
-                } => {
-                    let mouse = &mut self.mouse;
+                WindowEvent::MouseWheel { delta, .. } => {
+                    // マウスホイールは行単位(LineDelta)、ノートPCのタッチパッドは
+                    // ピクセル単位(PixelDelta)で来る。後者はセルサイズで行数に換算する。
+                    let cell_size = self.view.cell_size();
+                    let (dx, dy) = match delta {
+                        MouseScrollDelta::LineDelta(x, y) => (*x * 1.5, *y * 1.5),
+                        // タッチパッド等のピクセル単位スクロールはセルサイズで行数に換算。
+                        // winit は LineDelta も PixelDelta も同じ符号規約(正=上)なので、
+                        // 反転せずマウスホイールと同じ向きに揃える。
+                        MouseScrollDelta::PixelDelta(pos) => (
+                            pos.x as f32 / cell_size.w.max(1) as f32,
+                            pos.y as f32 / cell_size.h.max(1) as f32,
+                        ),
+                    };
 
-                    mouse.wheel_delta_x += dx * 1.5;
-                    mouse.wheel_delta_y += dy * 1.5;
+                    self.mouse.wheel_delta_x += dx;
+                    self.mouse.wheel_delta_y += dy;
 
-                    let horizontal = mouse.wheel_delta_x.trunc() as isize;
-                    let vertical = mouse.wheel_delta_y.trunc() as isize;
+                    let horizontal = self.mouse.wheel_delta_x.trunc() as isize;
+                    let vertical = self.mouse.wheel_delta_y.trunc() as isize;
 
-                    mouse.wheel_delta_x %= 1.0;
-                    mouse.wheel_delta_y %= 1.0;
+                    self.mouse.wheel_delta_x %= 1.0;
+                    self.mouse.wheel_delta_y %= 1.0;
 
-                    if self.modifiers.shift_key() {
-                        // スクロールバックを動かす（alacritty 側で履歴管理）
+                    // 通常画面ではホイールで履歴スクロール（直感的）。
+                    // 代替画面(nvim/less 等の TUI)では矢印キーを送って中身をスクロール。
+                    // Shift 押下時は常に履歴スクロール。
+                    if self.modifiers.shift_key() || !self.terminal.alt_screen() {
                         self.terminal.scroll(vertical as i32);
                     } else {
                         // Send Up/Down key
@@ -562,7 +573,10 @@ impl TerminalWindow {
             (false, _, KeyCode::Backspace) => self.terminal.write(b"\x7f"),
             (false, _, KeyCode::Delete) => self.terminal.write(b"\x1b[3~"),
 
-            (false, _, KeyCode::Enter) => self.terminal.write(b"\r"),
+            // Shift+Enter は ESC+CR を送る。Claude Code 等の TUI はこれを
+            // 「送信せず改行」として扱う（/terminal-setup が設定するのと同じ）。
+            (false, true, KeyCode::Enter) => self.terminal.write(b"\x1b\r"),
+            (false, false, KeyCode::Enter) => self.terminal.write(b"\r"),
             (false, _, KeyCode::Tab) => self.terminal.write(b"\t"),
 
             (false, _, KeyCode::ArrowUp) => self.terminal.write(b"\x1b[\x41"),
@@ -621,6 +635,11 @@ impl TerminalWindow {
 
             self.mouse.pressed_pos = None;
             self.mouse.released_pos = None;
+
+            // 実際の入力をしたらスクロールバックを最下部に戻す
+            // （履歴を見たまま打って迷子になるのを防ぐ）。コピー等の
+            // clear=false のキーでは戻さないので、履歴からのコピーは可能。
+            self.terminal.scroll_to_bottom();
         }
     }
 
