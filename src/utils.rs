@@ -1,7 +1,7 @@
 #![allow(unused)]
 
 pub mod utf8 {
-    pub fn process_utf8<'b, F>(buf: &'b [u8], mut callback: F) -> &[u8]
+    pub fn process_utf8<'b, F>(buf: &'b [u8], mut callback: F) -> &'b [u8]
     where
         F: FnMut(Result<&'b str, &'b [u8]>),
     {

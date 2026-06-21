@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- 背景（Tokyo Night 系の濃紺・角丸） -->
+  <rect width="256" height="256" rx="52" fill="#16161E"/>
+  <defs>
+    <!-- フラスコ本体の形（液体のクリップに流用） -->
+    <path id="flask"
+      d="M112 58 L112 116 L72 204 q-5 16 13 16 L159 236 q18 0 13 -16 L144 116 L144 58 Z"/>
+    <clipPath id="bodyClip"><use href="#flask"/></clipPath>
+  </defs>
+
+  <!-- 液体（本体にクリップ） -->
+  <rect x="36" y="168" width="184" height="80" fill="#1FA463" clip-path="url(#bodyClip)"/>
+  <!-- 泡 -->
+  <circle cx="118" cy="198" r="8" fill="#9ECE6A" clip-path="url(#bodyClip)"/>
+  <circle cx="143" cy="210" r="5" fill="#7DCFFF" clip-path="url(#bodyClip)"/>
+
+  <!-- フラスコの輪郭 -->
+  <use href="#flask" fill="none" stroke="#C0CAF5" stroke-width="10"
+       stroke-linejoin="round" stroke-linecap="round"/>
+  <!-- 口のフチ -->
+  <path d="M100 58 L156 58" fill="none" stroke="#C0CAF5" stroke-width="11" stroke-linecap="round"/>
+</svg>

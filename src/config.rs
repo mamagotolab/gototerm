@@ -58,9 +58,9 @@ impl Default for Config {
             fonts_regular: vec![PathBuf::new()],
             fonts_bold: vec![PathBuf::new()],
             fonts_faint: vec![PathBuf::new()],
-            font_size: 32,
+            font_size: 18,
 
-            status_bar_font_size: 18,
+            status_bar_font_size: 16,
 
             scroll_bar_width: 5,
             // 既定の配色は Tokyo Night（Night バリアント）。
@@ -112,17 +112,22 @@ pub fn build() -> Config {
 }
 
 fn find_config_file() -> Option<PathBuf> {
-    let mut xdg_config_home = std::env::var_os("XDG_CONFIG_HOME")
+    // Windows: %APPDATA%\gototerm\config.toml
+    #[cfg(windows)]
+    let mut base = PathBuf::from(std::env::var_os("APPDATA")?);
+
+    // Unix: $XDG_CONFIG_HOME か $HOME/.config
+    #[cfg(not(windows))]
+    let mut base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| {
-            // fallback to "$HOME/.config"
             let home = std::env::var_os("HOME")?;
             let mut p = PathBuf::from(home);
             p.push(".config");
             Some(p)
         })?;
 
-    xdg_config_home.push("gototerm");
-    xdg_config_home.push("config.toml");
-    Some(xdg_config_home)
+    base.push("gototerm");
+    base.push("config.toml");
+    Some(base)
 }

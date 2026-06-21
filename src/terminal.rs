@@ -1,3 +1,7 @@
+// 描画で使うデータ構造（Cell/Line/Color/Cursor 等）を保持するモジュール。
+// 一部のメソッド・定数は現状未使用だが、将来用・対称性のため残すので警告を抑える。
+#![allow(dead_code)]
+
 use std::cmp::min;
 use std::ops::{Range, RangeBounds};
 

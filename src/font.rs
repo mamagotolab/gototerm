@@ -34,7 +34,7 @@ impl Font {
         }
     }
 
-    fn render(&self, ch: char) -> Option<(RawImage2d<u8>, GlyphMetrics)> {
+    fn render(&self, ch: char) -> Option<(RawImage2d<'_, u8>, GlyphMetrics)> {
         if let idx @ 1.. = self.face.get_char_index(ch as usize) {
             let flags = LoadFlag::RENDER | LoadFlag::TARGET_LIGHT;
             self.face.load_glyph(idx, flags).expect("render");
@@ -106,7 +106,7 @@ impl FontSet {
         self.fonts.get(&style)?.iter().find_map(|f| f.metrics(ch))
     }
 
-    pub fn render(&self, ch: char, style: FontStyle) -> Option<(RawImage2d<u8>, GlyphMetrics)> {
+    pub fn render(&self, ch: char, style: FontStyle) -> Option<(RawImage2d<'_, u8>, GlyphMetrics)> {
         self.fonts.get(&style)?.iter().find_map(|f| f.render(ch))
     }
 

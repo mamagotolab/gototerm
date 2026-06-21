@@ -1,6 +1,6 @@
 [package]
 name = "gototerm"
-version = "0.2.1"
+version = "0.2.2"
 authors = ["mamagotolab"]
 edition = "2021"
 description = "日本語入力のストレスが少ない、軽量ターミナルエミュレータ（Wayland 向け・Sixel 画像対応）"
@@ -38,3 +38,7 @@ vte = "0.15"
 # Windows 限定ゲートなので Linux のビルドには影響しない。
 [target.'cfg(windows)'.dependencies]
 arboard = { version = "3", default-features = false }
+
+# exe にアイコンを埋め込む（build.rs）。ホストが Windows のときだけ使う。
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"

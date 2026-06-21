@@ -1,3 +1,7 @@
+// Windows のリリースビルドではコンソール窓を出さない（GUI subsystem）。
+// デバッグビルドはログを見られるようコンソールを残す。
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
+
 fn main() {
     // Make sure that configuration errors are detected earlier
     lazy_static::initialize(&gototerm::TOYTERM_CONFIG);
