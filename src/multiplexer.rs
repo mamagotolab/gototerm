@@ -402,6 +402,10 @@ pub struct Multiplexer {
     modifiers: ModifiersState,
     cursor_pos: PhysicalPosition<f64>,
     exited: bool,
+    /// ウィンドウが隠れているか。Wayland では隠れると frame callback が
+    /// 止まり、vsync 付きの描画がブロックして無応答になるため、隠れている間は
+    /// 描画しない。`WindowEvent::Occluded` で更新する。
+    occluded: bool,
 }
 
 impl Multiplexer {
@@ -441,6 +445,7 @@ impl Multiplexer {
             modifiers: ModifiersState::empty(),
             cursor_pos: PhysicalPosition::default(),
             exited: false,
+            occluded: false,
         };
         mux.refresh_layout();
         mux
@@ -656,7 +661,20 @@ impl Multiplexer {
                     self.update_status_bar();
                 }
 
+                &WindowEvent::Occluded(occluded) => {
+                    self.occluded = occluded;
+                    // 再表示されたら最新内容を描き直す。
+                    if !occluded {
+                        self.window.request_redraw();
+                    }
+                }
+
                 WindowEvent::RedrawRequested => {
+                    // 隠れている間は描画しない。Wayland では frame callback が
+                    // 止まり、ここでの swap がブロックして無応答になるため。
+                    if self.occluded {
+                        return;
+                    }
                     let mut surface = self.display.draw();
 
                     // まずフレーム全体を背景色でクリアする。分割の隙間や、
@@ -758,9 +776,11 @@ impl Multiplexer {
                     self.update_status_bar();
                 }
 
+                // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。
+                // 内容更新自体は上で汲み取り済みなので、再表示時にまとめて描ける。
                 let need = self.tabs[self.focus].needs_redraw()
                     || (self.status_bar_height() > 0 && self.status_view.needs_redraw());
-                if need {
+                if need && !self.occluded {
                     self.window.request_redraw();
                 }
 
