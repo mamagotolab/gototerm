@@ -51,7 +51,7 @@ impl Default for Config {
         Config {
             shell,
 
-            east_asian_width_ambiguous: 1,
+            east_asian_width_ambiguous: 0,
 
             // FIXME: due to a bug on "config-rs", empty Vecs cannot be serialized properly.
             // https://github.com/mehcode/config-rs/issues/114

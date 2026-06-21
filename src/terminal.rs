@@ -1187,10 +1187,11 @@ impl Engine {
 
                 GraphicChar(ch) => {
                     use unicode_width::UnicodeWidthChar as _;
+                    // east_asian_width_ambiguous: 0=半角(narrow) / 1=全角(wide)
                     let ch_width = if crate::TOYTERM_CONFIG.east_asian_width_ambiguous == 1 {
-                        ch.width()
+                        ch.width_cjk() // 曖昧幅を全角(2マス)扱い
                     } else {
-                        ch.width_cjk()
+                        ch.width() // 曖昧幅を半角(1マス)扱い（罫線・TUI向け）
                     };
 
                     if let Some(width @ 1..) = ch_width {

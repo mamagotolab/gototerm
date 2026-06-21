@@ -4,6 +4,7 @@ mod control_function;
 mod font;
 mod sixel;
 mod terminal;
+mod vt;
 mod utils;
 mod view;
 pub mod window;
