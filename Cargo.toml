@@ -33,3 +33,8 @@ lru = { version = "0.7.8", default-features = false }
 
 alacritty_terminal = "0.26.0"
 vte = "0.15"
+
+# Windows のクリップボードは外部コマンド(wl-copy)が無いので arboard を使う。
+# Windows 限定ゲートなので Linux のビルドには影響しない。
+[target.'cfg(windows)'.dependencies]
+arboard = { version = "3", default-features = false }

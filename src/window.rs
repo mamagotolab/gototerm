@@ -15,6 +15,7 @@ use crate::Display;
 type CursorPosition = PhysicalPosition<f64>;
 
 /// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
+#[cfg(unix)]
 fn set_clipboard(text: &str) {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
@@ -30,12 +31,34 @@ fn set_clipboard(text: &str) {
 }
 
 /// Wayland のクリップボードから読み出す（wl-paste）。
+#[cfg(unix)]
 fn get_clipboard() -> String {
     use std::process::Command;
     match Command::new("wl-paste").arg("--no-newline").output() {
         Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
         Err(e) => {
             log::error!("wl-paste の起動に失敗: {}", e);
+            String::new()
+        }
+    }
+}
+
+/// Windows のクリップボードへ書き込む（arboard）。
+#[cfg(windows)]
+fn set_clipboard(text: &str) {
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_owned())) {
+        Ok(()) => {}
+        Err(e) => log::error!("クリップボード書き込みに失敗: {}", e),
+    }
+}
+
+/// Windows のクリップボードから読み出す（arboard）。
+#[cfg(windows)]
+fn get_clipboard() -> String {
+    match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+        Ok(text) => text,
+        Err(e) => {
+            log::error!("クリップボード読み出しに失敗: {}", e);
             String::new()
         }
     }
