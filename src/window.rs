@@ -72,6 +72,9 @@ pub struct TerminalWindow {
     focused: bool,
     modifiers: ModifiersState,
     mouse: MouseState,
+    /// 直近の IME 確定(Commit)時刻。確定 Enter を端末へ送らないため
+    /// （Windows では確定 Enter が Commit とキー入力の両方で来る）。
+    last_ime_commit: std::time::Instant,
 }
 
 /// viewport とフォントから端末セル数を求めて VtTerminal を作る。
@@ -144,6 +147,7 @@ impl TerminalWindow {
                 click_count: 0,
                 last_clicked: std::time::Instant::now() - std::time::Duration::from_secs(10),
             },
+            last_ime_commit: std::time::Instant::now() - std::time::Duration::from_secs(10),
         }
     }
 
@@ -382,6 +386,9 @@ impl TerminalWindow {
                     Ime::Commit(text) => {
                         self.terminal.write(text.as_bytes());
                         self.view.update_contents(|view| view.preedit.clear());
+                        // 確定に使った Enter がこの直後にキー入力として来ても
+                        // 改行を送らないよう、確定時刻を記録しておく。
+                        self.last_ime_commit = std::time::Instant::now();
                     }
                     Ime::Enabled | Ime::Disabled => {
                         self.view.update_contents(|view| view.preedit.clear());
@@ -548,6 +555,19 @@ impl TerminalWindow {
             PhysicalKey::Code(code) => code,
             PhysicalKey::Unidentified(_) => return,
         };
+
+        // IME 変換中のキーは IME に任せ、端末へ送らない。
+        if !self.view.preedit.is_empty() {
+            return;
+        }
+        // IME 確定(Commit)とほぼ同時に来る確定 Enter は端末へ送らない
+        // （Windows で確定 Enter が Commit とキー入力の両方で来るため。
+        // ユーザが改めて押す本物の Enter は時間が空くので影響しない）。
+        if keycode == KeyCode::Enter
+            && self.last_ime_commit.elapsed() < std::time::Duration::from_millis(50)
+        {
+            return;
+        }
 
         let ctrl = self.modifiers.control_key();
         let shift = self.modifiers.shift_key();
