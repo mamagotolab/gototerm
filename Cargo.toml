@@ -1,8 +1,15 @@
 [package]
 name = "gototerm"
 version = "0.2.0"
-authors = ["algon-320 <algon.0320@gmail.com>"]
+authors = ["mamagotolab"]
 edition = "2021"
+description = "日本語入力のストレスが少ない、軽量ターミナルエミュレータ（Wayland 向け・Sixel 画像対応）"
+license = "MIT"
+repository = "https://github.com/mamagotolab/gototerm"
+homepage = "https://mamagotolab.com"
+readme = "README.md"
+keywords = ["terminal", "wayland", "ime", "japanese", "sixel"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "gototerm"
@@ -24,15 +31,5 @@ config = { version = "0.13.1", default-features = false, features = ["toml"] }
 lazy_static = "1.4.0"
 lru = { version = "0.7.8", default-features = false }
 
-chrono = { optional = true, version = "0.4.22", default-features = false, features = ["clock"] }
-serde_json = { optional = true, version = "1.0.83" }
 alacritty_terminal = "0.26.0"
 vte = "0.15"
-
-# nix は Unix 専用機能（multiplex の pgid 取得など）でのみ使用
-[target.'cfg(unix)'.dependencies]
-nix = "0.24.1"
-
-[features]
-default = []
-multiplex = ["chrono", "serde_json"]

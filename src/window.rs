@@ -1,7 +1,8 @@
+use std::rc::Rc;
+
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent},
-    event_loop::{ControlFlow, EventLoopWindowTarget},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::{CursorIcon, Window},
 };
@@ -11,7 +12,6 @@ use crate::vt::VtTerminal;
 use crate::view::{TerminalView, Viewport};
 use crate::Display;
 
-type Event = winit::event::Event<()>;
 type CursorPosition = PhysicalPosition<f64>;
 
 /// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
@@ -42,8 +42,7 @@ fn get_clipboard() -> String {
 }
 
 pub struct TerminalWindow {
-    window: Window,
-    display: Display,
+    window: Rc<Window>,
     terminal: VtTerminal,
 
     view: TerminalView,
@@ -79,27 +78,15 @@ struct MouseState {
 }
 
 impl TerminalWindow {
-    #[allow(unused)]
-    pub fn new(window: Window, display: Display, cwd: Option<&std::path::Path>) -> Self {
-        let size = window.inner_size();
-        let full = Viewport {
-            x: 0,
-            y: 0,
-            w: size.width,
-            h: size.height,
-        };
-        Self::with_viewport(window, display, full, cwd)
-    }
-
     pub fn with_viewport(
-        window: Window,
+        window: Rc<Window>,
         display: Display,
         viewport: Viewport,
         cwd: Option<&std::path::Path>,
     ) -> Self {
         let font_size = crate::TOYTERM_CONFIG.font_size;
         let view = TerminalView::with_viewport(
-            display.clone(),
+            display,
             viewport,
             font_size,
             Some((0, viewport.h)),
@@ -120,7 +107,6 @@ impl TerminalWindow {
 
         TerminalWindow {
             window,
-            display,
             terminal,
 
             view,
@@ -138,20 +124,6 @@ impl TerminalWindow {
         }
     }
 
-    pub fn reset_pty(&mut self) -> Option<i32> {
-        if !self.terminal.has_exited() {
-            self.terminal.kill();
-        }
-        let viewport = self.view.viewport();
-        let cwd = std::env::current_dir().expect("cwd");
-        self.terminal = make_terminal(&self.view, viewport, &cwd);
-
-        // Invalidate rendering cache
-        self.view.update_contents(|_| {});
-
-        None
-    }
-
     pub fn close_pty(&mut self) {
         self.terminal.kill();
     }
@@ -166,8 +138,13 @@ impl TerminalWindow {
         self.window.set_cursor_icon(icon);
     }
 
+    /// このペインの再描画が必要か（前回 draw 以降に内容が変わったか）。
+    pub fn needs_redraw(&self) -> bool {
+        self.view.needs_redraw()
+    }
+
     // Returns true if the PTY is closed, false otherwise
-    fn check_update(&mut self) -> bool {
+    pub fn check_update(&mut self) -> bool {
         let cell_size = self.view.cell_size();
 
         if self.terminal.has_exited() {
@@ -181,8 +158,9 @@ impl TerminalWindow {
         if self.terminal.take_dirty() {
             let snapshot = self.terminal.snapshot();
 
-            if let Some(cursor) = snapshot.cursor {
+            if let Some(cursor) = snapshot.cursor.filter(|_| self.focused) {
                 // 変換候補ウィンドウをカーソルのセル位置に出す（over-the-spot）。
+                // フォーカス中のペインだけが IME 位置を更新する。
                 self.window.set_ime_cursor_area(
                     PhysicalPosition::new(
                         self.viewport().x + cursor.col as u32 * cell_size.w,
@@ -195,7 +173,7 @@ impl TerminalWindow {
             self.view.update_contents(|view| {
                 view.lines = snapshot.lines;
                 view.cursor = snapshot.cursor;
-                view.images = Vec::new();
+                view.images = snapshot.images;
                 view.scroll_bar = None;
                 view.view_focused = self.focused;
             });
@@ -357,24 +335,12 @@ impl TerminalWindow {
         }
     }
 
-    pub fn on_event(&mut self, event: &Event, elwt: &EventLoopWindowTarget<()>) {
+    /// マネージャから渡されるウィンドウイベントを処理する。
+    /// CloseRequested / Resized / RedrawRequested / AboutToWait といった
+    /// ウィンドウ全体の制御はマネージャ側が持ち、ここでは扱わない。
+    pub fn process_window_event(&mut self, event: &WindowEvent) {
         match event {
-            Event::WindowEvent { event, .. } => match event {
-                WindowEvent::CloseRequested => {
-                    elwt.exit();
-                }
-
                 &WindowEvent::Focused(gain) => self.focus_changed(gain),
-
-                &WindowEvent::Resized(new_size) => {
-                    // glium 0.34 の手書きサーフェスは自動リサイズされない。
-                    // ここで明示的に合わせないと、描画が初期サイズのまま潰れる。
-                    self.display.resize((new_size.width, new_size.height));
-                    let mut viewport = self.viewport();
-                    viewport.w = new_size.width;
-                    viewport.h = new_size.height;
-                    self.set_viewport(viewport);
-                }
 
                 WindowEvent::ModifiersChanged(new_states) => {
                     self.modifiers = new_states.state();
@@ -524,33 +490,7 @@ impl TerminalWindow {
                     }
                 }
 
-                WindowEvent::RedrawRequested => {
-                    let mut surface = self.display.draw();
-                    self.draw(&mut surface);
-                    surface.finish().expect("finish");
-                }
-
                 _ => {}
-            },
-
-            Event::AboutToWait => {
-                if self.check_update() {
-                    elwt.exit();
-                    return;
-                }
-                // 内容が変わったフレームだけ再描画を要求する。アイドル時は
-                // スワップせず、ウィンドウが隠れていてもループが固まらない。
-                if self.view.needs_redraw() {
-                    self.window.request_redraw();
-                }
-                // 約16ms(=60fps)後に再びポーリングする。Poll の全力空転を避けつつ
-                // PTY 出力を遅延なく拾い、ping にも定期的に応答できる。
-                elwt.set_control_flow(ControlFlow::WaitUntil(
-                    std::time::Instant::now() + std::time::Duration::from_millis(16),
-                ));
-            }
-
-            _ => {}
         }
     }
 
@@ -742,34 +682,3 @@ impl TerminalWindow {
     }
 }
 
-#[cfg(feature = "multiplex")]
-impl TerminalWindow {
-    pub fn get_foreground_process_name(&self) -> String {
-        let pgid = self.terminal.get_pgid();
-        match std::fs::read(format!("/proc/{pgid}/cmdline")) {
-            Ok(cmdline) => {
-                let argv0 = cmdline.split(|b| *b == b'\0').next().unwrap();
-                String::from_utf8_lossy(argv0).into()
-            }
-            Err(err) => {
-                // A process group doesn't need to have a leader (PID=PGID).
-                log::debug!("Failed to read /proc/{pgid}/cmdline: {}", err);
-                "(unknown)".to_owned()
-            }
-        }
-    }
-
-    pub fn get_foreground_process_cwd(&self) -> std::path::PathBuf {
-        let pgid = self.terminal.get_pgid();
-        match std::fs::read_link(format!("/proc/{pgid}/cwd")) {
-            Ok(cwd) => cwd,
-            Err(err) => {
-                // A process group doesn't need to have a leader (PID=PGID).
-                log::debug!("Failed to read_link /proc/{pgid}/cwd: {}", err);
-
-                // FIXME
-                std::env::current_dir().unwrap()
-            }
-        }
-    }
-}

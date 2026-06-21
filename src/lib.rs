@@ -1,6 +1,5 @@
 mod cache;
 mod config;
-mod control_function;
 mod font;
 mod sixel;
 mod terminal;
@@ -9,7 +8,6 @@ mod utils;
 mod view;
 pub mod window;
 
-#[cfg(feature = "multiplex")]
 pub mod multiplexer;
 
 /// glium 0.34 から Display は Surface 型のジェネリック引数が必須になった。

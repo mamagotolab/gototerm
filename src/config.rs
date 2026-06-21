@@ -10,7 +10,7 @@ pub struct Config {
     pub fonts_faint: Vec<PathBuf>,
     pub font_size: u32,
 
-    #[cfg(feature = "multiplex")]
+    // タブバー（複数タブのときだけ表示）の文字サイズ
     pub status_bar_font_size: u32,
 
     // RRGGBBAA
@@ -60,8 +60,7 @@ impl Default for Config {
             fonts_faint: vec![PathBuf::new()],
             font_size: 32,
 
-            #[cfg(feature = "multiplex")]
-            status_bar_font_size: 32,
+            status_bar_font_size: 18,
 
             scroll_bar_width: 5,
             scroll_bar_fg_color: 0x606060FF,

@@ -19,15 +19,11 @@ fn main() {
 
     let (window, display) = build_window(&event_loop);
 
-    #[cfg(not(feature = "multiplex"))]
-    let mut term = gototerm::window::TerminalWindow::new(window, display, None);
-
-    #[cfg(feature = "multiplex")]
-    let mut term = gototerm::multiplexer::Multiplexer::new(window, display);
+    let mut mux = gototerm::multiplexer::Multiplexer::new(window, display);
 
     event_loop
         .run(move |event, elwt| {
-            term.on_event(&event, elwt);
+            mux.on_event(&event, elwt);
         })
         .expect("run");
 }

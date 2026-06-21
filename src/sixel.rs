@@ -29,6 +29,24 @@ impl Image {
         let size = PIXEL_SIZE * (self.height * self.width) as usize;
         self.data.resize(size, 0_u8);
     }
+
+    /// 幅を `min_width` 以上に広げ、既存行を行頭そろえで詰め直す。
+    /// ラスタ属性(`"`)で幅が宣言されないSixelに備える。高さは変えない。
+    fn ensure_width(&mut self, min_width: u64) {
+        if min_width <= self.width {
+            return;
+        }
+        let new_width = min_width;
+        let mut new_data = vec![0_u8; PIXEL_SIZE * (new_width * self.height) as usize];
+        let old_row = PIXEL_SIZE * self.width as usize;
+        let new_row = PIXEL_SIZE * new_width as usize;
+        for row in 0..self.height as usize {
+            let (o, n) = (old_row * row, new_row * row);
+            new_data[n..n + old_row].copy_from_slice(&self.data[o..o + old_row]);
+        }
+        self.width = new_width;
+        self.data = new_data;
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -219,10 +237,9 @@ impl Parser {
                     }
 
                     for _ in 0..(pixel_w as usize) * repeat {
-                        // FIXME
+                        // 幅が未宣言（ラスタ属性なし）でも書けるよう必要なら拡張する。
                         if x >= img.width {
-                            log::debug!("line overflow");
-                            break;
+                            img.ensure_width(x + 1);
                         }
 
                         for i in 0..6 {

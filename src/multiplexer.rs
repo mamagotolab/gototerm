@@ -1,731 +1,414 @@
-use glium::{glutin, Display};
-use glutin::{
-    dpi::PhysicalPosition,
-    event::{ElementState, ModifiersState, VirtualKeyCode, WindowEvent},
-    event_loop::ControlFlow,
-    window::CursorIcon,
-};
-use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+//! タブと画面分割を司るマネージャ。
+//!
+//! 1つの OS ウィンドウの中に複数の端末セッション（[`TerminalWindow`]）を
+//! 抱え、タブ（[`Vec<Node>`]）と二分木の分割（[`Node::Split`]）として配置する。
+//! ウィンドウ全体のイベント（リサイズ・再描画・終了）はここで握り、
+//! キー/マウス/IME は現在フォーカスしているペインへ振り分ける。
 
-use crate::terminal::{Cell, Color};
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use winit::{
+    dpi::PhysicalPosition,
+    event::{ElementState, KeyEvent, WindowEvent},
+    event_loop::{ControlFlow, EventLoopWindowTarget},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    window::Window,
+};
+
+use crate::terminal::{Cell, Color, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::window::TerminalWindow;
+use crate::Display;
 
-type Event = glutin::event::Event<'static, ()>;
-type CursorPosition = PhysicalPosition<f64>;
+type Event = winit::event::Event<()>;
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Command {
-    Nop,
-    FocusUp,
-    FocusDown,
-    FocusLeft,
-    FocusRight,
-    FocusNextTab,
-    FocusPrevTab,
-    FocusTab(usize),
+/// 分割の境界に空ける隙間（px）。
+const GAP: u32 = 2;
+
+#[derive(Clone, Copy, PartialEq)]
+enum Partition {
+    /// 縦の仕切り線で左右に分ける（幅を分割）。
+    Vertical,
+    /// 横の仕切り線で上下に分ける（高さを分割）。
+    Horizontal,
+}
+
+#[derive(Clone, Copy)]
+enum Dir {
+    Up,
+    Down,
+    Left,
+    Right,
+}
+
+/// マネージャが横取りするキー操作。
+enum Action {
+    NewTab,
+    CloseFocused,
+    NextTab,
+    PrevTab,
     SplitVertical,
     SplitHorizontal,
-    ResizeIncreaseLeft,
-    ResizeDecreaseLeft,
-    ResizeIncreaseUp,
-    ResizeDecreaseUp,
-    AddNewTab,
-    SetMaximize,
-    ResetMaximize,
-    Close,
-
-    SaveLayout,
-    RestoreLayout,
+    Focus(Dir),
 }
 
-#[derive(Serialize, Deserialize)]
-enum Layout {
-    Single(SingleLayout),
-    Binary(BinaryLayout),
-    Tabbed(TabbedLayout),
+/// タブ内のペイン木。葉が端末、節が分割。
+enum Node {
+    Leaf(Box<TerminalWindow>),
+    Split(SplitNode),
+    /// `mem::replace` の一時退避にだけ使う番兵。通常は出現しない。
+    Empty,
 }
 
-#[derive(Serialize, Deserialize)]
-struct SingleLayout {
-    #[serde(skip)]
-    window: Option<Box<TerminalWindow>>,
-    cwd: PathBuf,
-}
-
-impl SingleLayout {
-    fn get_mut(&mut self) -> &mut TerminalWindow {
-        self.window.as_mut().unwrap()
-    }
-
-    fn update_cwd(&mut self) {
-        let cwd = self.get_mut().get_foreground_process_cwd();
-        self.cwd = cwd;
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct BinaryLayout {
+struct SplitNode {
     partition: Partition,
-    viewport: Viewport,
     ratio: f64,
-    focus_x: bool,
-    x: Option<Box<Layout>>,
-    y: Option<Box<Layout>>,
-
-    #[serde(skip)]
-    maximized: bool,
-    #[serde(skip)]
-    mouse_cursor_pos: CursorPosition,
-    #[serde(skip)]
-    grabbing: bool,
+    /// フォーカスが first 側にあるか。
+    focus_first: bool,
+    first: Box<Node>,
+    second: Box<Node>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-enum Partition {
-    Horizontal,
-    Vertical,
-}
-
-impl BinaryLayout {
-    fn x_mut(&mut self) -> &mut Layout {
-        self.x.as_mut().unwrap()
-    }
-    fn y_mut(&mut self) -> &mut Layout {
-        self.y.as_mut().unwrap()
-    }
-    fn focused_mut(&mut self) -> &mut Layout {
-        if self.focus_x {
-            self.x_mut()
-        } else {
-            self.y_mut()
-        }
-    }
-
-    const GAP: u32 = 2;
-
-    fn split_viewport(&self) -> (Viewport, Viewport) {
-        let viewport = self.viewport;
-
-        if self.maximized {
-            return if self.focus_x {
-                (viewport, Viewport::default())
-            } else {
-                (Viewport::default(), viewport)
+/// 親ビューポートを比率で2分割する（GAP 分の隙間を空ける）。
+fn split_viewport(partition: Partition, ratio: f64, vp: Viewport) -> (Viewport, Viewport) {
+    match partition {
+        Partition::Vertical => {
+            let mid = (vp.w as f64 * ratio).round() as u32;
+            let left = Viewport {
+                x: vp.x,
+                y: vp.y,
+                w: mid.saturating_sub(GAP),
+                h: vp.h,
             };
-        }
-
-        match self.partition {
-            Partition::Horizontal => {
-                let mid = (viewport.h as f64 * self.ratio).round() as u32;
-
-                let mut up = viewport;
-                up.y = viewport.y;
-                up.h = mid - Self::GAP;
-
-                let mut down = viewport;
-                down.y = viewport.y + mid + Self::GAP;
-                down.h = viewport.h - mid - Self::GAP;
-
-                // +------+ <-- viewport.y
-                // |  up  |
-                // +======+ <-- viewport.y + mid - GAP
-                // |------| <-- viewport.y + mid
-                // +======+ <-- viewport.y + mid + GAP
-                // | down |
-                // +------+ <-- viewport.y + viewport.h
-
-                (up, down)
-            }
-
-            Partition::Vertical => {
-                let mid = (viewport.w as f64 * self.ratio).round() as u32;
-
-                let mut left = viewport;
-                left.x = viewport.x;
-                left.w = mid - Self::GAP;
-
-                let mut right = viewport;
-                right.x = viewport.x + mid + Self::GAP;
-                right.w = viewport.w - mid - Self::GAP;
-
-                // +-------------------- viewport.x
-                // |      +------------- viewport.x + mid - GAP
-                // |      |+------------ viewport.x + mid
-                // |      ||+----------- viewport.x + mid + GAP
-                // |      |||       +--- viewport.x + viewport.w
-                // v      vvv       v
-                // +------+-+-------+
-                // | left ||| right |
-                // +------+-+-------+
-
-                (left, right)
-            }
-        }
-    }
-
-    fn cursor_on_partition(&self) -> bool {
-        let x = self.mouse_cursor_pos.x.round() as i32;
-        let y = self.mouse_cursor_pos.y.round() as i32;
-        let viewport = self.viewport;
-
-        let gap = Self::GAP as i32;
-
-        match self.partition {
-            Partition::Horizontal => {
-                let mid = viewport.y as i32 + (viewport.h as f64 * self.ratio).round() as i32;
-                let hit_y = mid - gap <= y && y < mid + gap;
-
-                let left = viewport.x as i32;
-                let right = (viewport.x + viewport.w) as i32;
-                let hit_x = left - gap * 2 <= x && x < right + gap * 2;
-
-                hit_x && hit_y
-            }
-
-            Partition::Vertical => {
-                let mid = viewport.x as i32 + (viewport.w as f64 * self.ratio).round() as i32;
-                let hit_x = mid - gap <= x && x < mid + gap;
-
-                let top = viewport.y as i32;
-                let bottom = (viewport.y + viewport.h) as i32;
-                let hit_y = top - gap * 2 <= y && y < bottom + gap * 2;
-
-                hit_x && hit_y
-            }
-        }
-    }
-
-    fn update_ratio(&mut self) {
-        debug_assert!(self.grabbing);
-        let CursorPosition { x, y } = self.mouse_cursor_pos;
-        let viewport = self.viewport;
-
-        match self.partition {
-            Partition::Horizontal => {
-                let min_r = (Self::GAP * 2) as f64 / (viewport.h as f64);
-                let mid = y - viewport.y as f64;
-                let r = mid / (viewport.h as f64);
-                self.ratio = r.clamp(min_r, 1.0 - min_r);
-            }
-
-            Partition::Vertical => {
-                let min_r = (Self::GAP * 2) as f64 / (viewport.w as f64);
-                let mid = x - viewport.x as f64;
-                let r = mid / (viewport.w as f64);
-                self.ratio = r.clamp(min_r, 1.0 - min_r);
-            }
-        }
-
-        let (vp_x, vp_y) = self.split_viewport();
-        self.x_mut().set_viewport(vp_x);
-        self.y_mut().set_viewport(vp_y);
-    }
-
-    fn on_event(&mut self, display: &Display, event: &Event, control_flow: &mut ControlFlow) {
-        if let Event::WindowEvent { event: wev, .. } = event {
-            match wev {
-                WindowEvent::CursorMoved { position, .. } => {
-                    let on_partition_before = self.cursor_on_partition();
-                    self.mouse_cursor_pos = *position;
-                    let on_partition_after = self.cursor_on_partition();
-
-                    if !self.grabbing && on_partition_before != on_partition_after {
-                        if on_partition_after {
-                            let icon = match self.partition {
-                                Partition::Vertical => CursorIcon::EwResize,
-                                Partition::Horizontal => CursorIcon::NsResize,
-                            };
-                            display.gl_window().window().set_cursor_icon(icon);
-                        } else {
-                            // Reload normal icon
-                            self.focused_mut()
-                                .focused_window_mut()
-                                .refresh_cursor_icon();
-                        }
-                    }
-
-                    if self.grabbing {
-                        self.update_ratio();
-                    }
-                }
-                WindowEvent::MouseInput {
-                    state: ElementState::Pressed,
-                    ..
-                } => {
-                    if self.cursor_on_partition() {
-                        self.grabbing = true;
-                        display
-                            .gl_window()
-                            .window()
-                            .set_cursor_icon(CursorIcon::Grabbing);
-                    } else {
-                        let (vp_x, vp_y) = self.split_viewport();
-                        if !self.focus_x && vp_x.contains(self.mouse_cursor_pos) {
-                            self.focused_mut().focused_window_mut().focus_changed(false);
-                            self.focus_x = true;
-                            self.focused_mut().focused_window_mut().focus_changed(true);
-                        }
-                        if self.focus_x && vp_y.contains(self.mouse_cursor_pos) {
-                            self.focused_mut().focused_window_mut().focus_changed(false);
-                            self.focus_x = false;
-                            self.focused_mut().focused_window_mut().focus_changed(true);
-                        }
-                    }
-                }
-                WindowEvent::MouseInput {
-                    state: ElementState::Released,
-                    ..
-                } => {
-                    if self.grabbing {
-                        self.grabbing = false;
-
-                        // Reload normal icon
-                        self.focused_mut()
-                            .focused_window_mut()
-                            .refresh_cursor_icon();
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let (ev_x, ev_y) = self.split_event(event);
-
-        if let Some(event) = ev_x {
-            let mut cf = ControlFlow::default();
-            self.x_mut().on_event(display, event, &mut cf);
-            if cf == ControlFlow::Exit {
-                *control_flow = ControlFlow::Exit;
-            }
-        }
-
-        if let Some(event) = ev_y {
-            let mut cf = ControlFlow::default();
-            self.y_mut().on_event(display, event, &mut cf);
-            if cf == ControlFlow::Exit {
-                *control_flow = ControlFlow::Exit;
-            }
-        }
-    }
-
-    fn split_event<'e>(&mut self, event: &'e Event) -> (Option<&'e Event>, Option<&'e Event>) {
-        if self.maximized {
-            return if self.focus_x {
-                (Some(event), None)
-            } else {
-                (None, Some(event))
+            let right = Viewport {
+                x: vp.x + mid + GAP,
+                y: vp.y,
+                w: vp.w.saturating_sub(mid + GAP),
+                h: vp.h,
             };
+            (left, right)
         }
-
-        match event {
-            Event::WindowEvent { event: wev, .. } => match wev {
-                WindowEvent::ModifiersChanged(..)
-                | WindowEvent::CursorMoved { .. }
-                | WindowEvent::MouseInput { .. } => {
-                    return (Some(event), Some(event));
-                }
-                _ => {}
-            },
-
-            Event::MainEventsCleared => {
-                return (Some(event), Some(event));
-            }
-
-            _ => {}
-        }
-
-        if self.focus_x {
-            (Some(event), None)
-        } else {
-            (None, Some(event))
-        }
-    }
-
-    fn process_command(&mut self, display: &Display, cmd: Command) -> bool {
-        match cmd {
-            Command::FocusUp | Command::FocusDown | Command::FocusLeft | Command::FocusRight => {
-                let (x_focused, y_focused) = (self.focus_x, !self.focus_x);
-
-                let changeable = match cmd {
-                    Command::FocusDown => self.partition == Partition::Horizontal && x_focused,
-                    Command::FocusUp => self.partition == Partition::Horizontal && y_focused,
-                    Command::FocusRight => self.partition == Partition::Vertical && x_focused,
-                    Command::FocusLeft => self.partition == Partition::Vertical && y_focused,
-                    _ => unreachable!(),
-                };
-
-                let mut consumed = self.focused_mut().process_command(display, cmd);
-                if !consumed && changeable {
-                    self.focused_mut().focused_window_mut().focus_changed(false);
-                    self.focus_x ^= true;
-                    self.focused_mut().focused_window_mut().focus_changed(true);
-                    consumed = true;
-                }
-                consumed
-            }
-
-            Command::ResizeIncreaseUp
-            | Command::ResizeDecreaseUp
-            | Command::ResizeIncreaseLeft
-            | Command::ResizeDecreaseLeft => {
-                let resizable = match cmd {
-                    Command::ResizeIncreaseUp | Command::ResizeDecreaseUp => {
-                        self.partition == Partition::Horizontal
-                    }
-                    Command::ResizeIncreaseLeft | Command::ResizeDecreaseLeft => {
-                        self.partition == Partition::Vertical
-                    }
-                    _ => unreachable!(),
-                };
-
-                let mut consumed = self.focused_mut().process_command(display, cmd);
-                if !consumed && resizable {
-                    let new_ratio = match cmd {
-                        Command::ResizeIncreaseUp | Command::ResizeIncreaseLeft => {
-                            self.ratio + 0.05 // +5%
-                        }
-                        Command::ResizeDecreaseUp | Command::ResizeDecreaseLeft => {
-                            self.ratio - 0.05 // -5%
-                        }
-                        _ => unreachable!(),
-                    };
-
-                    let viewport = self.viewport;
-                    let min_r = (Self::GAP * 2) as f64 / (viewport.h as f64);
-                    self.ratio = new_ratio.clamp(min_r, 1.0 - min_r);
-
-                    let (vp_x, vp_y) = self.split_viewport();
-                    self.x_mut().set_viewport(vp_x);
-                    self.y_mut().set_viewport(vp_y);
-
-                    consumed = true;
-                }
-                consumed
-            }
-
-            Command::SetMaximize => {
-                self.focused_mut().process_command(display, cmd);
-                self.maximized = true;
-                true
-            }
-            Command::ResetMaximize => {
-                self.focused_mut().process_command(display, cmd);
-                self.maximized = false;
-                true
-            }
-
-            Command::SaveLayout | Command::RestoreLayout => {
-                self.x_mut().process_command(display, cmd);
-                self.y_mut().process_command(display, cmd);
-                true
-            }
-
-            _ => self.focused_mut().process_command(display, cmd),
+        Partition::Horizontal => {
+            let mid = (vp.h as f64 * ratio).round() as u32;
+            let top = Viewport {
+                x: vp.x,
+                y: vp.y,
+                w: vp.w,
+                h: mid.saturating_sub(GAP),
+            };
+            let bottom = Viewport {
+                x: vp.x,
+                y: vp.y + mid + GAP,
+                w: vp.w,
+                h: vp.h.saturating_sub(mid + GAP),
+            };
+            (top, bottom)
         }
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct TabbedLayout {
-    viewport: Viewport,
-    focus: usize,
-    tabs: Vec<Option<Box<Layout>>>,
-}
-
-impl TabbedLayout {
-    fn focused_mut(&mut self) -> &mut Layout {
-        self.tabs[self.focus].as_mut().unwrap()
-    }
-
-    fn on_event(&mut self, display: &Display, event: &Event, control_flow: &mut ControlFlow) {
-        self.focused_mut().on_event(display, event, control_flow);
-    }
-
-    fn process_command(&mut self, display: &Display, cmd: Command) -> bool {
-        match cmd {
-            Command::AddNewTab => {
-                self.focused_mut().focused_window_mut().focus_changed(false);
-
-                let window = TerminalWindow::with_viewport(display.clone(), self.viewport, None);
-                let single = Layout::new_single(window.into());
-
-                self.tabs.push(Some(single.into()));
-                self.focus = self.tabs.len() - 1;
-                self.focused_mut().focused_window_mut().focus_changed(true);
-                true
-            }
-            Command::FocusNextTab => {
-                self.focused_mut().focused_window_mut().focus_changed(false);
-                self.focus += 1;
-                self.focus %= self.tabs.len();
-                self.focused_mut().focused_window_mut().focus_changed(true);
-                true
-            }
-            Command::FocusPrevTab => {
-                self.focused_mut().focused_window_mut().focus_changed(false);
-                self.focus = self.tabs.len() + self.focus - 1;
-                self.focus %= self.tabs.len();
-                self.focused_mut().focused_window_mut().focus_changed(true);
-                true
-            }
-            Command::FocusTab(n) => {
-                self.focused_mut().focused_window_mut().focus_changed(false);
-                self.focus = n % self.tabs.len();
-                self.focused_mut().focused_window_mut().focus_changed(true);
-                true
-            }
-
-            Command::SaveLayout | Command::RestoreLayout => {
-                for tab in self.tabs.iter_mut().flatten() {
-                    tab.process_command(display, cmd);
+impl Node {
+    fn focused_leaf_mut(&mut self) -> &mut TerminalWindow {
+        match self {
+            Node::Leaf(w) => w,
+            Node::Split(s) => {
+                if s.focus_first {
+                    s.first.focused_leaf_mut()
+                } else {
+                    s.second.focused_leaf_mut()
                 }
-                true
             }
-
-            _ => self.focused_mut().process_command(display, cmd),
+            Node::Empty => unreachable!("Empty node"),
         }
     }
-}
 
-impl Layout {
-    fn new_single(win: Box<TerminalWindow>) -> Self {
-        let cwd = win.get_foreground_process_cwd();
-        Self::Single(SingleLayout {
-            window: Some(win),
-            cwd,
-        })
-    }
-
-    fn new_binary(
-        partition: Partition,
-        viewport: Viewport,
-        x: Box<Layout>,
-        y: Box<Layout>,
-    ) -> Self {
-        let mut layout = Self::Binary(BinaryLayout {
-            partition,
-            viewport,
-            ratio: 0.50,
-            focus_x: false,
-            x: Some(x),
-            y: Some(y),
-            mouse_cursor_pos: CursorPosition::default(),
-            grabbing: false,
-            maximized: false,
-        });
-        layout.set_viewport(viewport);
-        layout
-    }
-
-    fn new_tabbed(viewport: Viewport, first_tab: Box<Layout>) -> Self {
-        let mut layout = Self::Tabbed(TabbedLayout {
-            viewport,
-            focus: 0,
-            tabs: vec![Some(first_tab)],
-        });
-        layout.set_viewport(viewport);
-        layout
-    }
-
-    fn is_single(&self) -> bool {
-        matches!(self, Layout::Single(_))
+    fn set_viewport(&mut self, vp: Viewport) {
+        match self {
+            Node::Leaf(w) => w.set_viewport(vp),
+            Node::Split(s) => {
+                let (a, b) = split_viewport(s.partition, s.ratio, vp);
+                s.first.set_viewport(a);
+                s.second.set_viewport(b);
+            }
+            Node::Empty => {}
+        }
     }
 
     fn draw(&mut self, surface: &mut glium::Frame) {
         match self {
-            Self::Single(layout) => layout.get_mut().draw(surface),
-            Self::Binary(layout) => {
-                if layout.maximized {
-                    layout.focused_mut().draw(surface);
+            Node::Leaf(w) => w.draw(surface),
+            Node::Split(s) => {
+                s.first.draw(surface);
+                s.second.draw(surface);
+            }
+            Node::Empty => {}
+        }
+    }
+
+    fn for_each_leaf(&mut self, f: &mut dyn FnMut(&mut TerminalWindow)) {
+        match self {
+            Node::Leaf(w) => f(w),
+            Node::Split(s) => {
+                s.first.for_each_leaf(f);
+                s.second.for_each_leaf(f);
+            }
+            Node::Empty => {}
+        }
+    }
+
+    fn needs_redraw(&self) -> bool {
+        match self {
+            Node::Leaf(w) => w.needs_redraw(),
+            Node::Split(s) => s.first.needs_redraw() || s.second.needs_redraw(),
+            Node::Empty => false,
+        }
+    }
+
+    /// カーソル位置 `p` を含む葉へフォーカス経路を張り替える（true=見つかった）。
+    /// 葉の focus_changed は呼び出し側でまとめて行う。
+    fn focus_at(&mut self, p: PhysicalPosition<f64>) -> bool {
+        match self {
+            Node::Leaf(w) => w.viewport().contains(p),
+            Node::Split(s) => {
+                if s.first.focus_at(p) {
+                    s.focus_first = true;
+                    true
+                } else if s.second.focus_at(p) {
+                    s.focus_first = false;
+                    true
                 } else {
-                    layout.x_mut().draw(surface);
-                    layout.y_mut().draw(surface);
+                    false
                 }
             }
-            Self::Tabbed(layout) => {
-                layout.focused_mut().draw(surface);
-            }
+            Node::Empty => false,
         }
     }
 
-    fn set_viewport(&mut self, viewport: Viewport) {
+    /// フォーカス中の葉を分割する。`window`/`display` は新ペイン生成に使う。
+    fn split_focused(&mut self, partition: Partition, window: &Rc<Window>, display: &Display) {
         match self {
-            Self::Single(layout) => {
-                let win = layout.get_mut();
-                win.set_viewport(viewport);
+            Node::Leaf(_) => {
+                let vp = self.focused_leaf_mut().viewport();
+
+                let taken = std::mem::replace(self, Node::Empty);
+                let old = match taken {
+                    Node::Leaf(w) => w,
+                    _ => unreachable!(),
+                };
+
+                // 新ペインの作業ディレクトリは gototerm の起動ディレクトリ。
+                let cwd = std::env::current_dir().ok();
+                let new_win = Box::new(TerminalWindow::with_viewport(
+                    window.clone(),
+                    display.clone(),
+                    vp,
+                    cwd.as_deref(),
+                ));
+
+                let mut first = Box::new(Node::Leaf(old));
+                let mut second = Box::new(Node::Leaf(new_win));
+                first.focused_leaf_mut().focus_changed(false);
+                second.focused_leaf_mut().focus_changed(true);
+
+                *self = Node::Split(SplitNode {
+                    partition,
+                    ratio: 0.5,
+                    focus_first: false, // 新ペイン(second)にフォーカス
+                    first,
+                    second,
+                });
+                self.set_viewport(vp);
             }
-            Self::Binary(layout) => {
-                layout.viewport = viewport;
-                if layout.maximized {
-                    layout.focused_mut().set_viewport(viewport);
+            Node::Split(s) => {
+                if s.focus_first {
+                    s.first.split_focused(partition, window, display);
                 } else {
-                    let (vp_x, vp_y) = layout.split_viewport();
-                    layout.x_mut().set_viewport(vp_x);
-                    layout.y_mut().set_viewport(vp_y);
+                    s.second.split_focused(partition, window, display);
                 }
             }
-            Self::Tabbed(layout) => {
-                layout.viewport = viewport;
-                for t in layout.tabs.iter_mut().flatten() {
-                    t.set_viewport(viewport);
-                }
-            }
+            Node::Empty => {}
         }
     }
 
-    fn update_focus(&mut self, focus: bool) {
+    /// 方向キーでフォーカスを移す（true=この部分木内で消費した）。
+    fn move_focus(&mut self, dir: Dir) -> bool {
         match self {
-            Self::Single(layout) => {
-                layout.get_mut().focus_changed(focus);
-            }
-            Self::Binary(layout) => {
-                let focus_x = layout.focus_x;
-                layout.x_mut().update_focus(focus && focus_x);
-                layout.y_mut().update_focus(focus && !focus_x);
-            }
-            Self::Tabbed(layout) => {
-                for (i, tab) in layout.tabs.iter_mut().enumerate() {
-                    if let Some(tab) = tab {
-                        tab.update_focus(focus && i == layout.focus);
-                    }
+            Node::Leaf(_) => false,
+            Node::Split(s) => {
+                let deep = if s.focus_first {
+                    s.first.move_focus(dir)
+                } else {
+                    s.second.move_focus(dir)
+                };
+                if deep {
+                    return true;
+                }
+
+                let can = matches!(
+                    (s.partition, dir, s.focus_first),
+                    (Partition::Vertical, Dir::Right, true)
+                        | (Partition::Vertical, Dir::Left, false)
+                        | (Partition::Horizontal, Dir::Down, true)
+                        | (Partition::Horizontal, Dir::Up, false)
+                );
+
+                if can {
+                    s.focused_child_leaf().focus_changed(false);
+                    s.focus_first = !s.focus_first;
+                    s.focused_child_leaf().focus_changed(true);
+                    true
+                } else {
+                    false
                 }
             }
+            Node::Empty => false,
         }
     }
 
-    fn on_event(&mut self, display: &Display, event: &Event, control_flow: &mut ControlFlow) {
+    /// フォーカス中の葉を閉じる。戻り値 true = このノードが空になった
+    /// （＝親（またはタブ）が自分を取り除くべき）。
+    fn close_focused(&mut self) -> bool {
         match self {
-            Self::Single(layout) => layout.get_mut().on_event(event, control_flow),
-            Self::Binary(layout) => layout.on_event(display, event, control_flow),
-            Self::Tabbed(layout) => layout.on_event(display, event, control_flow),
-        }
-    }
-
-    fn close(&mut self) -> Option<Box<Layout>> {
-        match self {
-            Self::Single(_) => unreachable!(),
-            Self::Binary(layout) => {
-                if layout.focus_x {
-                    let x = layout.x_mut();
-                    if x.is_single() {
-                        layout.y_mut().focused_window_mut().focus_changed(true);
-                        layout.y.take()
+            Node::Leaf(w) => {
+                w.close_pty();
+                true
+            }
+            Node::Split(s) => {
+                let removed = if s.focus_first {
+                    s.first.close_focused()
+                } else {
+                    s.second.close_focused()
+                };
+                if removed {
+                    // 閉じた側を外し、残った側を自分の位置へ引き上げる。
+                    let survivor = if s.focus_first {
+                        std::mem::replace(&mut *s.second, Node::Empty)
                     } else {
-                        if let Some(new_x) = x.close() {
-                            layout.x = Some(new_x);
-                        }
-                        None
-                    }
-                } else {
-                    let y = layout.y_mut();
-                    if y.is_single() {
-                        layout.x_mut().focused_window_mut().focus_changed(true);
-                        layout.x.take()
-                    } else {
-                        if let Some(new_y) = y.close() {
-                            layout.y = Some(new_y);
-                        }
-                        None
-                    }
+                        std::mem::replace(&mut *s.first, Node::Empty)
+                    };
+                    *self = survivor;
+                    self.focused_leaf_mut().focus_changed(true);
                 }
+                false
             }
-            Self::Tabbed(layout) => {
-                let focused = layout.focused_mut();
-                if focused.is_single() {
-                    layout.tabs.remove(layout.focus);
-                    if layout.focus >= layout.tabs.len() {
-                        layout.focus = 0;
-                    }
-                    if !layout.tabs.is_empty() {
-                        layout
-                            .focused_mut()
-                            .focused_window_mut()
-                            .focus_changed(true);
-                    }
-                } else if let Some(new) = focused.close() {
-                    layout.tabs[layout.focus] = Some(new);
-                }
-
-                None
-            }
+            Node::Empty => false,
         }
     }
 
-    fn focused_window_mut(&mut self) -> &mut TerminalWindow {
+    /// 全葉の PTY を1ティック分汲み取り、終了した葉を刈り取る。
+    /// 分割を畳んだら `collapsed` を true にする（呼び出し側が再レイアウトする）。
+    /// 戻り値 true = このノードの全端末が終了した（タブを閉じてよい）。
+    fn update_and_prune(&mut self, collapsed: &mut bool) -> bool {
         match self {
-            Self::Single(layout) => layout.get_mut(),
-            Self::Binary(layout) => layout.focused_mut().focused_window_mut(),
-            Self::Tabbed(layout) => layout.focused_mut().focused_window_mut(),
+            Node::Leaf(w) => w.check_update(),
+            Node::Split(s) => {
+                let a_dead = s.first.update_and_prune(collapsed);
+                let b_dead = s.second.update_and_prune(collapsed);
+                if a_dead && b_dead {
+                    return true;
+                }
+                if a_dead {
+                    let focus_was_here = s.focus_first;
+                    let survivor = std::mem::replace(&mut *s.second, Node::Empty);
+                    *self = survivor;
+                    *collapsed = true;
+                    if focus_was_here {
+                        self.focused_leaf_mut().focus_changed(true);
+                    }
+                } else if b_dead {
+                    let focus_was_here = !s.focus_first;
+                    let survivor = std::mem::replace(&mut *s.first, Node::Empty);
+                    *self = survivor;
+                    *collapsed = true;
+                    if focus_was_here {
+                        self.focused_leaf_mut().focus_changed(true);
+                    }
+                }
+                false
+            }
+            Node::Empty => true,
         }
     }
+}
 
-    fn process_command(&mut self, display: &Display, cmd: Command) -> bool {
-        match self {
-            Self::Single(layout) => match cmd {
-                Command::SplitVertical | Command::SplitHorizontal => {
-                    let partition = match cmd {
-                        Command::SplitVertical => Partition::Vertical,
-                        Command::SplitHorizontal => Partition::Horizontal,
-                        _ => unreachable!(),
-                    };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-                    layout.update_cwd();
-                    let old_cwd = layout.cwd.clone();
-                    let old_window = layout.window.take().unwrap();
+    #[test]
+    fn vertical_split_leaves_a_gap_and_fills_width() {
+        let vp = Viewport { x: 10, y: 20, w: 100, h: 50 };
+        let (left, right) = split_viewport(Partition::Vertical, 0.5, vp);
 
-                    let new_window = {
-                        let cwd = Some(old_cwd.as_ref()); // derive from current pane
-                        Box::new(TerminalWindow::new(display.clone(), cwd))
-                    };
+        // 左右は同じ高さ・同じ y、左端は親の左端
+        assert_eq!(left.y, 20);
+        assert_eq!(right.y, 20);
+        assert_eq!(left.h, 50);
+        assert_eq!(right.h, 50);
+        assert_eq!(left.x, 10);
 
-                    let viewport = old_window.viewport();
+        // 仕切りで GAP 分の隙間が空く（mid=50）
+        assert_eq!(left.w, 50 - GAP);
+        assert_eq!(right.x, 10 + 50 + GAP);
+        assert_eq!(right.w, 100 - 50 - GAP);
+        // 隙間(GAP*2)を除いて親幅をちょうど覆う
+        assert_eq!(left.w + right.w + GAP * 2, vp.w);
+    }
 
-                    let mut y = Layout::new_single(new_window);
-                    let mut x = Layout::new_single(old_window);
+    #[test]
+    fn horizontal_split_leaves_a_gap_and_fills_height() {
+        let vp = Viewport { x: 0, y: 0, w: 80, h: 200 };
+        let (top, bottom) = split_viewport(Partition::Horizontal, 0.5, vp);
 
-                    x.focused_window_mut().focus_changed(false);
-                    y.focused_window_mut().focus_changed(true);
+        assert_eq!(top.w, 80);
+        assert_eq!(bottom.w, 80);
+        assert_eq!(top.x, 0);
+        assert_eq!(top.y, 0);
+        assert_eq!(top.h, 100 - GAP);
+        assert_eq!(bottom.y, 100 + GAP);
+        assert_eq!(bottom.h, 200 - 100 - GAP);
+        assert_eq!(top.h + bottom.h + GAP * 2, vp.h);
+    }
 
-                    *self = Layout::new_binary(partition, viewport, x.into(), y.into());
-                    true
-                }
+    #[test]
+    fn uneven_ratio_keeps_panes_within_parent() {
+        let vp = Viewport { x: 0, y: 0, w: 120, h: 60 };
+        let (left, right) = split_viewport(Partition::Vertical, 0.25, vp);
+        // mid = 30
+        assert_eq!(left.w, 30 - GAP);
+        assert_eq!(right.x, 30 + GAP);
+        assert_eq!(right.w, 120 - 30 - GAP);
+    }
+}
 
-                Command::SaveLayout => {
-                    layout.update_cwd();
-                    true
-                }
-                Command::RestoreLayout => {
-                    debug_assert!(layout.window.is_none());
-                    let new_window =
-                        Box::new(TerminalWindow::new(display.clone(), Some(&layout.cwd)));
-                    layout.window = Some(new_window);
-                    true
-                }
-
-                _ => false,
-            },
-
-            Self::Binary(layout) => layout.process_command(display, cmd),
-            Self::Tabbed(layout) => layout.process_command(display, cmd),
+impl SplitNode {
+    fn focused_child_leaf(&mut self) -> &mut TerminalWindow {
+        if self.focus_first {
+            self.first.focused_leaf_mut()
+        } else {
+            self.second.focused_leaf_mut()
         }
     }
 }
 
 pub struct Multiplexer {
+    window: Rc<Window>,
     display: Display,
     viewport: Viewport,
     status_view: TerminalView,
-    last_updated: std::time::Instant,
-    main_layout: Layout,
-    controller: Controller,
-    finished: bool,
+    tabs: Vec<Node>,
+    focus: usize,
+    modifiers: ModifiersState,
+    cursor_pos: PhysicalPosition<f64>,
+    exited: bool,
 }
 
 impl Multiplexer {
-    pub fn new(display: Display) -> Self {
-        let size = display.gl_window().window().inner_size();
+    pub fn new(window: Window, display: Display) -> Self {
+        let window = Rc::new(window);
+
+        let size = window.inner_size();
         let viewport = Viewport {
             x: 0,
             y: 0,
@@ -733,154 +416,236 @@ impl Multiplexer {
             h: size.height,
         };
 
-        let font_size = crate::TOYTERM_CONFIG.status_bar_font_size;
-        let status_view = TerminalView::with_viewport(display.clone(), viewport, font_size, None);
+        let status_view = TerminalView::with_viewport(
+            display.clone(),
+            viewport,
+            crate::TOYTERM_CONFIG.status_bar_font_size,
+            None,
+        );
 
-        let main_layout = {
-            let window = TerminalWindow::new(display.clone(), None);
-            let single = Layout::new_single(Box::new(window));
-            Layout::new_tabbed(viewport, single.into())
-        };
+        // 最初のタブ（1枚なのでタブバーは出ない＝全面が端末）。
+        let first = Node::Leaf(Box::new(TerminalWindow::with_viewport(
+            window.clone(),
+            display.clone(),
+            viewport,
+            None,
+        )));
 
         let mut mux = Multiplexer {
+            window,
             display,
             viewport,
             status_view,
-            last_updated: std::time::Instant::now(),
-            main_layout,
-            controller: Controller::default(),
-            finished: false,
+            tabs: vec![first],
+            focus: 0,
+            modifiers: ModifiersState::empty(),
+            cursor_pos: PhysicalPosition::default(),
+            exited: false,
         };
-
         mux.refresh_layout();
-        mux.update_status_bar();
         mux
     }
 
-    fn tab_layout(&mut self) -> &mut TabbedLayout {
-        match &mut self.main_layout {
-            Layout::Tabbed(layout) => layout,
-            _ => unreachable!(),
+    fn focused_root(&mut self) -> &mut Node {
+        &mut self.tabs[self.focus]
+    }
+
+    /// タブバーの高さ（px）。タブ1枚のときは 0（バー非表示）。
+    fn status_bar_height(&self) -> u32 {
+        if self.tabs.len() <= 1 {
+            0
+        } else {
+            self.status_view.cell_size().h
         }
     }
 
-    // Recalculate viewport recursively for each window/pane
-    fn refresh_layout(&mut self) {
-        self.status_view.set_viewport(self.viewport);
-
-        let mut window_viewport = self.viewport;
-        window_viewport.y += self.status_bar_height();
-        window_viewport.h -= self.status_bar_height();
-
-        self.main_layout.set_viewport(window_viewport);
+    /// 端末群が使える領域（タブバーの下）。
+    fn content_viewport(&self) -> Viewport {
+        let h = self.status_bar_height();
+        Viewport {
+            x: 0,
+            y: h,
+            w: self.viewport.w,
+            h: self.viewport.h.saturating_sub(h),
+        }
     }
 
-    fn status_bar_height(&self) -> u32 {
-        self.status_view.cell_size().h
+    /// 全タブのビューポートを再計算する（タブバーの有無が変わったときも）。
+    fn refresh_layout(&mut self) {
+        let bar = Viewport {
+            x: 0,
+            y: 0,
+            w: self.viewport.w,
+            h: self.status_view.cell_size().h,
+        };
+        self.status_view.set_viewport(bar);
+
+        let cvp = self.content_viewport();
+        for tab in &mut self.tabs {
+            tab.set_viewport(cvp);
+        }
     }
 
     fn update_status_bar(&mut self) {
-        const FOCUSED_FG: Color = Color::Yellow;
-        const NORMAL_FG: Color = Color::BrightBlue;
-        const BG: Color = Color::BrightGreen;
-
-        fn default_cell() -> Cell {
-            let mut cell = Cell::new_ascii(' ');
-            cell.attr.fg = NORMAL_FG;
-            cell.attr.bg = BG;
-            cell
+        if self.tabs.len() <= 1 {
+            return;
         }
 
-        struct Tab {
-            i: usize,
-            focus: bool,
-            name: String,
-        }
+        const BAR_BG: Color = Color::BrightBlack;
 
-        impl Tab {
-            fn display(&self) -> Vec<Cell> {
-                let text = format!("{}:{} ", self.i, self.name);
-                text.chars()
-                    .map(|ch| {
-                        let mut cell = default_cell();
-                        cell.ch = ch;
-                        if self.focus {
-                            cell.attr.fg = FOCUSED_FG;
-                        }
-                        cell
-                    })
-                    .collect()
-            }
-        }
+        let blank = {
+            let mut c = Cell::new_ascii(' ');
+            c.attr.fg = Color::White;
+            c.attr.bg = BAR_BG;
+            c
+        };
 
-        let cols = (self.viewport.w / self.status_view.cell_size().w) as usize;
-        let mut cells = Vec::new();
+        let cols = (self.viewport.w / self.status_view.cell_size().w).max(1) as usize;
+        let mut cells: Vec<Cell> = Vec::new();
 
-        let tab_layout = self.tab_layout();
-        let focused_tab = tab_layout.focus;
-        for (i, layout) in tab_layout.tabs.iter_mut().enumerate() {
-            if let Some(layout) = layout {
-                let win = layout.focused_window_mut();
-                let name = win.get_foreground_process_name();
-                let last_part = name.rsplit('/').next().unwrap().to_owned();
-
-                let tab = Tab {
-                    i,
-                    focus: i == focused_tab,
-                    name: last_part,
-                };
-
-                cells.extend(tab.display());
-            }
-        }
-
-        cells.resize(cols, default_cell());
-
-        // display date/time
-        {
-            use chrono::{DateTime, Local};
-            let now: DateTime<Local> = Local::now();
-
-            let text = format!("{}", now.format("%Y/%m/%d %H:%M"));
-            let start = cols.saturating_sub(text.len());
-            for (i, ch) in text.chars().enumerate() {
-                if let Some(cell) = cells.get_mut(start + i) {
-                    cell.ch = ch;
-                    cell.attr.fg = NORMAL_FG;
+        for i in 0..self.tabs.len() {
+            let focused = i == self.focus;
+            let label = format!(" {} ", i + 1);
+            for ch in label.chars() {
+                let mut c = Cell::new_ascii(ch);
+                if focused {
+                    c.attr.fg = Color::Black;
+                    c.attr.bg = Color::White;
+                } else {
+                    c.attr.fg = Color::White;
+                    c.attr.bg = BAR_BG;
                 }
+                cells.push(c);
             }
         }
+
+        cells.truncate(cols);
+        cells.resize(cols, blank);
 
         self.status_view.update_contents(|view| {
-            view.bg_color = BG;
-            view.lines = vec![cells.into_iter().collect()];
+            view.bg_color = BAR_BG;
+            view.lines = vec![Line::from_cells(cells, false)];
             view.images = Vec::new();
             view.cursor = None;
             view.selection_range = None;
         });
-
-        self.last_updated = std::time::Instant::now();
     }
 
-    pub fn on_event(&mut self, event: &Event, control_flow: &mut ControlFlow) {
-        if self.finished {
-            *control_flow = ControlFlow::Exit;
-            return;
+    fn parse_shortcut(&self, key: &KeyEvent) -> Option<Action> {
+        if key.state != ElementState::Pressed {
+            return None;
         }
-
-        if let Some(cmd) = self.controller.on_event(event) {
-            self.process_command(cmd);
-            return;
+        let code = match key.physical_key {
+            PhysicalKey::Code(c) => c,
+            PhysicalKey::Unidentified(_) => return None,
+        };
+        if !self.modifiers.control_key() {
+            return None;
         }
+        let shift = self.modifiers.shift_key();
 
-        match &event {
-            Event::WindowEvent { event: wev, .. } => match wev {
-                WindowEvent::CloseRequested => {
-                    *control_flow = ControlFlow::Exit;
+        let action = match (shift, code) {
+            // タブ
+            (false, KeyCode::Tab) => Action::NextTab,
+            (true, KeyCode::Tab) => Action::PrevTab,
+            (true, KeyCode::KeyT) => Action::NewTab,
+            (true, KeyCode::KeyW) | (true, KeyCode::KeyQ) => Action::CloseFocused,
+            // 分割
+            (true, KeyCode::KeyE) => Action::SplitVertical,
+            (true, KeyCode::KeyO) => Action::SplitHorizontal,
+            // フォーカス移動
+            (true, KeyCode::ArrowUp) => Action::Focus(Dir::Up),
+            (true, KeyCode::ArrowDown) => Action::Focus(Dir::Down),
+            (true, KeyCode::ArrowLeft) => Action::Focus(Dir::Left),
+            (true, KeyCode::ArrowRight) => Action::Focus(Dir::Right),
+            _ => return None,
+        };
+        Some(action)
+    }
+
+    fn handle_action(&mut self, action: Action) {
+        match action {
+            Action::NewTab => {
+                self.focused_root().focused_leaf_mut().focus_changed(false);
+
+                // タブが増えるとバーが出て内容領域が縮むので、push 後に再レイアウト。
+                let cvp = self.content_viewport();
+                let pane = Node::Leaf(Box::new(TerminalWindow::with_viewport(
+                    self.window.clone(),
+                    self.display.clone(),
+                    cvp,
+                    None,
+                )));
+                self.tabs.push(pane);
+                self.focus = self.tabs.len() - 1;
+                self.refresh_layout();
+                self.focused_root().focused_leaf_mut().focus_changed(true);
+                self.update_status_bar();
+            }
+
+            Action::CloseFocused => {
+                let tab_empty = self.tabs[self.focus].close_focused();
+                if tab_empty {
+                    self.tabs.remove(self.focus);
+                    if self.tabs.is_empty() {
+                        self.exited = true;
+                        return;
+                    }
+                    if self.focus >= self.tabs.len() {
+                        self.focus = self.tabs.len() - 1;
+                    }
+                    self.focused_root().focused_leaf_mut().focus_changed(true);
+                }
+                // タブ削除でも分割の畳み込みでも、残ったペインを広げ直す。
+                self.refresh_layout();
+                self.update_status_bar();
+            }
+
+            Action::NextTab | Action::PrevTab => {
+                if self.tabs.len() <= 1 {
                     return;
                 }
+                self.focused_root().focused_leaf_mut().focus_changed(false);
+                let n = self.tabs.len();
+                self.focus = match action {
+                    Action::NextTab => (self.focus + 1) % n,
+                    _ => (self.focus + n - 1) % n,
+                };
+                self.focused_root().focused_leaf_mut().focus_changed(true);
+                self.update_status_bar();
+            }
 
-                WindowEvent::Resized(new_size) => {
+            Action::SplitVertical | Action::SplitHorizontal => {
+                let partition = match action {
+                    Action::SplitVertical => Partition::Vertical,
+                    _ => Partition::Horizontal,
+                };
+                let window = self.window.clone();
+                let display = self.display.clone();
+                self.tabs[self.focus].split_focused(partition, &window, &display);
+            }
+
+            Action::Focus(dir) => {
+                self.tabs[self.focus].move_focus(dir);
+            }
+        }
+    }
+
+    pub fn on_event(&mut self, event: &Event, elwt: &EventLoopWindowTarget<()>) {
+        if self.exited {
+            elwt.exit();
+            return;
+        }
+
+        match event {
+            Event::WindowEvent { event: wev, .. } => match wev {
+                WindowEvent::CloseRequested => {
+                    elwt.exit();
+                }
+
+                &WindowEvent::Resized(new_size) => {
+                    // glium 0.34 の手書きサーフェスは自動リサイズされないため明示。
+                    self.display.resize((new_size.width, new_size.height));
                     self.viewport = Viewport {
                         x: 0,
                         y: 0,
@@ -889,262 +654,123 @@ impl Multiplexer {
                     };
                     self.refresh_layout();
                     self.update_status_bar();
-                    return;
                 }
 
-                _ => {}
+                WindowEvent::RedrawRequested => {
+                    let mut surface = self.display.draw();
+
+                    // まずフレーム全体を背景色でクリアする。分割の隙間や、
+                    // バー左右の余白を埋める。各ペインは自分の矩形を上書きする。
+                    {
+                        use glium::Surface as _;
+                        let bg = crate::TOYTERM_CONFIG.color_background;
+                        let r = ((bg >> 24) & 0xff) as f32 / 255.0;
+                        let g = ((bg >> 16) & 0xff) as f32 / 255.0;
+                        let b = ((bg >> 8) & 0xff) as f32 / 255.0;
+                        let a = (bg & 0xff) as f32 / 255.0;
+                        surface.clear_color_srgb(r, g, b, a);
+                    }
+
+                    if self.status_bar_height() > 0 {
+                        self.status_view.draw(&mut surface);
+                    }
+                    self.tabs[self.focus].draw(&mut surface);
+
+                    surface.finish().expect("finish");
+                }
+
+                WindowEvent::ModifiersChanged(m) => {
+                    self.modifiers = m.state();
+                    // 各ペインの内部修飾キー状態も合わせておく（フォーカス切替後も正しく）。
+                    for tab in &mut self.tabs {
+                        tab.for_each_leaf(&mut |w| w.process_window_event(wev));
+                    }
+                }
+
+                WindowEvent::KeyboardInput { event: key, .. } => {
+                    if let Some(action) = self.parse_shortcut(key) {
+                        self.handle_action(action);
+                    } else {
+                        self.focused_root().focused_leaf_mut().process_window_event(wev);
+                    }
+                }
+
+                WindowEvent::CursorMoved { position, .. } => {
+                    self.cursor_pos = *position;
+                    // どのペインでドラッグ選択しても効くよう、全ペインへ座標を配る。
+                    let focus_tab = self.focus;
+                    self.tabs[focus_tab].for_each_leaf(&mut |w| w.process_window_event(wev));
+                }
+
+                WindowEvent::MouseInput {
+                    state: ElementState::Pressed,
+                    ..
+                } => {
+                    // クリックしたペインへフォーカスを移してから入力を渡す。
+                    let p = self.cursor_pos;
+                    self.focused_root().focused_leaf_mut().focus_changed(false);
+                    self.tabs[self.focus].focus_at(p);
+                    self.focused_root().focused_leaf_mut().focus_changed(true);
+                    self.focused_root().focused_leaf_mut().process_window_event(wev);
+                }
+
+                // フォーカス・IME・ホイール・マウス離し等はフォーカス中ペインへ。
+                _ => {
+                    self.focused_root().focused_leaf_mut().process_window_event(wev);
+                }
             },
 
-            Event::RedrawRequested(_) => {
-                let mut surface = self.display.draw();
-                self.status_view.draw(&mut surface);
-                self.main_layout.draw(&mut surface);
-                surface.finish().expect("finish");
-                return;
-            }
-
-            Event::MainEventsCleared => {
-                if self.last_updated.elapsed().as_secs() >= 5 {
+            Event::AboutToWait => {
+                // 全タブの PTY を汲み取り、終了したペイン/タブを取り除く。
+                let mut changed = false;
+                let mut i = 0;
+                while i < self.tabs.len() {
+                    let mut collapsed = false;
+                    let empty = self.tabs[i].update_and_prune(&mut collapsed);
+                    if collapsed {
+                        changed = true;
+                    }
+                    if empty {
+                        self.tabs.remove(i);
+                        changed = true;
+                        if self.tabs.is_empty() {
+                            elwt.exit();
+                            return;
+                        }
+                        // フォーカス index を取り除いた位置に合わせて補正する。
+                        if i < self.focus {
+                            self.focus -= 1;
+                        } else if i == self.focus {
+                            if self.focus >= self.tabs.len() {
+                                self.focus = self.tabs.len() - 1;
+                            }
+                            // フォーカスしていたタブが消えたので、新しいタブの葉へ。
+                            self.focused_root().focused_leaf_mut().focus_changed(true);
+                        }
+                        // remove(i) で詰めたので i はそのまま次のタブを指す。
+                    } else {
+                        i += 1;
+                    }
+                }
+                // ペインやタブが減ったら、残ったペインを領域いっぱいに広げ直す。
+                if changed {
+                    self.refresh_layout();
                     self.update_status_bar();
                 }
 
-                self.display.gl_window().window().request_redraw();
+                let need = self.tabs[self.focus].needs_redraw()
+                    || (self.status_bar_height() > 0 && self.status_view.needs_redraw());
+                if need {
+                    self.window.request_redraw();
+                }
+
+                // 約16ms(=60fps)ごとにポーリングして PTY 出力を拾う。
+                elwt.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(16),
+                ));
             }
 
             _ => {}
-        }
-
-        let mut cf = ControlFlow::default();
-        self.main_layout.on_event(&self.display, event, &mut cf);
-
-        if cf == ControlFlow::Exit {
-            self.close_focused_window();
-        }
-    }
-
-    fn process_command(&mut self, cmd: Command) {
-        log::debug!("command: {:?}", cmd);
-        match cmd {
-            Command::Nop => {}
-
-            Command::SaveLayout => {
-                self.main_layout
-                    .process_command(&self.display, Command::SaveLayout);
-                self.refresh_layout();
-
-                let path = find_layout_file();
-                let bytes = serde_json::to_vec(&self.main_layout).expect("serialize");
-                match std::fs::write(&path, &bytes) {
-                    Ok(_) => {
-                        log::info!("layout saved in {}", path.display());
-                    }
-                    Err(err) => {
-                        log::error!("Failed to save layout in {}: {err}", path.display());
-                    }
-                }
-            }
-
-            Command::RestoreLayout => {
-                let path = find_layout_file();
-                let restore_result = std::fs::read(&path).and_then(|bytes| {
-                    serde_json::from_slice(&bytes).map_err(|err| {
-                        use std::io::{Error, ErrorKind};
-                        Error::new(ErrorKind::Other, format!("layout file corrupted: {err}"))
-                    })
-                });
-
-                let saved_layout = match restore_result {
-                    Ok(saved_layout) => saved_layout,
-                    Err(err) => {
-                        log::error!("Failed to restore layout from {}: {err}", path.display());
-                        return;
-                    }
-                };
-
-                self.main_layout = saved_layout;
-                self.main_layout
-                    .process_command(&self.display, Command::RestoreLayout);
-                self.main_layout.update_focus(true);
-
-                self.refresh_layout();
-                self.update_status_bar();
-
-                self.controller.maximized = false;
-
-                log::info!("layout restored from {}", path.display());
-            }
-
-            Command::SetMaximize | Command::ResetMaximize => {
-                self.main_layout.process_command(&self.display, cmd);
-                self.refresh_layout();
-            }
-
-            Command::FocusUp
-            | Command::FocusDown
-            | Command::FocusLeft
-            | Command::FocusRight
-            | Command::SplitVertical
-            | Command::SplitHorizontal
-            | Command::ResizeIncreaseUp
-            | Command::ResizeDecreaseUp
-            | Command::ResizeIncreaseLeft
-            | Command::ResizeDecreaseLeft => {
-                if self.controller.maximized {
-                    self.controller.maximized = false;
-                    self.main_layout
-                        .process_command(&self.display, Command::ResetMaximize);
-                    self.refresh_layout();
-                }
-
-                self.main_layout.process_command(&self.display, cmd);
-            }
-
-            Command::FocusNextTab
-            | Command::FocusPrevTab
-            | Command::FocusTab(_)
-            | Command::AddNewTab => {
-                self.main_layout.process_command(&self.display, cmd);
-                self.update_status_bar();
-            }
-
-            Command::Close => {
-                self.close_focused_window();
-            }
-        }
-    }
-
-    fn close_focused_window(&mut self) {
-        self.main_layout.close();
-        self.update_status_bar();
-
-        if self.tab_layout().tabs.is_empty() {
-            self.finished = true;
-        } else {
-            // FIXME
-            self.controller.maximized = false;
-            self.main_layout
-                .process_command(&self.display, Command::ResetMaximize);
-
-            self.refresh_layout();
-            self.update_status_bar();
-        }
-    }
-}
-
-fn find_layout_file() -> PathBuf {
-    let config_home = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| {
-            // fallback to "$HOME/.config"
-            let home = std::env::var_os("HOME")?;
-            let mut p = PathBuf::from(home);
-            p.push(".config");
-            Some(p)
-        })
-        .unwrap_or_else(|| {
-            // otherwise use "/tmp"
-            std::env::temp_dir()
-        });
-
-    let mut layout_path = config_home;
-    layout_path.push("toyterm");
-    layout_path.push("layout.json");
-    layout_path
-}
-
-#[derive(Default)]
-struct Controller {
-    modifiers: ModifiersState,
-    consume: bool,
-    maximized: bool,
-}
-
-impl Controller {
-    fn on_event(&mut self, event: &Event) -> Option<Command> {
-        if let Event::WindowEvent { event: wev, .. } = event {
-            match wev {
-                &WindowEvent::ModifiersChanged(new_states) => {
-                    self.modifiers = new_states;
-                }
-
-                &WindowEvent::ReceivedCharacter(ch) => {
-                    return self.on_character(ch);
-                }
-
-                WindowEvent::KeyboardInput { input, .. }
-                    if input.state == ElementState::Pressed =>
-                {
-                    if let Some(key) = input.virtual_keycode {
-                        return self.on_key_press(key);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        None
-    }
-
-    fn on_character(&mut self, ch: char) -> Option<Command> {
-        if !self.consume {
-            if ch == '\x01' {
-                self.consume = true;
-                Some(Command::Nop)
-            } else {
-                None
-            }
-        } else {
-            self.consume = false;
-            match ch {
-                '\x01' => None,
-                '\x1b' => Some(Command::Nop),
-                'c' => Some(Command::AddNewTab),
-                'n' => Some(Command::FocusNextTab),
-                'p' => Some(Command::FocusPrevTab),
-                digit @ ('0'..='9') => {
-                    let n = digit as u32 - '0' as u32;
-                    Some(Command::FocusTab(n as usize))
-                }
-                '%' => Some(Command::SplitVertical),
-                '"' => Some(Command::SplitHorizontal),
-                's' => Some(Command::SaveLayout),
-                'r' => Some(Command::RestoreLayout),
-                'z' => {
-                    self.maximized ^= true;
-                    if self.maximized {
-                        Some(Command::SetMaximize)
-                    } else {
-                        Some(Command::ResetMaximize)
-                    }
-                }
-                'x' => Some(Command::Close),
-                _ => Some(Command::Nop),
-            }
-        }
-    }
-
-    fn on_key_press(&mut self, keycode: VirtualKeyCode) -> Option<Command> {
-        use ModifiersState as Mod;
-        const EMPTY: u32 = Mod::empty().bits();
-        const CTRL: u32 = Mod::CTRL.bits();
-
-        if self.consume {
-            let cmd = match (self.modifiers.bits(), keycode) {
-                (EMPTY, VirtualKeyCode::Up) => Command::FocusUp,
-                (EMPTY, VirtualKeyCode::Down) => Command::FocusDown,
-                (EMPTY, VirtualKeyCode::Left) => Command::FocusLeft,
-                (EMPTY, VirtualKeyCode::Right) => Command::FocusRight,
-                (CTRL, VirtualKeyCode::Up) => Command::ResizeDecreaseUp,
-                (CTRL, VirtualKeyCode::Down) => Command::ResizeIncreaseUp,
-                (CTRL, VirtualKeyCode::Left) => Command::ResizeDecreaseLeft,
-                (CTRL, VirtualKeyCode::Right) => Command::ResizeIncreaseLeft,
-                _ => return None,
-            };
-
-            self.consume = false;
-            Some(cmd)
-        } else {
-            None
         }
     }
 }

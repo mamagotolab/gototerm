@@ -579,7 +579,12 @@ impl TerminalView {
             let g = ((bg >> 16) & 0xff) as f32 / 255.0;
             let b = ((bg >> 8) & 0xff) as f32 / 255.0;
             let a = (bg & 0xff) as f32 / 255.0;
-            surface.clear_color_srgb(r, g, b, a);
+            // 自分のビューポート矩形だけをクリアする。複数ペインが1つの
+            // フレームバッファを分け合うため全体クリアは使えない（他ペインを
+            // 消す）。枠の隙間はマネージャ側がフレーム全体クリアで塗る。
+            let (fw, fh) = self.display.get_framebuffer_dimensions();
+            let rect = self.viewport.to_glium_rect(PhysicalSize::new(fw, fh));
+            surface.clear(Some(&rect), Some((r, g, b, a)), true, None, None);
         }
 
         for query in iter_bg.chain(iter_fg) {
