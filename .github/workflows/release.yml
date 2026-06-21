@@ -1,0 +1,57 @@
+name: Release
+
+# v0.2.0 のような「v」始まりのタグを push すると、各 OS のバイナリを
+# ビルドして GitHub Release に添付する。利用者はビルド不要でダウンロードできる。
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    env:
+      # CI runner の新しい Visual Studio / CMake に合わせる（CI と同じ回避策）。
+      CMAKE_GENERATOR: Ninja
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Rename artifact
+        run: Copy-Item target/release/gototerm.exe gototerm-windows-x64.exe
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gototerm-windows-x64.exe
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            cmake
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Build
+        run: cargo build --release
+      - name: Rename artifact
+        run: cp target/release/gototerm gototerm-linux-x64
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: gototerm-linux-x64

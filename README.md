@@ -26,49 +26,51 @@ gototerm（ゴトターム）は、日本語を打つ人のために作られた
 
 ## インストール
 
-### 必要なもの
+### 🪟 Windows（ビルド不要・おすすめ）
 
-- Rust ツールチェイン（`cargo`）
-- FreeType / fontconfig（フォント描画）
-- **Linux**: Wayland 環境（X11 でも XWayland 経由で動作）
-- **Windows**: Windows 10 以降（ConPTY を使用）。クリップボードは OS 標準を使用
+[**Releases ページ**](https://github.com/mamagotolab/gototerm/releases/latest) から
+`gototerm-windows-x64.exe` をダウンロードし、ダブルクリックで起動するだけです。
 
-### ビルドと導入
+- 設定ファイル（任意）は **`%APPDATA%\gototerm\config.toml`**。無くても内蔵フォントで動きます。
+- フォントを変えたい場合の例:
+
+  ```toml
+  fonts_regular = [
+      "C:/Windows/Fonts/consola.ttf",   # 英数字
+      "C:/Windows/Fonts/YuGothM.ttc",   # 日本語（游ゴシック等）
+  ]
+  ```
+
+> 起動しない場合は、[Microsoft Visual C++ 再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+> を入れてください（多くの PC には既に入っています）。
+
+### Linux（ソースからビルド）
 
 ```sh
 git clone https://github.com/mamagotolab/gototerm.git
 cd gototerm
-
-# ビルド＆インストール
 cargo install --path .
 ```
 
-> 📦 **ビルドに必要なシステムライブラリ**（Arch の例）:
-> `sudo pacman -S freetype2 fontconfig wayland libxkbcommon cmake`
-> （Debian/Ubuntu 系は `libfreetype6-dev libfontconfig1-dev libwayland-dev libxkbcommon-dev cmake`）
+必要なシステムライブラリ（Arch の例）:
+`sudo pacman -S freetype2 fontconfig wayland libxkbcommon cmake`
+（Debian/Ubuntu 系は `libfreetype6-dev libfontconfig1-dev libwayland-dev libxkbcommon-dev cmake`）
 
-> 🪟 **Windows**: Rust（MSVC ツールチェイン）・**Visual Studio の C++ ビルドツール**・CMake が必要です
-> （FreeType をビルド時に同梱ソースから生成するため）。
-> **「x64 Native Tools Command Prompt for VS」**を開いて `cargo build --release` を実行します。
-> cmake が「couldn't determine visual studio generator」で止まる場合は、
-> Ninja を入れて generator を明示すると確実です:
->
-> ```cmd
-> set CMAKE_GENERATOR=Ninja
-> set CMAKE_POLICY_VERSION_MINIMUM=3.5
-> cargo build --release
-> ```
->
-> （`CMAKE_POLICY_VERSION_MINIMUM` は、新しい CMake が同梱 FreeType の
-> 古いポリシー宣言を拒否する場合の回避策です。）
-> 設定ファイルは **`%APPDATA%\gototerm\config.toml`**、フォントは下記のように Windows のパスを指定します:
->
-> ```toml
-> fonts_regular = [
->     "C:/Windows/Fonts/consola.ttf",   # 英数字
->     "C:/Windows/Fonts/YuGothM.ttc",   # 日本語（游ゴシック等）
-> ]
-> ```
+### Windows でソースからビルドする場合
+
+Rust（MSVC ツールチェイン）・Visual Studio の C++ ビルドツール・CMake が必要です。
+**PowerShell** で（`set` ではなく `$env:` で環境変数を渡す点に注意）:
+
+```powershell
+git clone https://github.com/mamagotolab/gototerm.git
+cd gototerm
+$env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"   # 新しいCMakeが同梱FreeTypeの古いポリシーを拒否するため
+cargo build --release
+# 生成物: target\release\gototerm.exe
+```
+
+> もし「couldn't determine visual studio generator」で止まる場合は、
+> `winget install Ninja-build.Ninja` で Ninja を入れ、`$env:CMAKE_GENERATOR = "Ninja"` も足してください。
 
 > ℹ️ **terminfo の導入は不要です。**
 > 内部の VT エンジンに [alacritty_terminal](https://crates.io/crates/alacritty_terminal)
