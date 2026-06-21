@@ -17,6 +17,8 @@ gototerm（ゴートターム）は、日本語を打つ人のために作られ
 - **軽い** — GPU 必須の重量級端末に比べてメモリが小さい（実測でメモリ約 1/3、バイナリも約半分）。
 - **半透明＋ぼかし対応** — 背景の不透明度を細かく指定でき、Wayland コンポジタのブラーと相性良し。
 - **全角幅に配慮** — East Asian Width（曖昧幅）を設定で切り替え可能。日本語の表組みが崩れにくい。
+- **完全な VT 互換** — VT エンジンに [alacritty_terminal](https://crates.io/crates/alacritty_terminal) を採用。nvim・Claude Code 等の高機能 TUI も正しく描画。
+- **タブ・画面分割・Sixel 画像** — 端末内で画像表示（yazi のプレビューなど）も可能。
 
 ---
 
@@ -31,12 +33,16 @@ gototerm（ゴートターム）は、日本語を打つ人のために作られ
 ### ビルドと導入
 
 ```sh
-git clone <このリポジトリ>
+git clone https://github.com/mamagotolab/gototerm.git
 cd gototerm
 
 # ビルド＆インストール
 cargo install --path .
 ```
+
+> 📦 **ビルドに必要なシステムライブラリ**（Arch の例）:
+> `sudo pacman -S freetype2 fontconfig wayland libxkbcommon cmake`
+> （Debian/Ubuntu 系は `libfreetype6-dev libfontconfig1-dev libwayland-dev libxkbcommon-dev cmake`）
 
 > ℹ️ **terminfo の導入は不要です。**
 > 内部の VT エンジンに [alacritty_terminal](https://crates.io/crates/alacritty_terminal)
@@ -134,6 +140,26 @@ color_magenta    = 0xBB9AF7FF
 | `Ctrl + Shift + L` | スクロールバックの履歴を消去 |
 | `Shift + マウスホイール` | 履歴スクロール |
 
+### タブ
+
+| キー | 動作 |
+|---|---|
+| `Ctrl + Shift + T` | 新しいタブ |
+| `Ctrl + Tab` / `Ctrl + Shift + Tab` | 次 / 前のタブ |
+| `Ctrl + Shift + W` | 現在のペイン（最後の1つならタブ）を閉じる |
+
+> タブが 2 枚以上のときだけ画面上部にタブバーが出ます（1 枚なら全面が端末）。
+
+### 画面分割
+
+| キー | 動作 |
+|---|---|
+| `Ctrl + Shift + E` | 縦の仕切りで左右に分割 |
+| `Ctrl + Shift + O` | 横の仕切りで上下に分割 |
+| `Ctrl + Shift + ↑ / ↓ / ← / →` | 隣のペインへフォーカス移動 |
+| `Ctrl + Shift + Q` | 現在のペインを閉じる |
+| クリック | クリックしたペインにフォーカス |
+
 ---
 
 ## 対応・非対応
@@ -142,8 +168,11 @@ color_magenta    = 0xBB9AF7FF
 - ✅ **完全な VT 互換**（alacritty_terminal エンジン採用）。nvim・Claude Code 等の
   高機能 TUI も正しく描画できる。SGR（RGB / 256 色）・Alternate Screen・
   Bracketed Paste・スクロールバック対応
-- ⚠️ 画像表示（Sixel / kitty graphics）は未対応
-- ⚠️ Linux で動作（Windows 対応・タブ・画面分割は作業中）
+- ✅ タブ・画面分割（二分割を入れ子に。上のキー操作を参照）
+- ✅ **Sixel 画像表示**（yazi のプレビュー・アルバムアートなど。`?62;4c` で対応申告）
+- ⚠️ kitty graphics protocol は未対応（画像は Sixel のみ）
+- ⚠️ 画像はスクロールに追従しない（全画面 TUI での絶対配置は問題なし）
+- ⚠️ Linux で動作（Windows 対応は作業中）
 
 ---
 

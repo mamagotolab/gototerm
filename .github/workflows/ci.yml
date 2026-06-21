@@ -1,21 +1,28 @@
 name: CI
+
 on: [push, pull_request]
 
 jobs:
-  build_normal:
+  build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-    - run: cargo build --release
+      - uses: actions/checkout@v4
 
-  build_mux:
-    runs-on: ubuntu-latest
-    steps:
-    - uses: actions/checkout@v2
-    - uses: actions-rs/toolchain@v1
-      with:
-        toolchain: stable
-    - run: cargo build --release --features=multiplex
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libfreetype6-dev \
+            libfontconfig1-dev \
+            libwayland-dev \
+            libxkbcommon-dev \
+            cmake
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --release
+
+      - name: Test
+        run: cargo test
