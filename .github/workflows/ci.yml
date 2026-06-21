@@ -29,11 +29,13 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
-    # cmake クレートは新しい Visual Studio(18=2026相当)の generator 名を知らず
-    # 自動判定に失敗する。Ninja を明示指定すれば VS バージョンに依存せずビルドできる
-    # （MSVC 環境さえ通っていればよい。windows-latest には Ninja が標準で入っている）。
     env:
+      # cmake クレートは新しい Visual Studio(18=2026相当)の generator 名を知らず
+      # 自動判定に失敗する。Ninja を明示すれば VS バージョン非依存でビルドできる。
       CMAKE_GENERATOR: Ninja
+      # 同梱 FreeType の CMakeLists が古い cmake_minimum_required を宣言しており、
+      # 新しい CMake(4.x) が互換ポリシー不足で拒否する。最小ポリシーを指定して許可する。
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
     steps:
       - uses: actions/checkout@v4
 
