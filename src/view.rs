@@ -482,6 +482,12 @@ impl TerminalView {
 
                 let fg = Color::White;
                 let bg = self.bg_color;
+                // preedit の下にある既存文字を確実に隠すため、塗りつぶしは
+                // 不透明な背景色にする（透過のままだと下の文字が透けて重なる）。
+                // さらに前景バッファに積み、セル本体のグリフより後に描く。
+                let opaque_bg = Color::Rgb {
+                    rgba: color_to_rgba(self.bg_color) | 0x0000_00FF,
+                };
 
                 for ch in self.preedit.chars() {
                     let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
@@ -490,15 +496,15 @@ impl TerminalView {
                     }
                     let cell_width_px = cell_size.w * ch_width as u32;
 
-                    // 背景（カーソルブロック等を塗りつぶす）
+                    // 背景（下の既存文字・カーソルブロックを不透明に塗りつぶす）
                     let rect = PixelRect {
                         x: leftline as i32,
                         y: (row * cell_size.h) as i32,
                         w: cell_width_px,
                         h: cell_size.h,
                     };
-                    let vs = rect_vertices(rect.to_gl(viewport), fg, bg);
-                    self.vertices_bg.extend_from_slice(&vs);
+                    let vs = rect_vertices(rect.to_gl(viewport), fg, opaque_bg);
+                    self.vertices_fg.extend_from_slice(&vs);
 
                     // 下線（変換中の目印）
                     let underline = PixelRect {
