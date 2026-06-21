@@ -34,17 +34,14 @@ gototerm（ゴートターム）は、日本語を打つ人のために作られ
 git clone <このリポジトリ>
 cd gototerm
 
-# ① terminfo を必ず入れる（重要）
-tic -x toyterm.info
-
-# ② ビルド＆インストール
+# ビルド＆インストール
 cargo install --path .
 ```
 
-> ⚠️ **terminfo（`tic -x toyterm.info`）は必須です。**
-> これを入れないと nvim 等のアプリが端末の能力を認識できず、
-> 画面に `B` のような文字が大量に漏れて崩れます。最初に必ず実行してください。
-> （`TERM=toyterm-256color` として動作します。グローバル導入は `sudo tic -x toyterm.info`）
+> ℹ️ **terminfo の導入は不要です。**
+> 内部の VT エンジンに [alacritty_terminal](https://crates.io/crates/alacritty_terminal)
+> を採用し、`TERM=xterm-256color` として動作します。xterm-256color の terminfo は
+> ほぼ全ての環境に標準で入っているため、`tic` での導入は要りません。
 
 ---
 
@@ -141,10 +138,12 @@ color_magenta    = 0xBB9AF7FF
 
 ## 対応・非対応
 
-- ✅ 日本語入力（IME・インライン変換）、UTF-8、SIXEL 画像、マウスレポート、ハードウェア描画
-- ✅ ECMA-48 準拠の主要な制御機能、SGR（RGB / 256 色）、Alternate Screen、Bracketed Paste 等
-- ⚠️ VT 対応は実用十分だが完全ではない。重い装飾系 TUI プラグインでは表示が崩れることがある
-- ⚠️ 現状 Linux 専用（Windows 対応は作業中）
+- ✅ 日本語入力（IME・インライン変換）、UTF-8、マウスレポート、ハードウェア描画
+- ✅ **完全な VT 互換**（alacritty_terminal エンジン採用）。nvim・Claude Code 等の
+  高機能 TUI も正しく描画できる。SGR（RGB / 256 色）・Alternate Screen・
+  Bracketed Paste・スクロールバック対応
+- ⚠️ 画像表示（Sixel / kitty graphics）は未対応
+- ⚠️ Linux で動作（Windows 対応・タブ・画面分割は作業中）
 
 ---
 
