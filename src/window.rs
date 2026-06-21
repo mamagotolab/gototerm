@@ -13,11 +13,37 @@ use crate::Display;
 type Event = winit::event::Event<()>;
 type CursorPosition = PhysicalPosition<f64>;
 
+/// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
+fn set_clipboard(text: &str) {
+    use std::io::Write as _;
+    use std::process::{Command, Stdio};
+    match Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
+        Ok(mut child) => {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            // wl-copy は stdin を読み終えると選択を保持するため wait しない
+        }
+        Err(e) => log::error!("wl-copy の起動に失敗: {}", e),
+    }
+}
+
+/// Wayland のクリップボードから読み出す（wl-paste）。
+fn get_clipboard() -> String {
+    use std::process::Command;
+    match Command::new("wl-paste").arg("--no-newline").output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(e) => {
+            log::error!("wl-paste の起動に失敗: {}", e);
+            String::new()
+        }
+    }
+}
+
 pub struct TerminalWindow {
     window: Window,
     display: Display,
     terminal: Terminal,
-    clipboard: arboard::Clipboard,
 
     view: TerminalView,
     mode: Mode,
@@ -88,7 +114,6 @@ impl TerminalWindow {
             window,
             display,
             terminal,
-            clipboard: arboard::Clipboard::new().expect("clipboard"),
 
             view,
             mode: Mode::default(),
@@ -383,6 +408,21 @@ impl TerminalWindow {
         }
     }
 
+    /// IME 候補ウィンドウの表示位置を、現在のカーソルセルに合わせて更新する。
+    fn update_ime_position(&self) {
+        if let Some(cursor) = self.view.cursor {
+            let cell_size = self.view.cell_size();
+            let vp = self.viewport();
+            self.window.set_ime_cursor_area(
+                PhysicalPosition::new(
+                    vp.x + cursor.col as u32 * cell_size.w,
+                    vp.y + cursor.row as u32 * cell_size.h,
+                ),
+                PhysicalSize::new(cell_size.w, cell_size.h),
+            );
+        }
+    }
+
     pub fn on_event(&mut self, event: &Event, elwt: &EventLoopWindowTarget<()>) {
         match event {
             Event::WindowEvent { event, .. } => match event {
@@ -412,6 +452,8 @@ impl TerminalWindow {
                     Ime::Preedit(text, _) => {
                         let text = text.clone();
                         self.view.update_contents(|view| view.preedit = text);
+                        // 変換中は内容更新が起きないので、ここで候補位置を更新する
+                        self.update_ime_position();
                     }
                     // 確定した文字列を PTY に流し、変換中表示を消す。
                     Ime::Commit(text) => {
@@ -420,6 +462,7 @@ impl TerminalWindow {
                     }
                     Ime::Enabled | Ime::Disabled => {
                         self.view.update_contents(|view| view.preedit.clear());
+                        self.update_ime_position();
                     }
                 },
 
@@ -736,24 +779,18 @@ impl TerminalWindow {
         }
 
         log::info!("copy: {:?}", text);
-        let _ = self.clipboard.set_text(text);
+        set_clipboard(&text);
     }
 
     fn paste_clipboard(&mut self) {
-        match self.clipboard.get_text() {
-            Ok(text) => {
-                log::debug!("paste: {:?}", text);
-                if self.mode.bracketed_paste {
-                    self.terminal.pty_write(b"\x1b[200~");
-                    self.terminal.pty_write(text.as_bytes());
-                    self.terminal.pty_write(b"\x1b[201~");
-                } else {
-                    self.terminal.pty_write(text.as_bytes());
-                }
-            }
-            Err(_) => {
-                log::error!("Failed to paste something from clipboard");
-            }
+        let text = get_clipboard();
+        log::debug!("paste: {:?}", text);
+        if self.mode.bracketed_paste {
+            self.terminal.pty_write(b"\x1b[200~");
+            self.terminal.pty_write(text.as_bytes());
+            self.terminal.pty_write(b"\x1b[201~");
+        } else {
+            self.terminal.pty_write(text.as_bytes());
         }
     }
 

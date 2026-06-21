@@ -19,7 +19,6 @@ glutin = "0.31"
 glutin-winit = "0.4"
 raw-window-handle = "0.5"
 freetype-rs = "0.26.0"
-arboard = { version = "2.1.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 config = { version = "0.13.1", default-features = false, features = ["toml"] }
 lazy_static = "1.4.0"

@@ -59,18 +59,24 @@ fn build_window<T>(
     let (window, gl_config) = glutin_winit::DisplayBuilder::new()
         .with_window_builder(Some(window_builder))
         .build(event_loop, template, |configs| {
-            // 透過に対応する config を優先して選ぶ。
-            configs
-                .reduce(|acc, c| {
-                    let better = c.supports_transparency().unwrap_or(false)
-                        && !acc.supports_transparency().unwrap_or(false);
-                    if better {
-                        c
-                    } else {
-                        acc
-                    }
-                })
-                .unwrap()
+            // 標準の 8bit RGBA かつ透過対応の config を最優先で選ぶ。
+            // （16bit float 等の特殊 config だと透過が正しく出ないことがある）
+            let score = |cfg: &glutin::config::Config| -> i32 {
+                let t = cfg.supports_transparency().unwrap_or(false);
+                match (t, cfg.alpha_size()) {
+                    (true, 8) => 3,
+                    (true, _) => 2,
+                    (false, 8) => 1,
+                    _ => 0,
+                }
+            };
+            let cfg = configs.reduce(|acc, c| if score(&c) > score(&acc) { c } else { acc }).unwrap();
+            log::warn!(
+                "selected GL config: alpha_size={} transparency={:?}",
+                cfg.alpha_size(),
+                cfg.supports_transparency()
+            );
+            cfg
         })
         .expect("failed to build display");
     let window = window.unwrap();
