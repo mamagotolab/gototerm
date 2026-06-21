@@ -38,9 +38,6 @@ void main() {
         gl_FragColor = back;
     } else {
         float a = texture(tex, v_tex_coords).r;
-        // sRGB空間の単純合成は暗背景の細い文字を痩せ・甘く見せる。被覆率を
-        // 控えめに持ち上げて輪郭を締める（弱めの簡易ガンマ補正。1.0で無効）。
-        a = pow(a, 1.0 / 1.4);
         gl_FragColor = vec4(fore.rgb, a);
     }
 }
