@@ -28,7 +28,8 @@ gototerm（ゴートターム）は、日本語を打つ人のために作られ
 
 - Rust ツールチェイン（`cargo`）
 - FreeType / fontconfig（フォント描画）
-- Wayland 環境（X11 でも XWayland 経由で動作）
+- **Linux**: Wayland 環境（X11 でも XWayland 経由で動作）
+- **Windows**: Windows 10 以降（ConPTY を使用）。クリップボードは OS 標準を使用
 
 ### ビルドと導入
 
@@ -43,6 +44,19 @@ cargo install --path .
 > 📦 **ビルドに必要なシステムライブラリ**（Arch の例）:
 > `sudo pacman -S freetype2 fontconfig wayland libxkbcommon cmake`
 > （Debian/Ubuntu 系は `libfreetype6-dev libfontconfig1-dev libwayland-dev libxkbcommon-dev cmake`）
+
+> 🪟 **Windows**: Rust（MSVC ツールチェイン）・**Visual Studio の C++ ビルドツール**・CMake が必要です
+> （FreeType をビルド時に同梱ソースから生成するため）。cmake が
+> 「couldn't determine visual studio generator」で失敗する場合は、
+> **「x64 Native Tools Command Prompt for VS」**から `cargo build --release` を実行してください。
+> 設定ファイルは **`%APPDATA%\gototerm\config.toml`**、フォントは下記のように Windows のパスを指定します:
+>
+> ```toml
+> fonts_regular = [
+>     "C:/Windows/Fonts/consola.ttf",   # 英数字
+>     "C:/Windows/Fonts/YuGothM.ttc",   # 日本語（游ゴシック等）
+> ]
+> ```
 
 > ℹ️ **terminfo の導入は不要です。**
 > 内部の VT エンジンに [alacritty_terminal](https://crates.io/crates/alacritty_terminal)

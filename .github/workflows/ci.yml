@@ -32,6 +32,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # FreeType を cmake でソースビルドするため MSVC 開発環境(vcvars)を読み込む。
+      # これが無いと cmake が「couldn't determine visual studio generator」で失敗する。
+      - name: Set up MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
