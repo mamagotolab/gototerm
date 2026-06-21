@@ -81,6 +81,26 @@ impl Cell {
         cell.ch = ch;
         cell
     }
+
+    /// 描画用に外部（VTアダプタ）からセルを組むためのコンストラクタ。
+    pub fn head(ch: char, width: u16, attr: GraphicAttribute) -> Cell {
+        Cell {
+            ch,
+            width,
+            backlink: 0,
+            attr,
+        }
+    }
+
+    /// 全角文字の右側など、幅0のスペーサセル。
+    pub fn spacer(backlink: u16) -> Cell {
+        Cell {
+            ch: ' ',
+            width: 0,
+            backlink,
+            attr: GraphicAttribute::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -119,7 +139,7 @@ pub struct GraphicAttribute {
 }
 
 impl GraphicAttribute {
-    const fn default() -> Self {
+    pub const fn default() -> Self {
         GraphicAttribute {
             fg: Color::Foreground,
             bg: Color::Background,
@@ -173,6 +193,11 @@ impl Line {
             cells: vec![Cell::TERM; len],
             linewrap: false,
         }
+    }
+
+    /// 描画用に外部（VTアダプタ）から行を組むためのコンストラクタ。
+    pub fn from_cells(cells: Vec<Cell>, linewrap: bool) -> Self {
+        Line { cells, linewrap }
     }
 
     pub fn copy_from(&mut self, src: &Self) {
@@ -633,6 +658,16 @@ pub enum CursorStyle {
 }
 
 impl Cursor {
+    /// 描画用に row/col/style だけ指定して作る（VTアダプタ用）。
+    pub fn at(row: usize, col: usize, style: CursorStyle) -> Cursor {
+        Cursor {
+            row,
+            col,
+            style,
+            ..Cursor::default()
+        }
+    }
+
     fn pos(&self) -> (usize, usize) {
         (self.row, self.col)
     }

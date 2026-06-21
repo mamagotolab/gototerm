@@ -159,6 +159,181 @@ impl VtTerminal {
     }
 }
 
+// ============================================================================
+// 描画アダプタ：alacritty のグリッドを既存の描画形式(Line/Cell)へ変換する
+// ============================================================================
+
+use crate::terminal::{Cell as TCell, Color as TColor, Cursor as TCursor, CursorStyle, GraphicAttribute, Line as TLine};
+use alacritty_terminal::grid::Dimensions as _;
+use alacritty_terminal::term::cell::Flags;
+use vte::ansi::{Color as AColor, CursorShape, NamedColor};
+
+/// 1フレーム分の描画スナップショット。
+pub struct Snapshot {
+    pub lines: Vec<TLine>,
+    pub cursor: Option<TCursor>,
+    pub columns: usize,
+    pub screen_lines: usize,
+}
+
+impl VtTerminal {
+    /// 現在の画面内容を既存描画形式に変換して取り出す。
+    pub fn snapshot(&self) -> Snapshot {
+        let term = self.term.lock().unwrap();
+        let columns = term.columns();
+        let screen_lines = term.screen_lines();
+
+        // 空白セルで初期化した行バッファ
+        let blank = TCell::head(' ', 1, GraphicAttribute::default());
+        let mut rows: Vec<Vec<TCell>> = vec![vec![blank; columns]; screen_lines];
+
+        let content = term.renderable_content();
+
+        for indexed in content.display_iter {
+            let line = indexed.point.line.0; // 可視領域は 0..screen_lines
+            let col = indexed.point.column.0;
+            if line < 0 || line as usize >= screen_lines || col >= columns {
+                continue;
+            }
+            let cell = &indexed;
+
+            // 全角・スペーサ
+            if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
+                || cell.flags.contains(Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                rows[line as usize][col] = TCell::spacer(1);
+                continue;
+            }
+            let width: u16 = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+
+            let bold: i8 = if cell.flags.contains(Flags::DIM) {
+                -1
+            } else if cell.flags.intersects(Flags::BOLD | Flags::BOLD_ITALIC) {
+                1
+            } else {
+                0
+            };
+
+            let attr = GraphicAttribute {
+                fg: map_color(cell.fg),
+                bg: map_color(cell.bg),
+                bold,
+                inversed: cell.flags.contains(Flags::INVERSE),
+                blinking: 0,
+                concealed: cell.flags.contains(Flags::HIDDEN),
+            };
+
+            let ch = if cell.c == '\0' { ' ' } else { cell.c };
+            rows[line as usize][col] = TCell::head(ch, width, attr);
+        }
+
+        let lines: Vec<TLine> = rows
+            .into_iter()
+            .map(|cells| TLine::from_cells(cells, false))
+            .collect();
+
+        // カーソル
+        let rc = content.cursor;
+        let cursor = match rc.shape {
+            CursorShape::Hidden => None,
+            shape => {
+                let style = match shape {
+                    CursorShape::Underline => CursorStyle::Underline,
+                    CursorShape::Beam => CursorStyle::Bar,
+                    _ => CursorStyle::Block,
+                };
+                let row = rc.point.line.0;
+                if row < 0 {
+                    None
+                } else {
+                    Some(TCursor::at(row as usize, rc.point.column.0, style))
+                }
+            }
+        };
+
+        Snapshot {
+            lines,
+            cursor,
+            columns,
+            screen_lines,
+        }
+    }
+}
+
+/// alacritty の色を既存の Color へ変換する。
+/// 標準16色・前景・背景は名前付きのまま（ユーザ設定パレットが効く）、
+/// それ以外は RGB に解決する。
+fn map_color(c: AColor) -> TColor {
+    match c {
+        AColor::Named(n) => match n {
+            NamedColor::Foreground => TColor::Foreground,
+            NamedColor::Background => TColor::Background,
+            NamedColor::Black => TColor::Black,
+            NamedColor::Red => TColor::Red,
+            NamedColor::Green => TColor::Green,
+            NamedColor::Yellow => TColor::Yellow,
+            NamedColor::Blue => TColor::Blue,
+            NamedColor::Magenta => TColor::Magenta,
+            NamedColor::Cyan => TColor::Cyan,
+            NamedColor::White => TColor::White,
+            NamedColor::BrightBlack => TColor::BrightBlack,
+            NamedColor::BrightRed => TColor::BrightRed,
+            NamedColor::BrightGreen => TColor::BrightGreen,
+            NamedColor::BrightYellow => TColor::BrightYellow,
+            NamedColor::BrightBlue => TColor::BrightBlue,
+            NamedColor::BrightMagenta => TColor::BrightMagenta,
+            NamedColor::BrightCyan => TColor::BrightCyan,
+            NamedColor::BrightWhite => TColor::BrightWhite,
+            _ => TColor::Foreground,
+        },
+        AColor::Spec(rgb) => TColor::Rgb {
+            rgba: rgba_u32(rgb.r, rgb.g, rgb.b),
+        },
+        AColor::Indexed(i) => match i {
+            0 => TColor::Black,
+            1 => TColor::Red,
+            2 => TColor::Green,
+            3 => TColor::Yellow,
+            4 => TColor::Blue,
+            5 => TColor::Magenta,
+            6 => TColor::Cyan,
+            7 => TColor::White,
+            8 => TColor::BrightBlack,
+            9 => TColor::BrightRed,
+            10 => TColor::BrightGreen,
+            11 => TColor::BrightYellow,
+            12 => TColor::BrightBlue,
+            13 => TColor::BrightMagenta,
+            14 => TColor::BrightCyan,
+            15 => TColor::BrightWhite,
+            16..=231 => {
+                // 6x6x6 カラーキューブ
+                let i = i - 16;
+                let to = |v: u8| -> u8 {
+                    if v == 0 {
+                        0
+                    } else {
+                        55 + 40 * v
+                    }
+                };
+                let r = to((i / 36) % 6);
+                let g = to((i / 6) % 6);
+                let b = to(i % 6);
+                TColor::Rgb { rgba: rgba_u32(r, g, b) }
+            }
+            _ => {
+                // グレースケール 232..=255
+                let v = 8 + 10 * (i - 232);
+                TColor::Rgb { rgba: rgba_u32(v, v, v) }
+            }
+        },
+    }
+}
+
+fn rgba_u32(r: u8, g: u8, b: u8) -> u32 {
+    ((r as u32) << 24) | ((g as u32) << 16) | ((b as u32) << 8) | 0xff
+}
+
 fn pty_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> PtySize {
     PtySize {
         rows: lines as u16,
