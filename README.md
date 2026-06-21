@@ -46,9 +46,15 @@ cargo install --path .
 > （Debian/Ubuntu 系は `libfreetype6-dev libfontconfig1-dev libwayland-dev libxkbcommon-dev cmake`）
 
 > 🪟 **Windows**: Rust（MSVC ツールチェイン）・**Visual Studio の C++ ビルドツール**・CMake が必要です
-> （FreeType をビルド時に同梱ソースから生成するため）。cmake が
-> 「couldn't determine visual studio generator」で失敗する場合は、
-> **「x64 Native Tools Command Prompt for VS」**から `cargo build --release` を実行してください。
+> （FreeType をビルド時に同梱ソースから生成するため）。
+> **「x64 Native Tools Command Prompt for VS」**を開いて `cargo build --release` を実行します。
+> cmake が「couldn't determine visual studio generator」で止まる場合は、
+> Ninja を入れて generator を明示すると確実です:
+>
+> ```cmd
+> set CMAKE_GENERATOR=Ninja
+> cargo build --release
+> ```
 > 設定ファイルは **`%APPDATA%\gototerm\config.toml`**、フォントは下記のように Windows のパスを指定します:
 >
 > ```toml

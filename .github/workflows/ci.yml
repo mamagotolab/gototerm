@@ -29,11 +29,15 @@ jobs:
 
   build-windows:
     runs-on: windows-latest
+    # cmake クレートは新しい Visual Studio(18=2026相当)の generator 名を知らず
+    # 自動判定に失敗する。Ninja を明示指定すれば VS バージョンに依存せずビルドできる
+    # （MSVC 環境さえ通っていればよい。windows-latest には Ninja が標準で入っている）。
+    env:
+      CMAKE_GENERATOR: Ninja
     steps:
       - uses: actions/checkout@v4
 
       # FreeType を cmake でソースビルドするため MSVC 開発環境(vcvars)を読み込む。
-      # これが無いと cmake が「couldn't determine visual studio generator」で失敗する。
       - name: Set up MSVC environment
         uses: ilammy/msvc-dev-cmd@v1
 
