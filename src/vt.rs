@@ -58,6 +58,7 @@ pub struct VtTerminal {
     master: Box<dyn MasterPty + Send>,
     killer: Box<dyn ChildKiller + Send + Sync>,
     exited: Arc<AtomicBool>,
+    dirty: Arc<AtomicBool>,
 }
 
 impl VtTerminal {
@@ -101,11 +102,13 @@ impl VtTerminal {
         let term = Arc::new(Mutex::new(Term::new(Config::default(), &size, proxy)));
 
         let exited = Arc::new(AtomicBool::new(false));
+        let dirty = Arc::new(AtomicBool::new(true));
 
         // 読取スレッド：PTY 出力を Processor に流し込む
         {
             let term = term.clone();
             let exited = exited.clone();
+            let dirty = dirty.clone();
             std::thread::spawn(move || {
                 let mut processor: Processor = Processor::new();
                 let mut reader = reader;
@@ -116,6 +119,8 @@ impl VtTerminal {
                         Ok(n) => {
                             let mut term = term.lock().unwrap();
                             processor.advance(&mut *term, &buf[..n]);
+                            drop(term);
+                            dirty.store(true, Ordering::SeqCst);
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                         Err(_) => break,
@@ -136,7 +141,48 @@ impl VtTerminal {
             master,
             killer,
             exited,
+            dirty,
         }
+    }
+
+    /// 前回以降に画面内容が変わったか（変わっていれば true を返し、フラグを下げる）。
+    pub fn take_dirty(&self) -> bool {
+        self.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// 現在の端末サイズ (columns, screen_lines)。
+    pub fn size(&self) -> (usize, usize) {
+        use alacritty_terminal::grid::Dimensions as _;
+        let term = self.term.lock().unwrap();
+        (term.columns(), term.screen_lines())
+    }
+
+    pub fn mouse_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().unwrap().mode().intersects(TermMode::MOUSE_MODE)
+    }
+
+    pub fn sgr_mouse(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().unwrap().mode().contains(TermMode::SGR_MOUSE)
+    }
+
+    pub fn bracketed_paste(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
+    /// スクロールバック（履歴）を消去する。
+    pub fn clear_history(&self) {
+        self.term.lock().unwrap().grid_mut().clear_history();
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// スクロールバック表示を delta 行ぶん動かす（正で過去方向）。
+    pub fn scroll(&self, delta: i32) {
+        use alacritty_terminal::grid::Scroll;
+        self.term.lock().unwrap().scroll_display(Scroll::Delta(delta));
+        self.dirty.store(true, Ordering::SeqCst);
     }
 
     /// ユーザー入力などを PTY master に書く。

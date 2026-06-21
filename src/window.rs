@@ -6,7 +6,8 @@ use winit::{
     window::{CursorIcon, Window},
 };
 
-use crate::terminal::{Mode, Terminal, TerminalSize};
+use crate::terminal::TerminalSize;
+use crate::vt::VtTerminal;
 use crate::view::{TerminalView, Viewport};
 use crate::Display;
 
@@ -43,15 +44,28 @@ fn get_clipboard() -> String {
 pub struct TerminalWindow {
     window: Window,
     display: Display,
-    terminal: Terminal,
+    terminal: VtTerminal,
 
     view: TerminalView,
-    mode: Mode,
-    history_head: isize,
-    last_history_head: isize,
     focused: bool,
     modifiers: ModifiersState,
     mouse: MouseState,
+}
+
+/// viewport とフォントから端末セル数を求めて VtTerminal を作る。
+fn make_terminal(view: &TerminalView, viewport: Viewport, cwd: &std::path::Path) -> VtTerminal {
+    let cell_size = view.cell_size();
+    let scroll_bar_width = crate::TOYTERM_CONFIG.scroll_bar_width;
+    let cols = ((viewport.w.saturating_sub(scroll_bar_width)) / cell_size.w).max(1) as usize;
+    let lines = (viewport.h / cell_size.h).max(1) as usize;
+    VtTerminal::new(
+        cols,
+        lines,
+        cell_size.w as u16,
+        cell_size.h as u16,
+        cwd,
+        &crate::TOYTERM_CONFIG.shell,
+    )
 }
 
 struct MouseState {
@@ -92,15 +106,9 @@ impl TerminalWindow {
         );
 
         let terminal = {
-            let cell_size = view.cell_size();
-            let scroll_bar_width = crate::TOYTERM_CONFIG.scroll_bar_width;
-            let size = TerminalSize {
-                rows: (viewport.h / cell_size.h) as usize,
-                cols: ((viewport.w - scroll_bar_width) / cell_size.w) as usize,
-            };
             let parent_cwd = std::env::current_dir().expect("cwd");
             let child_cwd = cwd.unwrap_or(&parent_cwd);
-            Terminal::new(size, cell_size, child_cwd)
+            make_terminal(&view, viewport, child_cwd)
         };
 
         // Use I-beam mouse cursor
@@ -116,9 +124,6 @@ impl TerminalWindow {
             terminal,
 
             view,
-            mode: Mode::default(),
-            history_head: 0,
-            last_history_head: 0,
             focused: true,
             modifiers: ModifiersState::empty(),
             mouse: MouseState {
@@ -134,37 +139,26 @@ impl TerminalWindow {
     }
 
     pub fn reset_pty(&mut self) -> Option<i32> {
-        let last_status = self.terminal.exit_status();
-
-        if last_status.is_none() {
-            self.terminal.send_sigterm();
+        if !self.terminal.has_exited() {
+            self.terminal.kill();
         }
-
-        self.terminal = {
-            let viewport = self.view.viewport();
-            let cell_size = self.view.cell_size();
-            let scroll_bar_width = crate::TOYTERM_CONFIG.scroll_bar_width;
-            let size = TerminalSize {
-                rows: (viewport.h / cell_size.h) as usize,
-                cols: ((viewport.w - scroll_bar_width) / cell_size.w) as usize,
-            };
-            let cwd = std::env::current_dir().expect("cwd");
-            Terminal::new(size, cell_size, &cwd)
-        };
+        let viewport = self.view.viewport();
+        let cwd = std::env::current_dir().expect("cwd");
+        self.terminal = make_terminal(&self.view, viewport, &cwd);
 
         // Invalidate rendering cache
         self.view.update_contents(|_| {});
 
-        last_status
+        None
     }
 
     pub fn close_pty(&mut self) {
-        self.terminal.send_sigterm();
+        self.terminal.kill();
     }
 
     // Change cursor icon according to the current mouse_track mode
     pub fn refresh_cursor_icon(&mut self) {
-        let icon = if self.mode.mouse_track {
+        let icon = if self.terminal.mouse_mode() {
             CursorIcon::Default
         } else {
             CursorIcon::Text
@@ -176,100 +170,35 @@ impl TerminalWindow {
     fn check_update(&mut self) -> bool {
         let cell_size = self.view.cell_size();
 
-        let contents_updated: bool;
-        let mouse_track_mode_changed: bool;
-        let terminal_size: TerminalSize;
-        {
-            // hold the lock while copying states
-            let mut state = self.terminal.state.lock().unwrap();
-
-            if state.exit_status.is_some() {
-                return true;
-            }
-
-            mouse_track_mode_changed = self.mode.mouse_track != state.mode().mouse_track;
-            self.mode = state.mode();
-
-            contents_updated = state.updated || self.last_history_head != self.history_head;
-            self.last_history_head = self.history_head;
-
-            terminal_size = state.size();
-
-            if contents_updated {
-                // update scroll bar
-                let scroll_bar_position = {
-                    let hist_rows = state.history_size();
-                    let rows = state.size().rows;
-                    let viewport_height = self.viewport().h;
-
-                    let total = hist_rows + rows;
-                    let r = (hist_rows as isize + self.history_head) as f64 / total as f64;
-                    let origin = (viewport_height as f64 * r) as u32;
-                    let length = ((viewport_height as f64) * rows as f64 / total as f64) as u32;
-                    Some((origin, length))
-                };
-
-                let mut lines = Vec::new();
-                self.view
-                    .update_contents(|view| std::mem::swap(&mut view.lines, &mut lines));
-
-                {
-                    let top = self.history_head;
-                    let bot = top + terminal_size.rows as isize;
-
-                    if lines.len() == terminal_size.rows {
-                        // Copy lines w/o heap allocation
-                        for (src, dst) in state.range(top, bot).zip(lines.iter_mut()) {
-                            dst.copy_from(src);
-                        }
-                    } else {
-                        // Copy lines w/ heap allocation
-                        lines.clear();
-                        lines.extend(state.range(top, bot).cloned());
-                    }
-                }
-
-                let images = state
-                    .images()
-                    .cloned()
-                    .map(|mut img| {
-                        img.row -= self.history_head;
-                        img
-                    })
-                    .collect();
-
-                let cursor = if self.history_head >= 0 && state.mode().cursor_visible {
-                    let cursor = state.cursor();
-
-                    // 変換候補ウィンドウをカーソルのセル位置に出すための矩形。
-                    // これにより候補が入力中の文字を隠さない（over-the-spot）。
-                    self.window.set_ime_cursor_area(
-                        PhysicalPosition::new(
-                            self.viewport().x + cursor.col as u32 * cell_size.w,
-                            self.viewport().y + cursor.row as u32 * cell_size.h,
-                        ),
-                        PhysicalSize::new(cell_size.w, cell_size.h),
-                    );
-
-                    Some(cursor)
-                } else {
-                    None
-                };
-
-                self.view.update_contents(|view| {
-                    view.lines = lines;
-                    view.images = images;
-                    view.cursor = cursor;
-                    view.scroll_bar = scroll_bar_position;
-                    view.view_focused = self.focused;
-                });
-            }
-
-            state.updated = false;
+        if self.terminal.has_exited() {
+            return true;
         }
 
-        if mouse_track_mode_changed {
-            self.refresh_cursor_icon();
+        let (cols, rows) = self.terminal.size();
+        let terminal_size = TerminalSize { rows, cols };
+
+        // 画面が変わったときだけ alacritty のグリッドを取り込んで描画を更新する。
+        if self.terminal.take_dirty() {
+            let snapshot = self.terminal.snapshot();
+
+            if let Some(cursor) = snapshot.cursor {
+                // 変換候補ウィンドウをカーソルのセル位置に出す（over-the-spot）。
+                self.window.set_ime_cursor_area(
+                    PhysicalPosition::new(
+                        self.viewport().x + cursor.col as u32 * cell_size.w,
+                        self.viewport().y + cursor.row as u32 * cell_size.h,
+                    ),
+                    PhysicalSize::new(cell_size.w, cell_size.h),
+                );
+            }
+
+            self.view.update_contents(|view| {
+                view.lines = snapshot.lines;
+                view.cursor = snapshot.cursor;
+                view.images = Vec::new();
+                view.scroll_bar = None;
+                view.view_focused = self.focused;
+            });
         }
 
         // Update text selection
@@ -392,7 +321,12 @@ impl TerminalWindow {
             rows: rows.max(1),
             cols: cols.max(1),
         };
-        self.terminal.request_resize(buff_size, cell_size);
+        self.terminal.resize(
+            buff_size.cols,
+            buff_size.rows,
+            cell_size.w as u16,
+            cell_size.h as u16,
+        );
     }
 
     pub fn focus_changed(&mut self, gain: bool) {
@@ -457,7 +391,7 @@ impl TerminalWindow {
                     }
                     // 確定した文字列を PTY に流し、変換中表示を消す。
                     Ime::Commit(text) => {
-                        self.terminal.pty_write(text.as_bytes());
+                        self.terminal.write(text.as_bytes());
                         self.view.update_contents(|view| view.preedit.clear());
                     }
                     Ime::Enabled | Ime::Disabled => {
@@ -493,9 +427,9 @@ impl TerminalWindow {
                         return;
                     }
 
-                    if self.mode.mouse_track {
+                    if self.terminal.mouse_mode() {
                         let button = match state {
-                            ElementState::Released if !self.mode.sgr_ext_mouse_track => 3,
+                            ElementState::Released if !self.terminal.sgr_mouse() => 3,
                             _ => match button {
                                 MouseButton::Left => 0,
                                 MouseButton::Middle => 1,
@@ -520,7 +454,7 @@ impl TerminalWindow {
                         let col = x.round() as u32 / cell_size.w + 1;
                         let row = y.round() as u32 / cell_size.h + 1;
 
-                        if self.mode.sgr_ext_mouse_track {
+                        if self.terminal.sgr_mouse() {
                             self.sgr_ext_mouse_report(button + mods, col, row, state);
                         } else {
                             self.normal_mouse_report(button + mods, col, row);
@@ -564,30 +498,28 @@ impl TerminalWindow {
                     mouse.wheel_delta_y %= 1.0;
 
                     if self.modifiers.shift_key() {
-                        // Scroll up history
-                        let state = self.terminal.state.lock().unwrap();
-                        let min = -(state.history_size() as isize);
-                        self.history_head = (self.history_head - vertical).clamp(min, 0);
+                        // スクロールバックを動かす（alacritty 側で履歴管理）
+                        self.terminal.scroll(vertical as i32);
                     } else {
                         // Send Up/Down key
                         if vertical > 0 {
                             for _ in 0..vertical.abs() {
-                                self.terminal.pty_write(b"\x1b[\x41"); // Up
+                                self.terminal.write(b"\x1b[\x41"); // Up
                             }
                         } else {
                             for _ in 0..vertical.abs() {
-                                self.terminal.pty_write(b"\x1b[\x42"); // Down
+                                self.terminal.write(b"\x1b[\x42"); // Down
                             }
                         }
                     }
 
                     if horizontal > 0 {
                         for _ in 0..horizontal.abs() {
-                            self.terminal.pty_write(b"\x1b[\x43"); // Right
+                            self.terminal.write(b"\x1b[\x43"); // Right
                         }
                     } else {
                         for _ in 0..horizontal.abs() {
-                            self.terminal.pty_write(b"\x1b[\x44"); // Left
+                            self.terminal.write(b"\x1b[\x44"); // Left
                         }
                     }
                 }
@@ -655,29 +587,28 @@ impl TerminalWindow {
         let mut handled = true;
         match (ctrl, shift, keycode) {
             (false, _, KeyCode::Escape) => {
-                self.history_head = 0;
                 self.mouse.pressed_pos = None;
                 self.mouse.released_pos = None;
-                self.terminal.pty_write(b"\x1B");
+                self.terminal.write(b"\x1B");
             }
 
             (true, false, KeyCode::Minus) => self.increase_font_size(-1),
             (true, false, KeyCode::Equal) => self.increase_font_size(1),
 
             // Backspace: send DEL instead of BS
-            (false, _, KeyCode::Backspace) => self.terminal.pty_write(b"\x7f"),
-            (false, _, KeyCode::Delete) => self.terminal.pty_write(b"\x1b[3~"),
+            (false, _, KeyCode::Backspace) => self.terminal.write(b"\x7f"),
+            (false, _, KeyCode::Delete) => self.terminal.write(b"\x1b[3~"),
 
-            (false, _, KeyCode::Enter) => self.terminal.pty_write(b"\r"),
-            (false, _, KeyCode::Tab) => self.terminal.pty_write(b"\t"),
+            (false, _, KeyCode::Enter) => self.terminal.write(b"\r"),
+            (false, _, KeyCode::Tab) => self.terminal.write(b"\t"),
 
-            (false, _, KeyCode::ArrowUp) => self.terminal.pty_write(b"\x1b[\x41"),
-            (false, _, KeyCode::ArrowDown) => self.terminal.pty_write(b"\x1b[\x42"),
-            (false, _, KeyCode::ArrowRight) => self.terminal.pty_write(b"\x1b[\x43"),
-            (false, _, KeyCode::ArrowLeft) => self.terminal.pty_write(b"\x1b[\x44"),
+            (false, _, KeyCode::ArrowUp) => self.terminal.write(b"\x1b[\x41"),
+            (false, _, KeyCode::ArrowDown) => self.terminal.write(b"\x1b[\x42"),
+            (false, _, KeyCode::ArrowRight) => self.terminal.write(b"\x1b[\x43"),
+            (false, _, KeyCode::ArrowLeft) => self.terminal.write(b"\x1b[\x44"),
 
-            (false, _, KeyCode::PageUp) => self.terminal.pty_write(b"\x1b[5~"),
-            (false, _, KeyCode::PageDown) => self.terminal.pty_write(b"\x1b[6~"),
+            (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
+            (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),
 
             // Ctrl+Shift+C/V/L: コピー・ペースト・履歴クリア
             (true, true, KeyCode::KeyC) => {
@@ -686,27 +617,25 @@ impl TerminalWindow {
             }
             (true, true, KeyCode::KeyV) => self.paste_clipboard(),
             (true, true, KeyCode::KeyL) => {
-                self.history_head = 0;
-                let mut state = self.terminal.state.lock().unwrap();
-                state.clear_history();
+                self.terminal.clear_history();
             }
 
-            (false, _, KeyCode::F1) => self.terminal.pty_write(b"\x1BOP"),
-            (false, _, KeyCode::F2) => self.terminal.pty_write(b"\x1BOQ"),
-            (false, _, KeyCode::F3) => self.terminal.pty_write(b"\x1BOR"),
-            (false, _, KeyCode::F4) => self.terminal.pty_write(b"\x1BOS"),
-            (false, _, KeyCode::F5) => self.terminal.pty_write(b"\x1B[15~"),
-            (false, _, KeyCode::F6) => self.terminal.pty_write(b"\x1B[17~"),
-            (false, _, KeyCode::F7) => self.terminal.pty_write(b"\x1B[18~"),
-            (false, _, KeyCode::F8) => self.terminal.pty_write(b"\x1B[19~"),
-            (false, _, KeyCode::F9) => self.terminal.pty_write(b"\x1B[20~"),
-            (false, _, KeyCode::F10) => self.terminal.pty_write(b"\x1B[21~"),
-            (false, _, KeyCode::F11) => self.terminal.pty_write(b"\x1B[23~"),
-            (false, _, KeyCode::F12) => self.terminal.pty_write(b"\x1B[24~"),
+            (false, _, KeyCode::F1) => self.terminal.write(b"\x1BOP"),
+            (false, _, KeyCode::F2) => self.terminal.write(b"\x1BOQ"),
+            (false, _, KeyCode::F3) => self.terminal.write(b"\x1BOR"),
+            (false, _, KeyCode::F4) => self.terminal.write(b"\x1BOS"),
+            (false, _, KeyCode::F5) => self.terminal.write(b"\x1B[15~"),
+            (false, _, KeyCode::F6) => self.terminal.write(b"\x1B[17~"),
+            (false, _, KeyCode::F7) => self.terminal.write(b"\x1B[18~"),
+            (false, _, KeyCode::F8) => self.terminal.write(b"\x1B[19~"),
+            (false, _, KeyCode::F9) => self.terminal.write(b"\x1B[20~"),
+            (false, _, KeyCode::F10) => self.terminal.write(b"\x1B[21~"),
+            (false, _, KeyCode::F11) => self.terminal.write(b"\x1B[23~"),
+            (false, _, KeyCode::F12) => self.terminal.write(b"\x1B[24~"),
 
             // Ctrl+英字（Shiftなし）は制御コードへ。Ctrl+C/L/V もここで処理。
             (true, false, code) => match ctrl_letter_code(code) {
-                Some(b) => self.terminal.pty_write(&[b]),
+                Some(b) => self.terminal.write(&[b]),
                 None => handled = false,
             },
 
@@ -716,7 +645,7 @@ impl TerminalWindow {
         if !handled {
             match &key_event.text {
                 // 通常文字（英数字・記号・全角等の非IME入力）をそのまま送る
-                Some(text) => self.terminal.pty_write(text.as_bytes()),
+                Some(text) => self.terminal.write(text.as_bytes()),
                 // 修飾キー単体などテキストを生まないキーでは選択を消さない
                 None => clear = false,
             }
@@ -727,7 +656,6 @@ impl TerminalWindow {
                 view.selection_range = None;
             });
 
-            self.history_head = 0;
             self.mouse.pressed_pos = None;
             self.mouse.released_pos = None;
         }
@@ -785,12 +713,12 @@ impl TerminalWindow {
     fn paste_clipboard(&mut self) {
         let text = get_clipboard();
         log::debug!("paste: {:?}", text);
-        if self.mode.bracketed_paste {
-            self.terminal.pty_write(b"\x1b[200~");
-            self.terminal.pty_write(text.as_bytes());
-            self.terminal.pty_write(b"\x1b[201~");
+        if self.terminal.bracketed_paste() {
+            self.terminal.write(b"\x1b[200~");
+            self.terminal.write(text.as_bytes());
+            self.terminal.write(b"\x1b[201~");
         } else {
-            self.terminal.pty_write(text.as_bytes());
+            self.terminal.write(text.as_bytes());
         }
     }
 
@@ -800,7 +728,7 @@ impl TerminalWindow {
 
         let msg = [b'\x1b', b'[', b'M', 32 + button, col, row];
 
-        self.terminal.pty_write(&msg);
+        self.terminal.write(&msg);
     }
 
     fn sgr_ext_mouse_report(&mut self, button: u8, col: u32, row: u32, state: &ElementState) {
@@ -810,7 +738,7 @@ impl TerminalWindow {
         };
 
         self.terminal
-            .pty_write(format!("\x1b[<{button};{col};{row}{m}").as_bytes());
+            .write(format!("\x1b[<{button};{col};{row}{m}").as_bytes());
     }
 }
 
