@@ -67,7 +67,9 @@ fn build_window<T>(
                 }
             };
             let cfg = configs.reduce(|acc, c| if score(&c) > score(&acc) { c } else { acc }).unwrap();
-            log::warn!(
+            // 透過対応 config が無い環境(Windows など)では transparency=false に
+            // なるが、不透明で正常に動くだけなので警告ではなく debug ログにする。
+            log::debug!(
                 "selected GL config: alpha_size={} transparency={:?}",
                 cfg.alpha_size(),
                 cfg.supports_transparency()

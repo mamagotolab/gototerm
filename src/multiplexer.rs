@@ -662,11 +662,19 @@ impl Multiplexer {
                 }
 
                 &WindowEvent::Occluded(occluded) => {
-                    self.occluded = occluded;
-                    // 再表示されたら最新内容を描き直す。
-                    if !occluded {
-                        self.window.request_redraw();
+                    // 遮蔽中の描画スキップは Wayland 限定の対策（frame callback 枯渇で
+                    // swap がブロックし無応答になる問題）。Windows ではこの問題が無く、
+                    // 遮蔽イベントの誤検出で描画が止まる恐れがあるので無視する。
+                    #[cfg(not(windows))]
+                    {
+                        self.occluded = occluded;
+                        // 再表示されたら最新内容を描き直す。
+                        if !occluded {
+                            self.window.request_redraw();
+                        }
                     }
+                    #[cfg(windows)]
+                    let _ = occluded;
                 }
 
                 WindowEvent::RedrawRequested => {
