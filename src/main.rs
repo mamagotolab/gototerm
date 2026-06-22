@@ -34,6 +34,13 @@ fn main() {
 
 /// 透過（半透明背景）と vsync を有効にしてウィンドウと glium Display を作る。
 /// glium の SimpleWindowBuilder はどちらも無効なため、glutin を手書きする。
+/// ウィンドウ（タイトルバー・タスクバー）のアイコン。exe 埋め込みの
+/// フラスコアイコンと同じものを、生 RGBA から読み込んで設定する。
+fn load_window_icon() -> Option<winit::window::Icon> {
+    const RGBA: &[u8] = include_bytes!("../assets/icon128.rgba");
+    winit::window::Icon::from_rgba(RGBA.to_vec(), 128, 128).ok()
+}
+
 fn build_window<T>(
     event_loop: &winit::event_loop::EventLoop<T>,
 ) -> (winit::window::Window, gototerm::Display) {
@@ -48,7 +55,8 @@ fn build_window<T>(
     use winit::platform::wayland::WindowBuilderExtWayland as _;
     let window_builder = winit::window::WindowBuilder::new()
         .with_title("gototerm")
-        .with_transparent(true);
+        .with_transparent(true)
+        .with_window_icon(load_window_icon());
     #[cfg(target_os = "linux")]
     let window_builder = window_builder.with_name("gototerm", "gototerm");
 
