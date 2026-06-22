@@ -32,14 +32,15 @@ gototerm（ゴトターム）は、日本語を打つ人のために作られた
 `gototerm-windows-x64.exe` をダウンロードし、ダブルクリックで起動するだけです。
 
 - 設定ファイル（任意）は **`%APPDATA%\gototerm\config.toml`**。無くても内蔵フォントで動きます。
-- フォントを変えたい場合の例:
+- 設定例は [`config.windows.example.toml`](./config.windows.example.toml) を参照（フォント・サイズ・配色・透過）。
+- フォントは**ファイルの絶対パス**で指定します。Nerd Font 等を使う場合、実ファイルのパスは
+  PowerShell で確認できます:
 
-  ```toml
-  fonts_regular = [
-      "C:/Windows/Fonts/consola.ttf",   # 英数字
-      "C:/Windows/Fonts/YuGothM.ttc",   # 日本語（游ゴシック等）
-  ]
+  ```powershell
+  Get-ChildItem -Path C:\Windows\Fonts, "$env:LOCALAPPDATA\Microsoft\Windows\Fonts" -Filter "JetBrainsMono*" | % { $_.FullName -replace '\\','/' }
   ```
+
+  個人インストールしたフォントは `%LOCALAPPDATA%\Microsoft\Windows\Fonts\` 配下にあります。
 
 > 起動しない場合は、[Microsoft Visual C++ 再頒布可能パッケージ](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 > を入れてください（多くの PC には既に入っています）。

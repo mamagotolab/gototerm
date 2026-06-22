@@ -1,0 +1,35 @@
+# gototerm 設定ファイル（Windows 用の例）
+# 置き場所: %APPDATA%\gototerm\config.toml
+#   （エクスプローラーのアドレスバーに %APPDATA% と入れて開ける）
+# 書いた項目だけデフォルト(Tokyo Night 配色)を上書きします。
+
+# フォントサイズ（px）。Windows は 11 くらいが見やすい。
+font_size = 11
+
+# フォント（先頭=主フォント、2番目以降=フォールバック）。
+# ★重要: gototerm はフォント名ではなく「ファイルの絶対パス」で読みます。
+#   実際のパスは PowerShell で確認してください:
+#     Get-ChildItem -Path C:\Windows\Fonts, "$env:LOCALAPPDATA\Microsoft\Windows\Fonts" -Filter "JetBrainsMono*" | % { $_.FullName -replace '\\','/' }
+#   ・全ユーザーにインストール → C:/Windows/Fonts/...
+#   ・個人インストール         → C:/Users/<ユーザー名>/AppData/Local/Microsoft/Windows/Fonts/...
+#   下の <ユーザー名> を自分のものに置き換え、ファイル名も実物に合わせてください。
+fonts_regular = [
+    "C:/Users/<ユーザー名>/AppData/Local/Microsoft/Windows/Fonts/JetBrainsMonoNerdFont-Medium.ttf",
+    "C:/Windows/Fonts/YuGothM.ttc",
+]
+fonts_bold = [
+    "C:/Users/<ユーザー名>/AppData/Local/Microsoft/Windows/Fonts/JetBrainsMonoNerdFont-Bold.ttf",
+    "C:/Windows/Fonts/YuGothB.ttc",
+]
+fonts_faint = [
+    "C:/Users/<ユーザー名>/AppData/Local/Microsoft/Windows/Fonts/JetBrainsMonoNerdFont-Medium.ttf",
+    "C:/Windows/Fonts/YuGothM.ttc",
+]
+
+# 背景色＋透過。1A1B26 = Tokyo Night 背景。末尾 B0 = 約30%透過。
+# ※ Windows では透過が効かない可能性が高い（WGL が透過フレームバッファ非対応）。
+#    効かなければ不透明の Tokyo Night 背景になります。
+color_background = 0x1A1B26B0
+
+# 曖昧幅文字（罫線など）。0=半角(1マス) / 1=全角(2マス)。TUI は 0 が安全。
+east_asian_width_ambiguous = 0
