@@ -7,7 +7,13 @@
 font_size = 11
 
 # フォント（先頭=主フォント、2番目以降=フォールバック）。
-# ★重要: gototerm はフォント名ではなく「ファイルの絶対パス」で読みます。
+# ★重要1: gototerm はフォント名ではなく「ファイルの絶対パス」で読みます。
+# ★重要2: 主フォント（先頭）は必ず Nerd Font 本体にしてください。
+#   gototerm はセル幅を主フォントの半角幅から決めます。英数字・アイコン
+#   （Claude Code のロゴ等）・罫線/ブロック文字がすべて同じ Nerd Font に
+#   同設計幅で入っているため、主フォントを Nerd Font にすると継ぎ目がズレません。
+#   ここを和文フォント（Moralerspace 等）にして Nerd Font をフォールバックへ回すと、
+#   幅の基準がズレてロゴ・罫線が崩れます。日本語は2番目以降で補えば十分です。
 #   実際のパスは PowerShell で確認してください:
 #     Get-ChildItem -Path C:\Windows\Fonts, "$env:LOCALAPPDATA\Microsoft\Windows\Fonts" -Filter "JetBrainsMono*" | % { $_.FullName -replace '\\','/' }
 #   ・全ユーザーにインストール → C:/Windows/Fonts/...
