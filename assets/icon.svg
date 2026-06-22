@@ -2,17 +2,17 @@
   <!-- 背景（Tokyo Night 系の濃紺・角丸） -->
   <rect width="256" height="256" rx="52" fill="#16161E"/>
   <defs>
-    <!-- フラスコ本体の形（液体のクリップに流用） -->
+    <!-- フラスコ本体（中心 x=128 で左右対称・底辺は水平） -->
     <path id="flask"
-      d="M112 58 L112 116 L72 204 q-5 16 13 16 L159 236 q18 0 13 -16 L144 116 L144 58 Z"/>
+      d="M112 58 L112 116 L80 206 Q72 222 92 222 L164 222 Q184 222 176 206 L144 116 L144 58 Z"/>
     <clipPath id="bodyClip"><use href="#flask"/></clipPath>
   </defs>
 
   <!-- 液体（本体にクリップ） -->
-  <rect x="36" y="168" width="184" height="80" fill="#1FA463" clip-path="url(#bodyClip)"/>
+  <rect x="36" y="170" width="184" height="60" fill="#1FA463" clip-path="url(#bodyClip)"/>
   <!-- 泡 -->
-  <circle cx="118" cy="198" r="8" fill="#9ECE6A" clip-path="url(#bodyClip)"/>
-  <circle cx="143" cy="210" r="5" fill="#7DCFFF" clip-path="url(#bodyClip)"/>
+  <circle cx="116" cy="196" r="8" fill="#9ECE6A" clip-path="url(#bodyClip)"/>
+  <circle cx="140" cy="208" r="5" fill="#7DCFFF" clip-path="url(#bodyClip)"/>
 
   <!-- フラスコの輪郭 -->
   <use href="#flask" fill="none" stroke="#C0CAF5" stroke-width="10"

@@ -525,6 +525,10 @@ impl VtTerminal {
         let _ = self.master.resize(pty_size(cols, lines, cell_w, cell_h));
         self.term.lock().unwrap().resize(GridSize { cols, lines });
         *self.winsize.lock().unwrap() = window_size(cols, lines, cell_w, cell_h);
+        // グリッドを再フローしただけでは PTY 出力が無く dirty が立たないため、
+        // 明示的に dirty にして即再描画させる。これが無いと次の出力（Enter 等）まで
+        // 旧サイズの画面が残る（Wayland はコンポジタ再描画で隠れていた）。
+        self.dirty.store(true, Ordering::SeqCst);
     }
 
     pub fn kill(&mut self) {
