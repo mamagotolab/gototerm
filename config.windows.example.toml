@@ -3,6 +3,15 @@
 #   （エクスプローラーのアドレスバーに %APPDATA% と入れて開ける）
 # 書いた項目だけデフォルト(Tokyo Night 配色)を上書きします。
 
+# 起動するシェル。Windows の既定は cmd.exe（COMSPEC）です。
+#   cmd.exe はコマンド履歴・補完が弱いので、好みで切り替えてください。
+#   ・PowerShell（履歴・補完あり。Windows なら無難）→ ["powershell.exe"]
+#   ・PowerShell 7（入れていれば）              → ["pwsh.exe"]
+#   ・WSL（既定のディストロに入る）             → ["wsl.exe"]
+#   ・WSL でディストロ指定                      → ["wsl.exe", "-d", "Ubuntu"]
+# ↓使うものだけコメントを外す（既定の cmd.exe のままなら丸ごと消してOK）。
+shell = ["powershell.exe"]
+
 # フォントサイズ（px）。Windows は 11 くらいが見やすい。
 font_size = 11
 
