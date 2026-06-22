@@ -436,10 +436,18 @@ impl VtTerminal {
             });
         }
 
-        // 子プロセスを回収するスレッド
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
+        // 子プロセスを回収するスレッド。子の終了を確実な終了シグナルとして使う。
+        // Windows の ConPTY では子が終了しても master 読み取りが EOF を返さない
+        // ことがあり、reader 側だけに頼ると `exit` で閉じない。ここで終了フラグを立てる。
+        {
+            let exited = exited.clone();
+            let dirty = dirty.clone();
+            std::thread::spawn(move || {
+                let _ = child.wait();
+                exited.store(true, Ordering::SeqCst);
+                dirty.store(true, Ordering::SeqCst);
+            });
+        }
 
         VtTerminal {
             term,
