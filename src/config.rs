@@ -39,6 +39,11 @@ pub struct Config {
     pub scroll_bar_bg_color: u32,
 
     pub east_asian_width_ambiguous: u8,
+
+    // カーソルを点滅させるか。
+    pub cursor_blink: bool,
+    // バー/下線カーソルの太さ(px)。ブロックカーソルには影響しない。
+    pub cursor_thickness: u32,
 }
 
 impl Default for Config {
@@ -52,6 +57,9 @@ impl Default for Config {
             shell,
 
             east_asian_width_ambiguous: 0,
+
+            cursor_blink: true,
+            cursor_thickness: 8,
 
             // FIXME: due to a bug on "config-rs", empty Vecs cannot be serialized properly.
             // https://github.com/mehcode/config-rs/issues/114

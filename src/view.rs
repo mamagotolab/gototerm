@@ -54,6 +54,8 @@ pub struct TerminalView {
     pub scroll_bar: Option<(u32, u32)>,
     pub bg_color: Color,
     pub view_focused: bool,
+    // カーソル点滅の表示フェーズ。false の間はカーソルを描かない。
+    cursor_blink_on: bool,
     updated: bool,
 
     display: Display,
@@ -142,6 +144,7 @@ impl TerminalView {
             scroll_bar,
             bg_color: Color::Black,
             view_focused: false,
+            cursor_blink_on: true,
             updated: false,
 
             display,
@@ -170,6 +173,14 @@ impl TerminalView {
     /// 「コンポジタ待ちでスワップがブロック→無応答」を防ぐ。
     pub fn needs_redraw(&self) -> bool {
         self.updated
+    }
+
+    /// カーソル点滅の表示フェーズを切り替える。変化したときだけ再描画を促す。
+    pub fn set_cursor_blink(&mut self, on: bool) {
+        if self.cursor_blink_on != on {
+            self.cursor_blink_on = on;
+            self.updated = true;
+        }
     }
 
     pub fn viewport(&self) -> Viewport {
@@ -326,6 +337,7 @@ impl TerminalView {
 
                     let on_cursor = if let Some(cursor) = self.cursor {
                         self.view_focused
+                            && self.cursor_blink_on
                             && cursor.style == CursorStyle::Block
                             && i == cursor.row
                             && j == cursor.col
@@ -342,8 +354,17 @@ impl TerminalView {
                         None => false,
                     };
 
-                    if on_cursor ^ is_selected {
+                    // マウス選択範囲はセレクション色で塗る。
+                    if is_selected {
                         bg = Color::Selection;
+                    }
+
+                    // ブロックカーソルは「いまのセルの色」を反転して描く（reverse video）。
+                    // 固定色だと nvim の CursorLine / Visual 選択と色が被って、
+                    // どこにカーソルがあるか分からなくなる。反転なら下地が
+                    // 何色でも必ずコントラストが出る。
+                    if on_cursor {
+                        std::mem::swap(&mut fg, &mut bg);
                     }
 
                     if cell.attr.concealed {
@@ -444,26 +465,52 @@ impl TerminalView {
 
         if let Some(cursor) = self.cursor {
             if self.view_focused
+                && self.cursor_blink_on
                 && matches!(cursor.style, CursorStyle::Underline | CursorStyle::Bar)
             {
+                // バー/下線の太さ(px)。セル幅/高さを超えないよう収める。
+                let thickness = crate::TOYTERM_CONFIG.cursor_thickness;
                 let rect = if cursor.style == CursorStyle::Underline {
+                    let t = thickness.min(cell_size.h);
                     PixelRect {
                         x: cursor.col as i32 * cell_size.w as i32,
-                        y: (cursor.row + 1) as i32 * cell_size.h as i32 - 4,
+                        y: (cursor.row + 1) as i32 * cell_size.h as i32 - t as i32,
                         w: cell_size.w,
-                        h: 4,
+                        h: t,
                     }
                 } else {
                     PixelRect {
                         x: cursor.col as i32 * cell_size.w as i32,
                         y: cursor.row as i32 * cell_size.h as i32,
-                        w: 4,
+                        w: thickness.min(cell_size.w),
                         h: cell_size.h,
                     }
                 };
 
+                // バー/下線カーソルも、カーソル下のセルの前景色で塗る。
+                // 固定色（旧 Color::Selection）だと下地と被って見えないため、
+                // ブロックカーソルのリバースビデオと同じく必ずコントラストを出す。
+                let cursor_color = self
+                    .lines
+                    .get(cursor.row)
+                    .and_then(|line| {
+                        let mut col = 0usize;
+                        for cell in line.iter() {
+                            let w = cell.width as usize;
+                            if w == 0 {
+                                continue;
+                            }
+                            if cursor.col < col + w {
+                                return Some(cell.attr.fg);
+                            }
+                            col += w;
+                        }
+                        None
+                    })
+                    .unwrap_or(Color::White);
+
                 let fg = Color::Black;
-                let bg = Color::Selection;
+                let bg = cursor_color;
                 let vs = rect_vertices(rect.to_gl(viewport), fg, bg);
                 self.vertices_fg.extend_from_slice(&vs);
             }

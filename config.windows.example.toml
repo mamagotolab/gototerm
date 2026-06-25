@@ -48,3 +48,9 @@ color_background = 0x1A1B26B0
 
 # 曖昧幅文字（罫線など）。0=半角(1マス) / 1=全角(2マス)。TUI は 0 が安全。
 east_asian_width_ambiguous = 0
+
+# カーソルを点滅させるか。false で点灯したまま。
+cursor_blink = true
+# バー（縦棒）/下線カーソルの太さ(px)。お好みで 6〜12 あたり。
+#   ※ブロックカーソルは全角なので影響しません。
+cursor_thickness = 8

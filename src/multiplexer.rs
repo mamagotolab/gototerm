@@ -406,6 +406,9 @@ pub struct Multiplexer {
     /// 止まり、vsync 付きの描画がブロックして無応答になるため、隠れている間は
     /// 描画しない。`WindowEvent::Occluded` で更新する。
     occluded: bool,
+    /// カーソル点滅の起点と現在の表示フェーズ。
+    blink_start: Instant,
+    cursor_blink_on: bool,
 }
 
 impl Multiplexer {
@@ -446,6 +449,8 @@ impl Multiplexer {
             cursor_pos: PhysicalPosition::default(),
             exited: false,
             occluded: false,
+            blink_start: Instant::now(),
+            cursor_blink_on: true,
         };
         mux.refresh_layout();
         mux
@@ -659,6 +664,30 @@ impl Multiplexer {
                     };
                     self.refresh_layout();
                     self.update_status_bar();
+                    // リサイズが来た＝ウィンドウは見えている。モニター切替時に
+                    // Occluded(true) を受けたまま解除イベントを取りこぼすと画面が
+                    // 固まるため、ここで遮蔽フラグを下ろして即再描画する。
+                    self.occluded = false;
+                    self.window.request_redraw();
+                }
+
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    // モニター間移動やマルチ→シングル切替で DPI(スケール)が変わると、
+                    // ピクセルサイズが同じでもサーフェスが古いまま残ることがある。
+                    // 実サイズで再同期し、遮蔽フラグも下ろして描き直す。直後に
+                    // Resized が続く場合もあるが、来ないケースの取りこぼしを防ぐ。
+                    let new = self.window.inner_size();
+                    self.display.resize((new.width, new.height));
+                    self.viewport = Viewport {
+                        x: 0,
+                        y: 0,
+                        w: new.width,
+                        h: new.height,
+                    };
+                    self.refresh_layout();
+                    self.update_status_bar();
+                    self.occluded = false;
+                    self.window.request_redraw();
                 }
 
                 &WindowEvent::Occluded(occluded) => {
@@ -714,6 +743,15 @@ impl Multiplexer {
                 }
 
                 WindowEvent::KeyboardInput { event: key, .. } => {
+                    // 入力中はカーソルを点いたままにする（押した瞬間に点滅で
+                    // 消えていると打ちにくい）。点滅の起点をリセットする。
+                    if key.state == ElementState::Pressed {
+                        self.blink_start = Instant::now();
+                        if !self.cursor_blink_on {
+                            self.cursor_blink_on = true;
+                            self.focused_root().focused_leaf_mut().set_cursor_blink(true);
+                        }
+                    }
                     if let Some(action) = self.parse_shortcut(key) {
                         self.handle_action(action);
                     } else {
@@ -782,6 +820,18 @@ impl Multiplexer {
                 if changed {
                     self.refresh_layout();
                     self.update_status_bar();
+                }
+
+                // カーソル点滅：530ms ごとに表示/非表示を切り替える。フェーズが
+                // 変わったフレームだけ set_cursor_blink で再描画を促す（毎フレーム
+                // 描かないので CPU を無駄に回さない）。
+                if crate::TOYTERM_CONFIG.cursor_blink {
+                    const BLINK_MS: u128 = 530;
+                    let on = (self.blink_start.elapsed().as_millis() / BLINK_MS) % 2 == 0;
+                    if on != self.cursor_blink_on {
+                        self.cursor_blink_on = on;
+                        self.focused_root().focused_leaf_mut().set_cursor_blink(on);
+                    }
                 }
 
                 // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。

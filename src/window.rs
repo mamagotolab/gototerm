@@ -14,6 +14,19 @@ use crate::Display;
 
 type CursorPosition = PhysicalPosition<f64>;
 
+/// URL を OS 標準のブラウザで開く。Linux は xdg-open、Windows は explorer
+/// （cmd の start だと黒いコンソールが一瞬出るため explorer を使う）。
+fn open_url(url: &str) {
+    use std::process::Command;
+    #[cfg(not(windows))]
+    let result = Command::new("xdg-open").arg(url).spawn();
+    #[cfg(windows)]
+    let result = Command::new("explorer").arg(url).spawn();
+    if let Err(e) = result {
+        log::error!("URL を開けませんでした ({}): {}", url, e);
+    }
+}
+
 /// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
 #[cfg(unix)]
 fn set_clipboard(text: &str) {
@@ -170,6 +183,11 @@ impl TerminalWindow {
         self.view.needs_redraw()
     }
 
+    /// カーソル点滅の表示フェーズを設定する。
+    pub fn set_cursor_blink(&mut self, on: bool) {
+        self.view.set_cursor_blink(on);
+    }
+
     // Returns true if the PTY is closed, false otherwise
     pub fn check_update(&mut self) -> bool {
         let cell_size = self.view.cell_size();
@@ -303,6 +321,61 @@ impl TerminalWindow {
         log::debug!("viewport changed: {:?}", new_viewport);
         self.view.set_viewport(new_viewport);
         self.resize_buffer();
+    }
+
+    /// 画面上の (row, col) にある URL を取り出す。クリック位置の文字から
+    /// 左右へ「URL に使える文字」を伸ばし、http(s):// で始まればその文字列を返す。
+    fn url_at(&self, row: usize, col: usize) -> Option<String> {
+        fn is_url_char(c: char) -> bool {
+            !c.is_whitespace()
+                && c != '\0'
+                && !matches!(
+                    c,
+                    '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '│'
+                )
+        }
+
+        let line = self.view.lines.get(row)?;
+
+        // 列ごとの文字を作る（幅2の全角は2列ぶん占有、幅0は前のセルの続き）。
+        let mut chars: Vec<char> = Vec::new();
+        for cell in line.iter() {
+            match cell.width {
+                0 => {}
+                w => {
+                    chars.push(cell.ch);
+                    for _ in 1..w {
+                        chars.push('\0');
+                    }
+                }
+            }
+        }
+
+        let clicked = *chars.get(col)?;
+        if !is_url_char(clicked) {
+            return None;
+        }
+
+        let mut start = col;
+        while start > 0 && is_url_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < chars.len() && is_url_char(chars[end + 1]) {
+            end += 1;
+        }
+
+        let token: String = chars[start..=end].iter().filter(|c| **c != '\0').collect();
+        // 末尾の句読点・閉じ記号は URL から除く。
+        let token = token
+            .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '。' | '、'))
+            .to_string();
+
+        if token.starts_with("http://") || token.starts_with("https://") {
+            Some(token)
+        } else {
+            None
+        }
     }
 
     fn increase_font_size(&mut self, size_diff: i32) {
@@ -473,6 +546,32 @@ impl TerminalWindow {
                             }
                             ElementState::Released => {
                                 self.mouse.released_pos = Some(self.mouse.cursor_pos);
+
+                                // ドラッグ（選択）でない単純な左クリックで、その位置に
+                                // URL があればブラウザで開く。mouse_mode が ON の
+                                // アプリ（nvim 等）はこの分岐に来ないので邪魔しない。
+                                if *button == MouseButton::Left {
+                                    if let Some(press) = self.mouse.pressed_pos {
+                                        let cs = self.view.cell_size();
+                                        let to_cell = |p: CursorPosition| {
+                                            (
+                                                (p.x / cs.w.max(1) as f64) as i64,
+                                                (p.y / cs.h.max(1) as f64) as i64,
+                                            )
+                                        };
+                                        let here = self.mouse.cursor_pos;
+                                        if to_cell(press) == to_cell(here) {
+                                            let (col, row) = to_cell(here);
+                                            if col >= 0 && row >= 0 {
+                                                if let Some(url) =
+                                                    self.url_at(row as usize, col as usize)
+                                                {
+                                                    open_url(&url);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
