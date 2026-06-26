@@ -1,6 +1,6 @@
 [package]
 name = "gototerm"
-version = "0.2.7"
+version = "0.2.8"
 authors = ["mamagotolab"]
 edition = "2021"
 description = "日本語入力のストレスが少ない、軽量ターミナルエミュレータ（Wayland 向け・Sixel 画像対応）"

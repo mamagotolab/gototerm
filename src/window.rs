@@ -14,14 +14,17 @@ use crate::Display;
 
 type CursorPosition = PhysicalPosition<f64>;
 
-/// URL を OS 標準のブラウザで開く。Linux は xdg-open、Windows は explorer
-/// （cmd の start だと黒いコンソールが一瞬出るため explorer を使う）。
+/// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
+/// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
+/// 引数をパスと誤解してフォルダを開くことがあるため使わない。
 fn open_url(url: &str) {
     use std::process::Command;
     #[cfg(not(windows))]
     let result = Command::new("xdg-open").arg(url).spawn();
     #[cfg(windows)]
-    let result = Command::new("explorer").arg(url).spawn();
+    let result = Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn();
     if let Err(e) = result {
         log::error!("URL を開けませんでした ({}): {}", url, e);
     }
@@ -480,6 +483,22 @@ impl TerminalWindow {
                     let x = position.x - viewport.x as f64;
                     let y = position.y - viewport.y as f64;
                     self.mouse.cursor_pos = CursorPosition { x, y };
+
+                    // URL の上ではポインタ（手）カーソルにして「クリックできる」と
+                    // 分かるようにする。mouse_mode のアプリにはマウスを渡すので変えない。
+                    if !self.terminal.mouse_mode() {
+                        let cs = self.view.cell_size();
+                        let col = (x / cs.w.max(1) as f64) as i64;
+                        let row = (y / cs.h.max(1) as f64) as i64;
+                        let on_url = col >= 0
+                            && row >= 0
+                            && self.url_at(row as usize, col as usize).is_some();
+                        self.window.set_cursor_icon(if on_url {
+                            CursorIcon::Pointer
+                        } else {
+                            CursorIcon::Text
+                        });
+                    }
                 }
 
                 WindowEvent::MouseInput { state, button, .. } => {
@@ -601,31 +620,53 @@ impl TerminalWindow {
                     self.mouse.wheel_delta_x %= 1.0;
                     self.mouse.wheel_delta_y %= 1.0;
 
-                    // 通常画面ではホイールで履歴スクロール（直感的）。
-                    // 代替画面(nvim/less 等の TUI)では矢印キーを送って中身をスクロール。
-                    // Shift 押下時は常に履歴スクロール。
-                    if self.modifiers.shift_key() || !self.terminal.alt_screen() {
+                    // スクロールの振り分け：
+                    //  ・Shift 押下 → 常に履歴スクロール（どんな画面でも遡れる保険）
+                    //  ・アプリがマウス報告中(Claude Code 等の TUI) → ホイールを
+                    //    マウスホイールイベントとして送り、アプリ自身にスクロールさせる。
+                    //    （以前は矢印キーを送っていたため、Claude Code が入力履歴↑↓と
+                    //     誤解してページが動かなかった）
+                    //  ・代替画面(マウス非対応の less 等) → 矢印キー
+                    //  ・通常画面 → ローカル履歴スクロール
+                    if self.modifiers.shift_key() {
                         self.terminal.scroll(vertical as i32);
-                    } else {
-                        // Send Up/Down key
-                        if vertical > 0 {
-                            for _ in 0..vertical.abs() {
-                                self.terminal.write(b"\x1b[\x41"); // Up
-                            }
-                        } else {
-                            for _ in 0..vertical.abs() {
-                                self.terminal.write(b"\x1b[\x42"); // Down
+                    } else if self.terminal.mouse_mode() {
+                        let cell_size = self.view.cell_size();
+                        let CursorPosition { x, y } = self.mouse.cursor_pos;
+                        let col = x.round().max(0.0) as u32 / cell_size.w.max(1) + 1;
+                        let row = y.round().max(0.0) as u32 / cell_size.h.max(1) + 1;
+                        let sgr = self.terminal.sgr_mouse();
+                        // 64=ホイール上, 65=下, 66=左, 67=右
+                        let v_btn: u8 = if vertical > 0 { 64 } else { 65 };
+                        for _ in 0..vertical.abs() {
+                            if sgr {
+                                self.sgr_ext_mouse_report(v_btn, col, row, &ElementState::Pressed);
+                            } else {
+                                self.normal_mouse_report(v_btn, col, row);
                             }
                         }
-                    }
-
-                    if horizontal > 0 {
+                        let h_btn: u8 = if horizontal > 0 { 67 } else { 66 };
                         for _ in 0..horizontal.abs() {
-                            self.terminal.write(b"\x1b[\x43"); // Right
+                            if sgr {
+                                self.sgr_ext_mouse_report(h_btn, col, row, &ElementState::Pressed);
+                            } else {
+                                self.normal_mouse_report(h_btn, col, row);
+                            }
+                        }
+                    } else if self.terminal.alt_screen() {
+                        let vk: &[u8] = if vertical > 0 { b"\x1b[\x41" } else { b"\x1b[\x42" };
+                        for _ in 0..vertical.abs() {
+                            self.terminal.write(vk);
+                        }
+                        let hk: &[u8] = if horizontal > 0 { b"\x1b[\x43" } else { b"\x1b[\x44" };
+                        for _ in 0..horizontal.abs() {
+                            self.terminal.write(hk);
                         }
                     } else {
+                        self.terminal.scroll(vertical as i32);
+                        let hk: &[u8] = if horizontal > 0 { b"\x1b[\x43" } else { b"\x1b[\x44" };
                         for _ in 0..horizontal.abs() {
-                            self.terminal.write(b"\x1b[\x44"); // Left
+                            self.terminal.write(hk);
                         }
                     }
                 }
@@ -697,6 +738,12 @@ impl TerminalWindow {
             (false, true, KeyCode::Enter) => self.terminal.write(b"\x1b\r"),
             (false, false, KeyCode::Enter) => self.terminal.write(b"\r"),
             (false, _, KeyCode::Tab) => self.terminal.write(b"\t"),
+
+            // Space は明示的に空白を送る。IME 有効時に winit が text=None で
+            // Space を渡してくることがあり、その場合 text 経由だと何も送られず、
+            // Claude Code の選択(スペースでトグル)等が効かなくなるため。
+            // ここに来る時点で preedit は空（上でガード済み）なので変換中は影響しない。
+            (false, _, KeyCode::Space) => self.terminal.write(b" "),
 
             (false, _, KeyCode::ArrowUp) => self.terminal.write(b"\x1b[\x41"),
             (false, _, KeyCode::ArrowDown) => self.terminal.write(b"\x1b[\x42"),
