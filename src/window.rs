@@ -9,7 +9,7 @@ use winit::{
 
 use crate::terminal::TerminalSize;
 use crate::vt::VtTerminal;
-use crate::view::{TerminalView, Viewport};
+use crate::view::{Selection, TerminalView, Viewport};
 use crate::Display;
 
 type CursorPosition = PhysicalPosition<f64>;
@@ -115,6 +115,14 @@ struct MouseState {
     cursor_pos: CursorPosition,
     pressed_pos: Option<CursorPosition>,
     released_pos: Option<CursorPosition>,
+    // 選択を絶対行に固定するため、押下/離した時点のスクロール量を覚えておく。
+    pressed_offset: i64,
+    released_offset: i64,
+    // 押下時に矩形選択(Alt)だったか。
+    block: bool,
+    // 現在のドラッグがローカル選択か（押下時に確定）。途中で Shift を離しても
+    // ボタンを離すまでローカル選択を続け、released_pos を確実に立てるため。
+    selecting: bool,
     click_count: usize,
     last_clicked: std::time::Instant,
 }
@@ -160,6 +168,10 @@ impl TerminalWindow {
                 cursor_pos: CursorPosition::default(),
                 pressed_pos: None,
                 released_pos: None,
+                pressed_offset: 0,
+                released_offset: 0,
+                block: false,
+                selecting: false,
                 click_count: 0,
                 last_clicked: std::time::Instant::now() - std::time::Duration::from_secs(10),
             },
@@ -227,76 +239,118 @@ impl TerminalWindow {
             });
         }
 
-        // Update text selection
+        // Update text selection（スクロール追従＋矩形対応）
         if let Some(CursorPosition { x: sx, y: sy }) = self.mouse.pressed_pos {
             let CursorPosition { x: ex, y: ey } =
                 self.mouse.released_pos.unwrap_or(self.mouse.cursor_pos);
 
             let lines = &self.view.lines;
+            let rows = terminal_size.rows;
+            let cols = terminal_size.cols;
+            let rows_i = rows as i64;
 
-            let x_max = cell_size.w as f64 * terminal_size.cols as f64;
-            let y_max = cell_size.h as f64 * terminal_size.rows as f64;
+            // 列はスクロールの影響を受けないのでピクセルから直接。
+            let x_max = cell_size.w as f64 * cols as f64;
             let sx = sx.clamp(0.0, x_max - 0.1);
-            let sy = sy.clamp(0.0, y_max - 0.1);
             let ex = ex.clamp(0.0, x_max - 0.1);
-            let ey = ey.clamp(0.0, y_max - 0.1);
-
-            let mut s_row = (sy / cell_size.h as f64).floor() as usize;
             let mut s_col = (sx / cell_size.w as f64).round() as usize;
-            let mut e_row = (ey / cell_size.h as f64).floor() as usize;
             let mut e_col = (ex / cell_size.w as f64).round() as usize;
 
-            if (e_row, e_col) < (s_row, s_col) {
-                std::mem::swap(&mut s_row, &mut e_row);
-                std::mem::swap(&mut s_col, &mut e_col);
-            }
+            // 行は「押下/離した時点のスクロール量」で絶対行に正規化し、現在の
+            // スクロール量で画面行へ戻す。これで選択が中身に貼り付き、スクロール
+            // しても付いていく（以前は画面位置に固定されていてズレた）。
+            let cur_off = self.terminal.display_offset() as i64;
+            let end_off = if self.mouse.released_pos.is_some() {
+                self.mouse.released_offset
+            } else {
+                cur_off
+            };
+            let s_row_cap = ((sy / cell_size.h as f64).floor() as i64).clamp(0, rows_i - 1);
+            let e_row_cap = ((ey / cell_size.h as f64).floor() as i64).clamp(0, rows_i - 1);
+            let s_row_now = s_row_cap - self.mouse.pressed_offset + cur_off;
+            let e_row_now = e_row_cap - end_off + cur_off;
 
-            // NOTE: selecton is closed range [s, e]
-            e_col = e_col.saturating_sub(1);
+            let new_selection_range = if (s_row_now < 0 && e_row_now < 0)
+                || (s_row_now >= rows_i && e_row_now >= rows_i)
+            {
+                // スクロールで選択が完全に画面外へ出た → 何も塗らない。
+                None
+            } else {
+                let mut s_row = s_row_now.clamp(0, rows_i - 1) as usize;
+                let mut e_row = e_row_now.clamp(0, rows_i - 1) as usize;
 
-            match self.mouse.click_count {
-                // single click: character selection
-                1 => {
-                    // nothing to do
-                }
-
-                // double click: word selection
-                2 => {
-                    fn delimiter(ch: char) -> bool {
-                        ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
+                if self.mouse.block {
+                    // 矩形選択：行範囲 × 列範囲（各軸 min/max の閉区間）。
+                    let top = s_row.min(e_row);
+                    let bottom = s_row.max(e_row);
+                    let left = s_col.min(e_col);
+                    let right = s_col.max(e_col).saturating_sub(1);
+                    if left <= right {
+                        Some(Selection::Block {
+                            top,
+                            bottom,
+                            left,
+                            right,
+                        })
+                    } else {
+                        None
                     }
-                    fn on_different_word(a: char, b: char) -> bool {
-                        delimiter(a) || delimiter(b)
+                } else {
+                    if (e_row, e_col) < (s_row, s_col) {
+                        std::mem::swap(&mut s_row, &mut e_row);
+                        std::mem::swap(&mut s_col, &mut e_col);
                     }
 
-                    while 0 < s_col && s_col < terminal_size.cols {
-                        let prev = lines[s_row].get(s_col - 1).unwrap().ch;
-                        let curr = lines[s_row].get(s_col).unwrap().ch;
-                        if on_different_word(prev, curr) {
-                            break;
+                    // NOTE: selecton is closed range [s, e]
+                    e_col = e_col.saturating_sub(1);
+
+                    match self.mouse.click_count {
+                        // single click: character selection
+                        1 => {}
+
+                        // double click: word selection
+                        2 => {
+                            fn delimiter(ch: char) -> bool {
+                                ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
+                            }
+                            fn on_different_word(a: char, b: char) -> bool {
+                                delimiter(a) || delimiter(b)
+                            }
+
+                            while 0 < s_col && s_col < cols {
+                                let prev = lines[s_row].get(s_col - 1).unwrap().ch;
+                                let curr = lines[s_row].get(s_col).unwrap().ch;
+                                if on_different_word(prev, curr) {
+                                    break;
+                                }
+                                s_col -= 1;
+                            }
+                            while e_col < cols - 1 {
+                                let prev = lines[e_row].get(e_col).unwrap().ch;
+                                let curr = lines[e_row].get(e_col + 1).unwrap().ch;
+                                if on_different_word(prev, curr) {
+                                    break;
+                                }
+                                e_col += 1;
+                            }
                         }
-                        s_col -= 1;
-                    }
-                    while e_col < terminal_size.cols - 1 {
-                        let prev = lines[e_row].get(e_col).unwrap().ch;
-                        let curr = lines[e_row].get(e_col + 1).unwrap().ch;
-                        if on_different_word(prev, curr) {
-                            break;
+
+                        // triple click (or more): line selection
+                        _ => {
+                            s_col = 0;
+                            e_col = cols - 1;
                         }
-                        e_col += 1;
+                    }
+
+                    let l = s_row * cols + s_col;
+                    let r = e_row * cols + e_col;
+                    if l <= r {
+                        Some(Selection::Linear { left: l, right: r })
+                    } else {
+                        None
                     }
                 }
-
-                // triple click (or more): line selection
-                _ => {
-                    s_col = 0;
-                    e_col = terminal_size.cols - 1;
-                }
-            }
-
-            let l = s_row * terminal_size.cols + s_col;
-            let r = e_row * terminal_size.cols + e_col;
-            let new_selection_range = if l <= r { Some((l, r)) } else { None };
+            };
 
             if self.view.selection_range != new_selection_range {
                 self.view.update_contents(|view| {
@@ -512,10 +566,24 @@ impl TerminalWindow {
                     if !is_inner {
                         self.mouse.pressed_pos = None;
                         self.mouse.released_pos = None;
+                        self.mouse.selecting = false;
                         return;
                     }
 
-                    if self.terminal.mouse_mode() {
+                    // Shift 押下中はマウス報告を無視してローカル選択に回す
+                    // （xterm の作法）。これで Claude Code 等のマウス報告アプリでも
+                    // Shift+ドラッグで画面の文字を選択 → Ctrl+Shift+C でコピーできる。
+                    // Released は「ドラッグ開始時にローカル選択だったか(selecting)」も見る。
+                    // 途中で Shift を離してもボタンを離すまでローカル選択を続け、
+                    // released_pos を必ず立てる（立たないと離した後も選択がマウスに
+                    // 追従して固定できない）。
+                    let report_to_app = self.terminal.mouse_mode() && !self.modifiers.shift_key();
+                    let report = match state {
+                        ElementState::Pressed => report_to_app,
+                        ElementState::Released => report_to_app && !self.mouse.selecting,
+                    };
+                    if report {
+                        self.mouse.selecting = false;
                         let button = match state {
                             ElementState::Released if !self.terminal.sgr_mouse() => 3,
                             _ => match button {
@@ -562,9 +630,18 @@ impl TerminalWindow {
 
                                 self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
                                 self.mouse.released_pos = None;
+                                // 選択をスクロールに追従させるため押下時のスクロール量を記録。
+                                self.mouse.pressed_offset = self.terminal.display_offset() as i64;
+                                self.mouse.released_offset = self.mouse.pressed_offset;
+                                // Ctrl を押しながらの開始は矩形選択。
+                                self.mouse.block = self.modifiers.control_key();
+                                // このドラッグはローカル選択。離すまで継続する。
+                                self.mouse.selecting = true;
                             }
                             ElementState::Released => {
+                                self.mouse.selecting = false;
                                 self.mouse.released_pos = Some(self.mouse.cursor_pos);
+                                self.mouse.released_offset = self.terminal.display_offset() as i64;
 
                                 // ドラッグ（選択）でない単純な左クリックで、その位置に
                                 // URL があればブラウザで開く。mouse_mode が ON の
@@ -812,47 +889,71 @@ impl TerminalWindow {
     fn copy_clipboard(&mut self) {
         let mut text = String::new();
 
-        let selection_range = self.view.selection_range;
+        match self.view.selection_range {
+            None => {}
 
-        'row: for (i, row) in self.view.lines.iter().enumerate() {
-            let cols = row.columns();
-
-            for (j, cell) in row.iter().enumerate() {
-                if cell.width == 0 {
-                    continue;
-                }
-
-                let is_selected = match selection_range {
-                    Some((left, right)) => {
+            // 通常選択：行方向の連続範囲。
+            Some(Selection::Linear { left, right }) => {
+                'row: for (i, row) in self.view.lines.iter().enumerate() {
+                    let cols = row.columns();
+                    for (j, cell) in row.iter().enumerate() {
+                        if cell.width == 0 {
+                            continue;
+                        }
                         let offset = i * cols + j;
                         let center = offset + (cell.width / 2) as usize;
-                        left <= center && center <= right
+                        if left <= center && center <= right {
+                            text.push(cell.ch);
+                        }
+                        if cell.ch == '\n' {
+                            continue 'row;
+                        }
                     }
-                    None => false,
-                };
-
-                if is_selected {
-                    text.push(cell.ch);
+                    if !row.linewrap() {
+                        let offset = (i + 1) * cols;
+                        if left < offset && offset <= right {
+                            // 行末の余分な空白は貼り付け先で邪魔になるので落とす。
+                            let n = text.trim_end_matches([' ', '\t']).len();
+                            text.truncate(n);
+                            text.push('\n');
+                        }
+                    }
                 }
-
-                if cell.ch == '\n' {
-                    continue 'row;
-                }
+                text = dedent_common_indent(&text);
             }
 
-            if !row.linewrap() {
-                let is_selected = match selection_range {
-                    Some((left, right)) => {
-                        let offset = (i + 1) * cols;
-                        left < offset && offset <= right
+            // 矩形選択：各行の列範囲 [left, right] を取り、行間に改行を入れる。
+            Some(Selection::Block {
+                top,
+                bottom,
+                left,
+                right,
+            }) => {
+                for (i, row) in self.view.lines.iter().enumerate() {
+                    if i < top || i > bottom {
+                        continue;
                     }
-                    None => false,
-                };
-                if is_selected {
-                    text.push('\n');
+                    let mut line = String::new();
+                    for (j, cell) in row.iter().enumerate() {
+                        if cell.width == 0 {
+                            continue;
+                        }
+                        if left <= j && j <= right {
+                            line.push(cell.ch);
+                        }
+                    }
+                    // 矩形の右側にできる余分な空白を行ごとに落とす。
+                    text.push_str(line.trim_end_matches([' ', '\t']));
+                    if i != bottom {
+                        text.push('\n');
+                    }
                 }
             }
         }
+
+        // 末尾行の余分な空白も落とす（改行は残す）。
+        let n = text.trim_end_matches([' ', '\t']).len();
+        text.truncate(n);
 
         log::info!("copy: {:?}", text);
         set_clipboard(&text);
@@ -890,3 +991,72 @@ impl TerminalWindow {
     }
 }
 
+fn dedent_common_indent(text: &str) -> String {
+    fn is_blank(line: &str) -> bool {
+        line.chars().all(|ch| matches!(ch, ' ' | '\t'))
+    }
+
+    fn leading_indent(line: &str) -> &str {
+        let end = line
+            .char_indices()
+            .find_map(|(i, ch)| (!matches!(ch, ' ' | '\t')).then_some(i))
+            .unwrap_or(line.len());
+        &line[..end]
+    }
+
+    fn common_prefix(left: &str, right: &str) -> String {
+        let mut end = 0;
+        for ((i, a), b) in left.char_indices().zip(right.chars()) {
+            if a != b {
+                break;
+            }
+            end = i + a.len_utf8();
+        }
+        left[..end].to_string()
+    }
+
+    let mut common: Option<String> = None;
+    for line in text.split('\n').filter(|line| !is_blank(line)) {
+        let indent = leading_indent(line);
+        common = Some(match common {
+            Some(ref current) => common_prefix(current, indent),
+            None => indent.to_string(),
+        });
+    }
+
+    let common = common.unwrap_or_default();
+    text.split('\n')
+        .map(|line| {
+            if is_blank(line) {
+                ""
+            } else {
+                line.strip_prefix(&common).unwrap_or(line)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::dedent_common_indent;
+
+    #[test]
+    fn dedent_common_indent_removes_shared_prefix() {
+        let cases = [
+            ("  a\n  b", "a\nb"),
+            ("  a\n    b", "a\n  b"),
+            ("  a\n\n  b", "a\n\nb"),
+            ("  a\n   \n  b", "a\n\nb"),
+            ("a\n  b", "a\n  b"),
+            ("   hello", "hello"),
+            ("\tx\n\ty", "x\ny"),
+            ("  a\n  b\n", "a\nb\n"),
+            ("", ""),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(dedent_common_indent(input), expected);
+        }
+    }
+}

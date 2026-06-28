@@ -116,12 +116,17 @@ fn build_window<T>(
     .make_current(&surface)
     .unwrap();
 
-    // vsync（垂直同期）。これで描画がリフレッシュレートに同期し、
-    // ティアリングが消え、Poll でも CPU が無駄に回らない。
-    let _ = surface.set_swap_interval(
-        &context,
-        glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap()),
-    );
+    // Wayland(Linux) では swap interval を待たない（DontWait）。Wait(1)＝vsync だと、
+    // ワークスペース切替などでコンポジタが frame callback を止めた瞬間に swap が
+    // ブロックし、イベントループが固まって「応答なし（強制終了/待機）」ダイアログが
+    // 出る。描画ペースは AboutToWait の WaitUntil(16ms) で既に約60fpsに保っている
+    // ので、vsync の待ちは無くても CPU は回らず、固着だけが消える。
+    // Windows ではこの問題は起きないため、ティアリングを避けて従来どおり vsync。
+    #[cfg(not(windows))]
+    let interval = glutin::surface::SwapInterval::DontWait;
+    #[cfg(windows)]
+    let interval = glutin::surface::SwapInterval::Wait(NonZeroU32::new(1).unwrap());
+    let _ = surface.set_swap_interval(&context, interval);
 
     let display = glium::Display::from_context_surface(context, surface).unwrap();
     (window, display)

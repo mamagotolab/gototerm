@@ -38,6 +38,22 @@ impl Viewport {
     }
 }
 
+/// テキスト選択。Linear=行方向の連続範囲（通常選択）、
+/// Block=矩形選択（行範囲 × 列範囲）。いずれも閉区間。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Selection {
+    Linear {
+        left: usize,
+        right: usize,
+    },
+    Block {
+        top: usize,
+        bottom: usize,
+        left: usize,
+        right: usize,
+    },
+}
+
 pub struct TerminalView {
     fonts: FontSet,
     cache: GlyphCache,
@@ -50,7 +66,7 @@ pub struct TerminalView {
     pub cursor: Option<Cursor>,
     // IME 変換中（未確定）の文字列。確定すると空になる。
     pub preedit: String,
-    pub selection_range: Option<(usize, usize)>,
+    pub selection_range: Option<Selection>,
     pub scroll_bar: Option<(u32, u32)>,
     pub bg_color: Color,
     pub view_focused: bool,
@@ -346,11 +362,17 @@ impl TerminalView {
                     };
 
                     let is_selected = match self.selection_range {
-                        Some((left, right)) => {
+                        Some(Selection::Linear { left, right }) => {
                             let offset = i * cols + j;
                             let center = offset + (cell.width / 2) as usize;
                             left <= center && center <= right
                         }
+                        Some(Selection::Block {
+                            top,
+                            bottom,
+                            left,
+                            right,
+                        }) => top <= i && i <= bottom && left <= j && j <= right,
                         None => false,
                     };
 

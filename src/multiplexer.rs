@@ -690,6 +690,18 @@ impl Multiplexer {
                     self.window.request_redraw();
                 }
 
+                &WindowEvent::Focused(focused) => {
+                    // ワークスペース切替などで Occluded(false) を取りこぼしても、
+                    // フォーカスが戻った＝必ず可視なので、遮蔽フラグを下ろして
+                    // 描き直す。これが無いと別ワークスペースから戻ったとき画面が
+                    // 固まったまま（待機）になる。
+                    if focused {
+                        self.occluded = false;
+                        self.window.request_redraw();
+                    }
+                    self.focused_root().focused_leaf_mut().process_window_event(wev);
+                }
+
                 &WindowEvent::Occluded(occluded) => {
                     // 遮蔽中の描画スキップは Wayland 限定の対策（frame callback 枯渇で
                     // swap がブロックし無応答になる問題）。Windows ではこの問題が無く、

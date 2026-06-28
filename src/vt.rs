@@ -508,6 +508,12 @@ impl VtTerminal {
         self.dirty.store(true, Ordering::SeqCst);
     }
 
+    /// 現在のスクロールバック表示量（行）。0=最下部。選択を絶対行に
+    /// 固定してスクロール追従させるために使う。
+    pub fn display_offset(&self) -> usize {
+        self.term.lock().unwrap().grid().display_offset()
+    }
+
     /// スクロールバックを最下部（現在）に戻す。キー入力時に呼ぶ。
     pub fn scroll_to_bottom(&self) {
         use alacritty_terminal::grid::Scroll;
