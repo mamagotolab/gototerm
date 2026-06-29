@@ -754,7 +754,15 @@ impl Multiplexer {
                     }
                 }
 
-                WindowEvent::KeyboardInput { event: key, .. } => {
+                WindowEvent::KeyboardInput { event: key, is_synthetic, .. } => {
+                    // winit はウィンドウがフォーカスを得た瞬間、その時点で押されて
+                    // いるキーを「合成の押下イベント」として発行する。Win+3 でこの窓へ
+                    // 切替えると合成 Pressed「3」が、Ctrl+Tab で切替えると合成 Pressed
+                    // 「Tab」が届き、入力として打ち込まれてしまう。合成イベントは実入力
+                    // でもショートカットでもないので無視する。
+                    if *is_synthetic {
+                        return;
+                    }
                     // 入力中はカーソルを点いたままにする（押した瞬間に点滅で
                     // 消えていると打ちにくい）。点滅の起点をリセットする。
                     if key.state == ElementState::Pressed {
@@ -810,6 +818,11 @@ impl Multiplexer {
                         self.tabs.remove(i);
                         changed = true;
                         if self.tabs.is_empty() {
+                            // exited を立てないと、終了確定前に届く次のイベント
+                            // （AboutToWait やフォーカス/クリック）が空の tabs を
+                            // 触って panic する（index out of bounds: len 0）。
+                            // Ctrl+Shift+W の経路と同じくフラグを立てる。
+                            self.exited = true;
                             elwt.exit();
                             return;
                         }
