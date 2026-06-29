@@ -3,6 +3,12 @@
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 fn main() {
+    // パニック（異常終了）の内容をファイルに残す。リリース版はコンソールを
+    // 出さない（windows_subsystem="windows"）ため、何もしないと Windows の
+    // エラーダイアログだけ出てメッセージが消える。原因究明のため crash.log に
+    // パニック箇所とバックトレースを書き出す。
+    install_crash_logger();
+
     // Make sure that configuration errors are detected earlier
     lazy_static::initialize(&gototerm::TOYTERM_CONFIG);
 
@@ -30,6 +36,53 @@ fn main() {
             mux.on_event(&event, elwt);
         })
         .expect("run");
+}
+
+/// パニック時にメッセージとバックトレースを crash.log へ追記する。
+/// 保存先は Windows: %LOCALAPPDATA%\gototerm\crash.log、
+/// それ以外: $XDG_CACHE_HOME(or ~/.cache)/gototerm/crash.log。
+fn crash_log_path() -> std::path::PathBuf {
+    #[cfg(windows)]
+    let base = std::env::var_os("LOCALAPPDATA").map(std::path::PathBuf::from);
+    #[cfg(not(windows))]
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")));
+    base.unwrap_or_else(std::env::temp_dir)
+        .join("gototerm")
+        .join("crash.log")
+}
+
+fn install_crash_logger() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        let path = crash_log_path();
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        use std::io::Write as _;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            let _ = writeln!(
+                f,
+                "\n===== gototerm v{} panic =====\n{}\n{}\n--- backtrace ---\n{}",
+                env!("CARGO_PKG_VERSION"),
+                chrono_now(),
+                info,
+                bt
+            );
+        }
+        // 既定のフック（stderr 出力など）も呼ぶ。
+        default_hook(info);
+    }));
+}
+
+/// 依存を増やさないための簡易タイムスタンプ（UNIX 秒）。
+fn chrono_now() -> String {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => format!("unix_time={}s", d.as_secs()),
+        Err(_) => "unix_time=unknown".to_string(),
+    }
 }
 
 /// 透過（半透明背景）と vsync を有効にしてウィンドウと glium Display を作る。
