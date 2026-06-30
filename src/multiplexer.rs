@@ -641,6 +641,19 @@ impl Multiplexer {
         }
     }
 
+    /// 今このフレームを描画してよいか。最小化中（またはサイズ0）は描かない。
+    /// Windows では最小化中も毎フレーム描画→SwapBuffers を呼んでしまうと、
+    /// 隠れたウィンドウには画面合成(vblank)が来ないため、投げた描画コマンドが
+    /// ドライバ側に処理されず溜まり続け、メモリが膨張して最後は OOM で落ちる。
+    /// タスクバーアイコンの連打（＝最小化⇔復元の高速な繰り返し）で顕著に出る。
+    /// Occluded イベントは Windows では当てにならないので is_minimized で判定する。
+    fn drawable(&self) -> bool {
+        if self.viewport.w == 0 || self.viewport.h == 0 {
+            return false;
+        }
+        !matches!(self.window.is_minimized(), Some(true))
+    }
+
     pub fn on_event(&mut self, event: &Event, elwt: &EventLoopWindowTarget<()>) {
         if self.exited {
             elwt.exit();
@@ -654,6 +667,14 @@ impl Multiplexer {
                 }
 
                 &WindowEvent::Resized(new_size) => {
+                    // 最小化すると Windows は Resized(0,0) を送ってくる。0 サイズで
+                    // glium をリサイズすると落ちるうえ、描いても無意味なので、
+                    // ビューポートだけ 0 にして（drawable() が false になる）戻る。
+                    // 復元時は非0の Resized が再度届き、下の通常経路で描き直す。
+                    if new_size.width == 0 || new_size.height == 0 {
+                        self.viewport = Viewport { x: 0, y: 0, w: 0, h: 0 };
+                        return;
+                    }
                     // glium 0.34 の手書きサーフェスは自動リサイズされないため明示。
                     self.display.resize((new_size.width, new_size.height));
                     self.viewport = Viewport {
@@ -721,7 +742,9 @@ impl Multiplexer {
                 WindowEvent::RedrawRequested => {
                     // 隠れている間は描画しない。Wayland では frame callback が
                     // 止まり、ここでの swap がブロックして無応答になるため。
-                    if self.occluded {
+                    // Windows では最小化中の描画コマンドがドライバに溜まって
+                    // メモリ膨張→OOM になるため drawable() でも弾く。
+                    if self.occluded || !self.drawable() {
                         return;
                     }
                     let mut surface = self.display.draw();
@@ -863,7 +886,7 @@ impl Multiplexer {
                 // 内容更新自体は上で汲み取り済みなので、再表示時にまとめて描ける。
                 let need = self.tabs[self.focus].needs_redraw()
                     || (self.status_bar_height() > 0 && self.status_view.needs_redraw());
-                if need && !self.occluded {
+                if need && !self.occluded && self.drawable() {
                     self.window.request_redraw();
                 }
 
