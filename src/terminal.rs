@@ -14,7 +14,6 @@ pub struct PositionedImage {
     pub data: Vec<u8>,
 }
 
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TerminalSize {
     pub rows: usize,
@@ -181,6 +180,10 @@ impl Line {
     /// 描画用に外部（VTアダプタ）から行を組むためのコンストラクタ。
     pub fn from_cells(cells: Vec<Cell>, linewrap: bool) -> Self {
         Line { cells, linewrap }
+    }
+
+    pub fn cells_mut(&mut self) -> &mut [Cell] {
+        &mut self.cells
     }
 
     pub fn copy_from(&mut self, src: &Self) {

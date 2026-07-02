@@ -5,20 +5,23 @@
 //! ウィンドウ全体のイベント（リサイズ・再描画・終了）はここで握り、
 //! キー/マウス/IME は現在フォーカスしているペインへ振り分ける。
 
+use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use winit::{
     dpi::PhysicalPosition,
-    event::{ElementState, KeyEvent, WindowEvent},
+    event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoopWindowTarget},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::Window,
 };
 
-use crate::sidebar::Sidebar;
+use crate::config::resolve_editor;
+use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::terminal::{Cell, Color, Line};
 use crate::view::{TerminalView, Viewport};
+use crate::vt::ShellLocation;
 use crate::window::TerminalWindow;
 use crate::Display;
 
@@ -44,6 +47,7 @@ enum Dir {
 }
 
 /// マネージャが横取りするキー操作。
+#[derive(Clone, Copy)]
 enum Action {
     NewTab,
     CloseFocused,
@@ -52,6 +56,7 @@ enum Action {
     SplitVertical,
     SplitHorizontal,
     ToggleSidebar,
+    FocusSidebar,
     Focus(Dir),
 }
 
@@ -123,6 +128,42 @@ fn content_and_sidebar_viewport(
     let ratio = (1.0 - sidebar_ratio).clamp(0.0, 1.0);
     let (content, sidebar) = split_viewport(Partition::Vertical, ratio, vp);
     (content, Some(sidebar))
+}
+
+fn command_exists(command: &str) -> bool {
+    let path = Path::new(command);
+    if path.components().count() > 1 {
+        return path.is_file();
+    }
+
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+
+    #[cfg(windows)]
+    let extensions: Vec<String> = std::env::var_os("PATHEXT")
+        .map(|value| {
+            std::env::split_paths(&value)
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect()
+        })
+        .unwrap_or_else(|| vec![".exe".to_owned(), ".cmd".to_owned(), ".bat".to_owned()]);
+
+    for dir in std::env::split_paths(&paths) {
+        let candidate = dir.join(command);
+        if candidate.is_file() {
+            return true;
+        }
+        #[cfg(windows)]
+        {
+            for ext in &extensions {
+                if dir.join(format!("{command}{ext}")).is_file() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 impl Node {
@@ -207,7 +248,13 @@ impl Node {
     }
 
     /// フォーカス中の葉を分割する。`window`/`display` は新ペイン生成に使う。
-    fn split_focused(&mut self, partition: Partition, window: &Rc<Window>, display: &Display) {
+    fn split_focused(
+        &mut self,
+        partition: Partition,
+        window: &Rc<Window>,
+        display: &Display,
+        command: Option<&[String]>,
+    ) {
         match self {
             Node::Leaf(_) => {
                 let vp = self.focused_leaf_mut().viewport();
@@ -220,12 +267,16 @@ impl Node {
 
                 // 新ペインの作業ディレクトリは元ペインのシェルの現在地を継承する
                 // （取れない環境では gototerm の起動ディレクトリ）。
-                let cwd = old.pane_cwd().or_else(|| std::env::current_dir().ok());
-                let new_win = Box::new(TerminalWindow::with_viewport(
+                let cwd = match old.pane_location() {
+                    ShellLocation::Local(path) => Some(path),
+                    ShellLocation::Remote { .. } => std::env::current_dir().ok(),
+                };
+                let new_win = Box::new(TerminalWindow::with_viewport_command(
                     window.clone(),
                     display.clone(),
                     vp,
                     cwd.as_deref(),
+                    command,
                 ));
 
                 let mut first = Box::new(Node::Leaf(old));
@@ -244,9 +295,9 @@ impl Node {
             }
             Node::Split(s) => {
                 if s.focus_first {
-                    s.first.split_focused(partition, window, display);
+                    s.first.split_focused(partition, window, display, command);
                 } else {
-                    s.second.split_focused(partition, window, display);
+                    s.second.split_focused(partition, window, display, command);
                 }
             }
             Node::Empty => {}
@@ -470,6 +521,7 @@ pub struct Multiplexer {
     viewport: Viewport,
     status_view: TerminalView,
     sidebar: Sidebar,
+    sidebar_focused: bool,
     tabs: Vec<Node>,
     focus: usize,
     modifiers: ModifiersState,
@@ -518,6 +570,7 @@ impl Multiplexer {
             viewport,
             status_view,
             sidebar,
+            sidebar_focused: false,
             tabs: vec![first],
             focus: 0,
             modifiers: ModifiersState::empty(),
@@ -535,14 +588,8 @@ impl Multiplexer {
         &mut self.tabs[self.focus]
     }
 
-    /// サイドバーに表示する作業フォルダ。フォーカス中ペインのシェルの現在地を
-    /// 優先し、取れない環境（Windows 等）では起動ディレクトリへフォールバック。
-    fn focused_cwd(&mut self) -> std::path::PathBuf {
-        self.focused_root()
-            .focused_leaf_mut()
-            .pane_cwd()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
+    fn focused_location(&mut self) -> ShellLocation {
+        self.focused_root().focused_leaf_mut().pane_location()
     }
 
     /// タブバーの高さ（px）。タブ1枚のときは 0（バー非表示）。
@@ -578,7 +625,7 @@ impl Multiplexer {
         let (cvp, sidebar_vp) = content_and_sidebar_viewport(
             self.content_viewport(),
             self.sidebar.is_visible(),
-            crate::TOYTERM_CONFIG.sidebar_ratio,
+            self.sidebar.current_ratio(),
         );
         if let Some(sidebar_vp) = sidebar_vp {
             self.sidebar.set_viewport(sidebar_vp);
@@ -656,6 +703,7 @@ impl Multiplexer {
             (true, KeyCode::KeyE) => Action::SplitVertical,
             (true, KeyCode::KeyO) => Action::SplitHorizontal,
             (true, KeyCode::KeyF) => Action::ToggleSidebar,
+            (true, KeyCode::KeyB) => Action::FocusSidebar,
             // フォーカス移動
             (true, KeyCode::ArrowUp) => Action::Focus(Dir::Up),
             (true, KeyCode::ArrowDown) => Action::Focus(Dir::Down),
@@ -725,7 +773,7 @@ impl Multiplexer {
                 };
                 let window = self.window.clone();
                 let display = self.display.clone();
-                self.tabs[self.focus].split_focused(partition, &window, &display);
+                self.tabs[self.focus].split_focused(partition, &window, &display, None);
             }
 
             Action::Focus(dir) => {
@@ -733,9 +781,53 @@ impl Multiplexer {
             }
 
             Action::ToggleSidebar => {
-                let cwd = self.focused_cwd();
-                self.sidebar.toggle(&cwd);
+                let location = self.focused_location();
+                self.sidebar.toggle(&location);
+                if !self.sidebar.is_visible() {
+                    self.release_sidebar_focus();
+                }
                 self.refresh_layout();
+            }
+
+            Action::FocusSidebar => {
+                if !self.sidebar.is_visible() {
+                    let location = self.focused_location();
+                    self.sidebar.toggle(&location);
+                    self.refresh_layout();
+                }
+                self.focus_sidebar();
+            }
+        }
+    }
+
+    fn focus_sidebar(&mut self) {
+        if !self.sidebar.is_visible() || self.sidebar_focused {
+            return;
+        }
+        self.focused_root().focused_leaf_mut().focus_changed(false);
+        self.sidebar_focused = true;
+        self.sidebar.set_focused(true);
+    }
+
+    fn release_sidebar_focus(&mut self) {
+        if !self.sidebar_focused {
+            self.sidebar.set_focused(false);
+            return;
+        }
+        self.sidebar_focused = false;
+        self.sidebar.set_focused(false);
+        self.focused_root().focused_leaf_mut().focus_changed(true);
+    }
+
+    fn handle_sidebar_key_result(&mut self, result: SidebarKeyResult) {
+        match result {
+            SidebarKeyResult::Consumed => {}
+            SidebarKeyResult::ReleaseFocus => self.release_sidebar_focus(),
+            SidebarKeyResult::Request(request) => {
+                self.handle_sidebar_request(request);
+                if self.sidebar_focused {
+                    self.focused_root().focused_leaf_mut().focus_changed(false);
+                }
             }
         }
     }
@@ -746,11 +838,42 @@ impl Multiplexer {
         };
 
         if !self.sidebar.is_visible() {
-            let cwd = self.focused_cwd();
-            self.sidebar.toggle(&cwd);
+            let location = self.focused_location();
+            self.sidebar.toggle(&location);
             self.refresh_layout();
         }
         self.sidebar.preview_pinned(&path);
+        self.refresh_layout();
+    }
+
+    fn handle_sidebar_request(&mut self, request: SidebarRequest) {
+        match request {
+            SidebarRequest::EditFile(path) => {
+                let env_editor = std::env::var("EDITOR").ok();
+                let mut command =
+                    resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
+                if !command_exists(&command[0]) {
+                    self.sidebar.show_missing_editor(&command[0]);
+                    return;
+                }
+                command.push(path.to_string_lossy().into_owned());
+
+                let window = self.window.clone();
+                let display = self.display.clone();
+                self.tabs[self.focus].split_focused(
+                    Partition::Horizontal,
+                    &window,
+                    &display,
+                    Some(&command),
+                );
+            }
+            SidebarRequest::OpenWithSystem(path) => {
+                crate::window::open_url(&path.to_string_lossy());
+            }
+            SidebarRequest::RefreshLayout => {
+                self.refresh_layout();
+            }
+        }
     }
 
     /// 今このフレームを描画してよいか。最小化中（またはサイズ0）は描かない。
@@ -923,6 +1046,12 @@ impl Multiplexer {
                     }
                     if let Some(action) = self.parse_shortcut(key) {
                         self.handle_action(action);
+                        if self.sidebar_focused && !matches!(action, Action::FocusSidebar) {
+                            self.focused_root().focused_leaf_mut().focus_changed(false);
+                        }
+                    } else if self.sidebar_focused {
+                        let result = self.sidebar.on_key(key);
+                        self.handle_sidebar_key_result(result);
                     } else {
                         self.focused_root()
                             .focused_leaf_mut()
@@ -942,12 +1071,19 @@ impl Multiplexer {
                     ..
                 } => {
                     if self.sidebar.contains(self.cursor_pos) {
-                        self.sidebar.on_click(self.cursor_pos);
+                        self.focus_sidebar();
+                        if let Some(request) = self.sidebar.on_click(self.cursor_pos) {
+                            self.handle_sidebar_request(request);
+                        }
                         return;
                     }
                     // クリックしたペインへフォーカスを移してから入力を渡す。
                     let p = self.cursor_pos;
-                    self.focused_root().focused_leaf_mut().focus_changed(false);
+                    if self.sidebar_focused {
+                        self.release_sidebar_focus();
+                    } else {
+                        self.focused_root().focused_leaf_mut().focus_changed(false);
+                    }
                     self.tabs[self.focus].focus_at(p);
                     self.focused_root().focused_leaf_mut().focus_changed(true);
                     self.focused_root()
@@ -956,8 +1092,17 @@ impl Multiplexer {
                     self.handle_clicked_file();
                 }
 
-                WindowEvent::MouseWheel { .. } => {
-                    if !self.sidebar.contains(self.cursor_pos) {
+                WindowEvent::MouseWheel { delta, .. } => {
+                    if self.sidebar.contains(self.cursor_pos) {
+                        let rows = match delta {
+                            MouseScrollDelta::LineDelta(_, y) => (*y * 1.5).trunc() as i32,
+                            MouseScrollDelta::PixelDelta(pos) => {
+                                let cell_h = self.sidebar.cell_height();
+                                (pos.y / cell_h.max(1) as f64).trunc() as i32
+                            }
+                        };
+                        self.sidebar.on_scroll(rows);
+                    } else {
                         self.focused_root()
                             .focused_leaf_mut()
                             .process_window_event(wev);
@@ -965,6 +1110,8 @@ impl Multiplexer {
                 }
 
                 WindowEvent::MouseInput { .. } if self.sidebar.contains(self.cursor_pos) => {}
+
+                WindowEvent::Ime(_) if self.sidebar_focused => {}
 
                 // フォーカス・IME・マウス離し等はフォーカス中ペインへ。
                 _ => {
@@ -1032,8 +1179,8 @@ impl Multiplexer {
 
                 // フォーカス中ペインの cd に追従する（非表示中は /proc も読まない）。
                 if self.sidebar.is_visible() {
-                    let cwd = self.focused_cwd();
-                    self.sidebar.refresh_if_stale(&cwd);
+                    let location = self.focused_location();
+                    self.sidebar.refresh_if_stale(&location);
                 }
 
                 // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。

@@ -5,8 +5,9 @@
 //! PTY は portable-pty（Unix=openpty / Windows=ConPTY）。
 
 use std::io::{Read as _, Write as _};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
@@ -20,6 +21,12 @@ use crate::terminal::PositionedImage;
 
 /// PTY master への書き込み口。入力と応答(DA/DSR等)の両方が使うため共有する。
 pub type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ShellLocation {
+    Local(PathBuf),
+    Remote { host: String, path: PathBuf },
+}
 
 /// alacritty の Term が応答シーケンスを送るときに呼ばれるリスナー。
 /// `PtyWrite`(DA/DSR等)・`TextAreaSizeRequest`(CSI14t/16t=ピクセル寸法)・
@@ -149,6 +156,7 @@ pub struct VtTerminal {
     /// シェル（PTY 子プロセス）の PID。`cwd()` で /proc を引くために保持。
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     child_pid: Option<u32>,
+    shell_location: Arc<Mutex<Option<ShellLocation>>>,
 }
 
 fn window_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> WindowSize {
@@ -166,7 +174,17 @@ enum Seg {
     Pass(Vec<u8>),
     /// Sixel の本体（`ESC P …q` と ST を除いた中身）。自前で描画する。
     Sixel(Vec<u8>),
+    /// gototerm が読む OSC。OSC 7717 は Phase 8a では抽出だけ行う。
+    Osc { code: OscCode, payload: String },
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OscCode {
+    Cwd,
+    Gt,
+}
+
+const OSC_MAX_BYTES: usize = 1024 * 1024;
 
 #[derive(Default, Clone, Copy, PartialEq)]
 enum SplitState {
@@ -178,6 +196,11 @@ enum SplitState {
     SixelEsc,
     DcsPass,
     DcsPassEsc,
+    OscCode,
+    OscData,
+    OscEsc,
+    OscPass,
+    OscPassEsc,
 }
 
 /// PTY バイト列から Sixel(DCS) を抜き出す状態機械。チャンクをまたいで状態を保つ。
@@ -188,6 +211,9 @@ struct SixelSplitter {
     intro: Vec<u8>,
     not_sixel: bool,
     payload: Vec<u8>,
+    osc_code: Vec<u8>,
+    osc_kind: Option<OscCode>,
+    osc_discard: bool,
 }
 
 impl SixelSplitter {
@@ -209,6 +235,11 @@ impl SixelSplitter {
                         self.state = SplitState::DcsIntro;
                         self.intro.clear();
                         self.not_sixel = false;
+                    } else if b == b']' {
+                        self.state = SplitState::OscCode;
+                        self.osc_code.clear();
+                        self.osc_kind = None;
+                        self.osc_discard = false;
                     } else {
                         pass.push(0x1b);
                         if b == 0x1b {
@@ -281,12 +312,195 @@ impl SixelSplitter {
                         SplitState::DcsPass
                     };
                 }
+                SplitState::OscCode => {
+                    if b == b';' {
+                        self.osc_kind = match self.osc_code.as_slice() {
+                            b"7" => Some(OscCode::Cwd),
+                            b"7717" => Some(OscCode::Gt),
+                            _ => None,
+                        };
+                        if self.osc_kind.is_some() {
+                            self.payload.clear();
+                            self.state = SplitState::OscData;
+                        } else {
+                            pass.push(0x1b);
+                            pass.push(b']');
+                            pass.extend_from_slice(&self.osc_code);
+                            pass.push(b';');
+                            self.state = SplitState::OscPass;
+                        }
+                    } else if b == 0x07 {
+                        pass.push(0x1b);
+                        pass.push(b']');
+                        pass.extend_from_slice(&self.osc_code);
+                        pass.push(b);
+                        self.state = SplitState::Normal;
+                    } else if b == 0x1b {
+                        pass.push(0x1b);
+                        pass.push(b']');
+                        pass.extend_from_slice(&self.osc_code);
+                        pass.push(b);
+                        self.state = SplitState::OscPassEsc;
+                    } else if b.is_ascii_digit() {
+                        self.osc_code.push(b);
+                    } else {
+                        pass.push(0x1b);
+                        pass.push(b']');
+                        pass.extend_from_slice(&self.osc_code);
+                        pass.push(b);
+                        self.state = SplitState::OscPass;
+                    }
+                }
+                SplitState::OscData => {
+                    if b == 0x07 {
+                        if let Some(seg) = self.finish_osc() {
+                            if !pass.is_empty() {
+                                segs.push(Seg::Pass(std::mem::take(&mut pass)));
+                            }
+                            segs.push(seg);
+                        }
+                        self.state = SplitState::Normal;
+                    } else if b == 0x1b {
+                        self.state = SplitState::OscEsc;
+                    } else {
+                        self.push_osc_payload(b);
+                    }
+                }
+                SplitState::OscEsc => {
+                    if b == b'\\' {
+                        if let Some(seg) = self.finish_osc() {
+                            if !pass.is_empty() {
+                                segs.push(Seg::Pass(std::mem::take(&mut pass)));
+                            }
+                            segs.push(seg);
+                        }
+                        self.state = SplitState::Normal;
+                    } else {
+                        self.push_osc_payload(0x1b);
+                        self.push_osc_payload(b);
+                        self.state = SplitState::OscData;
+                    }
+                }
+                SplitState::OscPass => {
+                    pass.push(b);
+                    if b == 0x07 {
+                        self.state = SplitState::Normal;
+                    } else if b == 0x1b {
+                        self.state = SplitState::OscPassEsc;
+                    }
+                }
+                SplitState::OscPassEsc => {
+                    pass.push(b);
+                    self.state = if b == b'\\' {
+                        SplitState::Normal
+                    } else {
+                        SplitState::OscPass
+                    };
+                }
             }
         }
         if !pass.is_empty() {
             segs.push(Seg::Pass(pass));
         }
         segs
+    }
+
+    fn push_osc_payload(&mut self, b: u8) {
+        if self.osc_discard {
+            return;
+        }
+        if self.payload.len() >= OSC_MAX_BYTES {
+            self.payload.clear();
+            self.osc_discard = true;
+        } else {
+            self.payload.push(b);
+        }
+    }
+
+    fn finish_osc(&mut self) -> Option<Seg> {
+        if self.osc_discard {
+            self.payload.clear();
+            return None;
+        }
+        let code = self.osc_kind?;
+        let bytes = std::mem::take(&mut self.payload);
+        let payload = String::from_utf8(bytes).ok()?;
+        Some(Seg::Osc { code, payload })
+    }
+}
+
+pub(crate) fn parse_osc7(payload: &str) -> Option<(String, PathBuf)> {
+    let rest = payload.strip_prefix("file://")?;
+    let slash = rest.find('/')?;
+    let (host, path) = rest.split_at(slash);
+    let path = percent_decode_path(path)?;
+    Some((host.to_string(), PathBuf::from(path)))
+}
+
+fn percent_decode_path(input: &str) -> Option<String> {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            let hi = *bytes.get(i + 1)?;
+            let lo = *bytes.get(i + 2)?;
+            out.push(hex_value(hi)? << 4 | hex_value(lo)?);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn local_hostname() -> &'static str {
+    static HOSTNAME: OnceLock<String> = OnceLock::new();
+    HOSTNAME
+        .get_or_init(|| {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string("/proc/sys/kernel/hostname")
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_default()
+            }
+            #[cfg(windows)]
+            {
+                std::env::var("COMPUTERNAME").unwrap_or_default()
+            }
+            #[cfg(all(not(target_os = "linux"), not(windows)))]
+            {
+                String::new()
+            }
+        })
+        .as_str()
+}
+
+pub(crate) fn classify_shell_location(
+    host: &str,
+    path: PathBuf,
+    local_host: &str,
+) -> ShellLocation {
+    if host.is_empty()
+        || host.eq_ignore_ascii_case("localhost")
+        || (!local_host.is_empty() && host.eq_ignore_ascii_case(local_host))
+    {
+        ShellLocation::Local(path)
+    } else {
+        ShellLocation::Remote {
+            host: host.to_string(),
+            path,
+        }
     }
 }
 
@@ -333,16 +547,19 @@ impl VtTerminal {
         cell_w: u16,
         cell_h: u16,
         cwd: &std::path::Path,
-        shell: &[String],
+        command: Option<&[String]>,
     ) -> Self {
+        let _ = local_hostname();
+
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
             .openpty(pty_size(cols, lines, cell_w, cell_h))
             .expect("openpty");
 
-        // シェルを起動
-        let mut cmd = CommandBuilder::new(&shell[0]);
-        for arg in &shell[1..] {
+        let command = command.unwrap_or(&crate::TOYTERM_CONFIG.shell);
+        // コマンド未指定時だけ既定シェルへ戻し、環境の整備は全経路で同じにする。
+        let mut cmd = CommandBuilder::new(&command[0]);
+        for arg in &command[1..] {
             cmd.arg(arg);
         }
         // 親の環境を引き継ぐが、「別端末の正体」を示す変数は落とす。
@@ -381,7 +598,7 @@ impl VtTerminal {
         cmd.env("TERM_PROGRAM", "gototerm");
         cmd.cwd(cwd);
 
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
+        let mut child = pair.slave.spawn_command(cmd).expect("spawn command");
         let killer = child.clone_killer();
         // 回収スレッドに move する前に PID を控える（cwd 追従に使う）。
         let child_pid = child.process_id();
@@ -403,6 +620,7 @@ impl VtTerminal {
         let dirty = Arc::new(AtomicBool::new(true));
         let images: Arc<Mutex<Vec<PositionedImage>>> = Arc::new(Mutex::new(Vec::new()));
         let last_alt = Arc::new(AtomicBool::new(false));
+        let shell_location = Arc::new(Mutex::new(None));
 
         // 読取スレッド：PTY 出力を Sixel と通常VTに分け、後者を Processor に流す
         {
@@ -411,6 +629,7 @@ impl VtTerminal {
             let dirty = dirty.clone();
             let images = images.clone();
             let winsize = winsize.clone();
+            let shell_location = shell_location.clone();
             std::thread::spawn(move || {
                 let mut processor: Processor = Processor::new();
                 let mut splitter = SixelSplitter::default();
@@ -434,6 +653,18 @@ impl VtTerminal {
                                             &winsize,
                                             &mut processor,
                                         );
+                                    }
+                                    Seg::Osc { code, payload } => {
+                                        if code == OscCode::Cwd {
+                                            if let Some((host, path)) = parse_osc7(&payload) {
+                                                let location = classify_shell_location(
+                                                    &host,
+                                                    path,
+                                                    local_hostname(),
+                                                );
+                                                *shell_location.lock().unwrap() = Some(location);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -471,6 +702,7 @@ impl VtTerminal {
             images,
             last_alt,
             child_pid,
+            shell_location,
         }
     }
 
@@ -478,6 +710,11 @@ impl VtTerminal {
     /// `cd` に追従できる。Windows には相当する安全な手段が無いため None を返す
     /// （Phase 4 の OSC 7 シェル統合で対応予定）。呼び出し側でフォールバックする。
     pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        match self.location() {
+            Some(ShellLocation::Local(path)) => return Some(path),
+            Some(ShellLocation::Remote { .. }) => return None,
+            None => {}
+        }
         #[cfg(target_os = "linux")]
         {
             let pid = self.child_pid?;
@@ -487,6 +724,10 @@ impl VtTerminal {
         {
             None
         }
+    }
+
+    pub fn location(&self) -> Option<ShellLocation> {
+        self.shell_location.lock().unwrap().clone()
     }
 
     /// 前回以降に画面内容が変わったか（変わっていれば true を返し、フラグを下げる）。
@@ -864,6 +1105,10 @@ mod tests {
             .map(|s| match s {
                 Seg::Pass(b) => ('P', String::from_utf8_lossy(b).into_owned()),
                 Seg::Sixel(b) => ('S', String::from_utf8_lossy(b).into_owned()),
+                Seg::Osc { code, payload } => match code {
+                    OscCode::Cwd => ('7', payload.clone()),
+                    OscCode::Gt => ('G', payload.clone()),
+                },
             })
             .collect()
     }
@@ -902,6 +1147,116 @@ mod tests {
         assert_eq!(
             got,
             vec![('S', "#0~~~-?".to_string()), ('P', "done".to_string())]
+        );
+    }
+
+    #[test]
+    fn splitter_extracts_osc7_bel() {
+        let mut sp = SixelSplitter::default();
+        let segs = sp.feed(b"pre\x1b]7;file://host/tmp/a%20b\x07post");
+        assert_eq!(
+            segs_to_debug(&segs),
+            vec![
+                ('P', "pre".to_string()),
+                ('7', "file://host/tmp/a%20b".to_string()),
+                ('P', "post".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn splitter_extracts_osc7_st_across_chunks() {
+        let mut sp = SixelSplitter::default();
+        let mut got = Vec::new();
+        got.extend(segs_to_debug(&sp.feed(b"\x1b]7;file://host/")));
+        got.extend(segs_to_debug(&sp.feed(b"work\x1b\\x")));
+        assert_eq!(
+            got,
+            vec![
+                ('7', "file://host/work".to_string()),
+                ('P', "x".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn splitter_passes_other_osc_through() {
+        let mut sp = SixelSplitter::default();
+        let segs = sp.feed(b"\x1b]0;title\x1b\\ok");
+        assert_eq!(
+            segs_to_debug(&segs),
+            vec![('P', "\x1b]0;title\x1b\\ok".to_string())]
+        );
+    }
+
+    #[test]
+    fn splitter_discards_oversized_osc7() {
+        let mut sp = SixelSplitter::default();
+        let mut input = b"\x1b]7;".to_vec();
+        input.extend(std::iter::repeat(b'a').take(OSC_MAX_BYTES + 1));
+        input.push(0x07);
+        input.extend_from_slice(b"ok");
+        let segs = sp.feed(&input);
+        assert_eq!(segs_to_debug(&segs), vec![('P', "ok".to_string())]);
+    }
+
+    #[test]
+    fn splitter_handles_sixel_and_osc_mix() {
+        let mut sp = SixelSplitter::default();
+        let segs = sp.feed(b"\x1bPqabc\x1b\\\x1b]7717;event;kind=mod\x07z");
+        assert_eq!(
+            segs_to_debug(&segs),
+            vec![
+                ('S', "abc".to_string()),
+                ('G', "event;kind=mod".to_string()),
+                ('P', "z".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_osc7_accepts_host_and_empty_host() {
+        assert_eq!(
+            parse_osc7("file://host/tmp/a%20b"),
+            Some(("host".to_string(), PathBuf::from("/tmp/a b")))
+        );
+        assert_eq!(
+            parse_osc7("file:///tmp"),
+            Some(("".to_string(), PathBuf::from("/tmp")))
+        );
+    }
+
+    #[test]
+    fn parse_osc7_accepts_percent_encoded_utf8_and_rejects_invalid() {
+        assert_eq!(
+            parse_osc7("file://host/%E6%97%A5%E6%9C%AC%E8%AA%9E"),
+            Some(("host".to_string(), PathBuf::from("/日本語")))
+        );
+        assert_eq!(parse_osc7("http://host/tmp"), None);
+        assert_eq!(parse_osc7("file://host/%GG"), None);
+        assert_eq!(parse_osc7("file://host/%E6%97"), None);
+    }
+
+    #[test]
+    fn classify_shell_location_detects_local_hosts() {
+        assert_eq!(
+            classify_shell_location("", PathBuf::from("/tmp"), "mybox"),
+            ShellLocation::Local(PathBuf::from("/tmp"))
+        );
+        assert_eq!(
+            classify_shell_location("localhost", PathBuf::from("/tmp"), "mybox"),
+            ShellLocation::Local(PathBuf::from("/tmp"))
+        );
+        assert_eq!(
+            classify_shell_location("MYBOX", PathBuf::from("/tmp"), "mybox"),
+            ShellLocation::Local(PathBuf::from("/tmp"))
+        );
+        assert_eq!(
+            classify_shell_location("other", PathBuf::from("/home/n"), "mybox"),
+            ShellLocation::Remote {
+                host: "other".to_string(),
+                path: PathBuf::from("/home/n"),
+            }
         );
     }
 

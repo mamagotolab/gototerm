@@ -12,11 +12,21 @@
 # ↓使うものだけコメントを外す（既定の cmd.exe のままなら丸ごと消してOK）。
 shell = ["powershell.exe"]
 
+# [編集] で使うエディタ。空なら $EDITOR → nvim の順で決まる。
+# 例: editor = ["nvim"] / ["vim"] / ["micro"] / ["helix"]
+# VSCode 等の GUI エディタ派は editor を設定せず
+# [OSの既定アプリで開く] を使うのが簡単（既定アプリの関連付けに従う）。
+# Windows で外部エディタを使わない場合はメモ帳が無難です。
+editor = ["notepad"]
+
 # フォントサイズ（px）。Windows は 11 くらいが見やすい。
 font_size = 11
 
 # 右サイドバーの幅比率。Ctrl+Shift+F で表示したときだけ使われます。
 sidebar_ratio = 0.30
+
+# ファイルを開いた Reader 表示中の右サイドバー幅比率。
+preview_ratio = 0.50
 
 # サイドバーの changed files 監視で無視するパス構成要素。
 # 例: ["target"] は target/foo.obj と crates/app/target/foo.obj の両方を無視します。

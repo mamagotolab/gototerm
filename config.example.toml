@@ -35,9 +35,18 @@ font_size = 17
 # 右サイドバーの幅比率。Ctrl+Shift+F で表示したときだけ使われます。
 sidebar_ratio = 0.30
 
+# ファイルを開いた Reader 表示中の右サイドバー幅比率。
+preview_ratio = 0.50
+
 # サイドバーの changed files 監視で無視するパス構成要素。
 # 例: ["target"] は target/foo.o と crates/app/target/foo.o の両方を無視します。
 watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
+
+# [編集] で使うエディタ。空なら $EDITOR → nvim の順で決まる。
+# 例: editor = ["nvim"] / ["vim"] / ["micro"] / ["helix"]
+# VSCode 等の GUI エディタ派は editor を設定せず
+# [OSの既定アプリで開く] を使うのが簡単（既定アプリの関連付けに従う）。
+# editor = ["nvim"]
 
 # 配色は既定で Tokyo Night（Night バリアント）。背景だけ透過を上書きする例。
 # 1A1B26 = Tokyo Night の背景色。末尾2桁 = アルファ（不透明度）。

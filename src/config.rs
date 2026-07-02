@@ -3,6 +3,10 @@ use std::path::PathBuf;
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub shell: Vec<String>,
+    // 空 = $EDITOR に従う。configクレートは空配列のデフォルトをシリアライズで
+    // 落とすため、serde(default) が無いと未記載の設定ファイルで起動時 panic する。
+    #[serde(default)]
+    pub editor: Vec<String>,
 
     // paths to font files which FreeType supports (TTF, OTF, etc.)
     pub fonts_regular: Vec<PathBuf>,
@@ -15,6 +19,9 @@ pub struct Config {
 
     // 右サイドバーの幅比率（表示中のみ使用）
     pub sidebar_ratio: f64,
+    // Reader 表示中の右サイドバー幅比率。
+    #[serde(default = "default_preview_ratio")]
+    pub preview_ratio: f64,
     // ファイル監視で無視するパス構成要素。
     pub watch_ignore: Vec<String>,
 
@@ -60,6 +67,7 @@ impl Default for Config {
 
         Config {
             shell,
+            editor: Vec::new(),
 
             east_asian_width_ambiguous: 0,
 
@@ -75,6 +83,7 @@ impl Default for Config {
 
             status_bar_font_size: 16,
             sidebar_ratio: 0.30,
+            preview_ratio: default_preview_ratio(),
             watch_ignore: vec![
                 ".git".to_owned(),
                 "node_modules".to_owned(),
@@ -110,6 +119,10 @@ impl Default for Config {
             color_bright_white: 0xC0CAF5FF,
         }
     }
+}
+
+fn default_preview_ratio() -> f64 {
+    0.5
 }
 
 pub fn build() -> Config {
@@ -151,4 +164,62 @@ fn find_config_file() -> Option<PathBuf> {
     base.push("gototerm");
     base.push("config.toml");
     Some(base)
+}
+
+/// 最終フォールバックのエディタ。Windows に nvim は通常入っていないので notepad。
+#[cfg(windows)]
+pub(crate) const FALLBACK_EDITOR: &str = "notepad";
+#[cfg(not(windows))]
+pub(crate) const FALLBACK_EDITOR: &str = "nvim";
+
+/// 使うエディタを決める。優先順: config.editor（空でなければ）→ $EDITOR → FALLBACK_EDITOR
+pub(crate) fn resolve_editor(config_editor: &[String], env_editor: Option<&str>) -> Vec<String> {
+    if !config_editor.is_empty() {
+        return config_editor.to_vec();
+    }
+
+    if let Some(editor) = env_editor {
+        let parts: Vec<String> = editor
+            .split_whitespace()
+            .filter(|part| !part.is_empty())
+            .map(str::to_owned)
+            .collect();
+        if !parts.is_empty() {
+            return parts;
+        }
+    }
+
+    vec![FALLBACK_EDITOR.to_owned()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resolve_editor, FALLBACK_EDITOR};
+
+    #[test]
+    fn resolve_editor_prefers_config() {
+        let config = vec!["vim".to_owned(), "-n".to_owned()];
+
+        assert_eq!(
+            resolve_editor(&config, Some("nano")),
+            vec!["vim".to_owned(), "-n".to_owned()]
+        );
+    }
+
+    #[test]
+    fn resolve_editor_uses_editor_env_when_config_empty() {
+        assert_eq!(
+            resolve_editor(&[], Some("nvim -u NONE")),
+            vec!["nvim".to_owned(), "-u".to_owned(), "NONE".to_owned()]
+        );
+    }
+
+    #[test]
+    fn resolve_editor_falls_back_to_default() {
+        assert_eq!(resolve_editor(&[], None), vec![FALLBACK_EDITOR.to_owned()]);
+        assert_eq!(
+            resolve_editor(&[], Some("  ")),
+            vec![FALLBACK_EDITOR.to_owned()]
+        );
+    }
 }

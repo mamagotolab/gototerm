@@ -10,7 +10,7 @@ use winit::{
 
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
-use crate::vt::VtTerminal;
+use crate::vt::{ShellLocation, VtTerminal};
 use crate::Display;
 
 type CursorPosition = PhysicalPosition<f64>;
@@ -23,7 +23,7 @@ enum LinkTarget {
 /// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
 /// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
 /// 引数をパスと誤解してフォルダを開くことがあるため使わない。
-fn open_url(url: &str) {
+pub(crate) fn open_url(url: &str) {
     use std::process::Command;
     #[cfg(not(windows))]
     let result = Command::new("xdg-open").arg(url).spawn();
@@ -158,7 +158,12 @@ pub struct TerminalWindow {
 }
 
 /// viewport とフォントから端末セル数を求めて VtTerminal を作る。
-fn make_terminal(view: &TerminalView, viewport: Viewport, cwd: &std::path::Path) -> VtTerminal {
+fn make_terminal(
+    view: &TerminalView,
+    viewport: Viewport,
+    cwd: &std::path::Path,
+    command: Option<&[String]>,
+) -> VtTerminal {
     let cell_size = view.cell_size();
     let scroll_bar_width = crate::TOYTERM_CONFIG.scroll_bar_width;
     let cols = ((viewport.w.saturating_sub(scroll_bar_width)) / cell_size.w).max(1) as usize;
@@ -169,7 +174,7 @@ fn make_terminal(view: &TerminalView, viewport: Viewport, cwd: &std::path::Path)
         cell_size.w as u16,
         cell_size.h as u16,
         cwd,
-        &crate::TOYTERM_CONFIG.shell,
+        command,
     )
 }
 
@@ -198,13 +203,23 @@ impl TerminalWindow {
         viewport: Viewport,
         cwd: Option<&std::path::Path>,
     ) -> Self {
+        Self::with_viewport_command(window, display, viewport, cwd, None)
+    }
+
+    pub fn with_viewport_command(
+        window: Rc<Window>,
+        display: Display,
+        viewport: Viewport,
+        cwd: Option<&std::path::Path>,
+        command: Option<&[String]>,
+    ) -> Self {
         let font_size = crate::TOYTERM_CONFIG.font_size;
         let view = TerminalView::with_viewport(display, viewport, font_size, Some((0, viewport.h)));
 
         let terminal = {
             let parent_cwd = std::env::current_dir().expect("cwd");
             let child_cwd = cwd.unwrap_or(&parent_cwd);
-            make_terminal(&view, viewport, child_cwd)
+            make_terminal(&view, viewport, child_cwd, command)
         };
 
         // Use I-beam mouse cursor
@@ -437,6 +452,14 @@ impl TerminalWindow {
     /// このペインのシェルの現在の作業ディレクトリ（取れない環境では None）。
     pub fn pane_cwd(&self) -> Option<std::path::PathBuf> {
         self.terminal.cwd()
+    }
+
+    pub fn pane_location(&self) -> ShellLocation {
+        self.terminal
+            .location()
+            .or_else(|| self.terminal.cwd().map(ShellLocation::Local))
+            .or_else(|| std::env::current_dir().ok().map(ShellLocation::Local))
+            .unwrap_or_else(|| ShellLocation::Local(PathBuf::from(".")))
     }
 
     pub fn take_clicked_file(&mut self) -> Option<PathBuf> {

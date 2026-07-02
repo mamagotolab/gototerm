@@ -159,6 +159,43 @@ color_background = 0x1A1B26B0   # Tokyo Night の背景＋透過
 
 ---
 
+## SSH・cwd 追従（OSC 7）
+
+gototerm は OSC 7 (`file://host/path`) を受け取ると、ペインの現在ディレクトリを追従します。
+`host` がローカルホストと異なる場合はリモート接続中として扱い、サイドバーはローカルファイルの監視・一覧を止めます。
+
+bash:
+
+```sh
+__gototerm_osc7() {
+    printf '\033]7;file://%s%s\033\\' "$HOSTNAME" "$PWD"
+}
+PROMPT_COMMAND="__gototerm_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+```
+
+zsh:
+
+```sh
+__gototerm_osc7() {
+    printf '\033]7;file://%s%s\033\\' "$HOST" "$PWD"
+}
+autoload -Uz add-zsh-hook
+add-zsh-hook precmd __gototerm_osc7
+```
+
+fish は多くの環境で OSC 7 を標準発行します。発行されない場合は次を読み込んでください。
+
+```fish
+function __gototerm_osc7 --on-event fish_prompt
+    printf '\033]7;file://%s%s\033\\' (hostname) "$PWD"
+end
+```
+
+同じ内容のスニペットを `assets/shell-integration/osc7.bash`、
+`assets/shell-integration/osc7.zsh`、`assets/shell-integration/osc7.fish` に同梱しています。
+
+---
+
 ## キー操作
 
 | キー | 動作 |
