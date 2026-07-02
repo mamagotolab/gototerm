@@ -16,6 +16,7 @@ use winit::{
     window::Window,
 };
 
+use crate::sidebar::Sidebar;
 use crate::terminal::{Cell, Color, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::window::TerminalWindow;
@@ -50,6 +51,7 @@ enum Action {
     PrevTab,
     SplitVertical,
     SplitHorizontal,
+    ToggleSidebar,
     Focus(Dir),
 }
 
@@ -108,6 +110,21 @@ fn split_viewport(partition: Partition, ratio: f64, vp: Viewport) -> (Viewport, 
     }
 }
 
+/// サイドバー表示中だけ、タブバーを除いた領域の右側をサイドバーに割り当てる。
+fn content_and_sidebar_viewport(
+    vp: Viewport,
+    sidebar_visible: bool,
+    sidebar_ratio: f64,
+) -> (Viewport, Option<Viewport>) {
+    if !sidebar_visible {
+        return (vp, None);
+    }
+
+    let ratio = (1.0 - sidebar_ratio).clamp(0.0, 1.0);
+    let (content, sidebar) = split_viewport(Partition::Vertical, ratio, vp);
+    (content, Some(sidebar))
+}
+
 impl Node {
     fn focused_leaf_mut(&mut self) -> &mut TerminalWindow {
         match self {
@@ -121,6 +138,10 @@ impl Node {
             }
             Node::Empty => unreachable!("Empty node"),
         }
+    }
+
+    fn take_clicked_file(&mut self) -> Option<std::path::PathBuf> {
+        self.focused_leaf_mut().take_clicked_file()
     }
 
     fn set_viewport(&mut self, vp: Viewport) {
@@ -197,8 +218,9 @@ impl Node {
                     _ => unreachable!(),
                 };
 
-                // 新ペインの作業ディレクトリは gototerm の起動ディレクトリ。
-                let cwd = std::env::current_dir().ok();
+                // 新ペインの作業ディレクトリは元ペインのシェルの現在地を継承する
+                // （取れない環境では gototerm の起動ディレクトリ）。
+                let cwd = old.pane_cwd().or_else(|| std::env::current_dir().ok());
                 let new_win = Box::new(TerminalWindow::with_viewport(
                     window.clone(),
                     display.clone(),
@@ -338,7 +360,12 @@ mod tests {
 
     #[test]
     fn vertical_split_leaves_a_gap_and_fills_width() {
-        let vp = Viewport { x: 10, y: 20, w: 100, h: 50 };
+        let vp = Viewport {
+            x: 10,
+            y: 20,
+            w: 100,
+            h: 50,
+        };
         let (left, right) = split_viewport(Partition::Vertical, 0.5, vp);
 
         // 左右は同じ高さ・同じ y、左端は親の左端
@@ -358,7 +385,12 @@ mod tests {
 
     #[test]
     fn horizontal_split_leaves_a_gap_and_fills_height() {
-        let vp = Viewport { x: 0, y: 0, w: 80, h: 200 };
+        let vp = Viewport {
+            x: 0,
+            y: 0,
+            w: 80,
+            h: 200,
+        };
         let (top, bottom) = split_viewport(Partition::Horizontal, 0.5, vp);
 
         assert_eq!(top.w, 80);
@@ -373,12 +405,52 @@ mod tests {
 
     #[test]
     fn uneven_ratio_keeps_panes_within_parent() {
-        let vp = Viewport { x: 0, y: 0, w: 120, h: 60 };
+        let vp = Viewport {
+            x: 0,
+            y: 0,
+            w: 120,
+            h: 60,
+        };
         let (left, right) = split_viewport(Partition::Vertical, 0.25, vp);
         // mid = 30
         assert_eq!(left.w, 30 - GAP);
         assert_eq!(right.x, 30 + GAP);
         assert_eq!(right.w, 120 - 30 - GAP);
+    }
+
+    #[test]
+    fn hidden_sidebar_keeps_content_viewport_unchanged() {
+        let vp = Viewport {
+            x: 5,
+            y: 7,
+            w: 300,
+            h: 200,
+        };
+        let (content, sidebar) = content_and_sidebar_viewport(vp, false, 0.30);
+
+        assert_eq!(content, vp);
+        assert_eq!(sidebar, None);
+    }
+
+    #[test]
+    fn visible_sidebar_uses_right_side_after_gap() {
+        let vp = Viewport {
+            x: 0,
+            y: 20,
+            w: 1000,
+            h: 700,
+        };
+        let (content, sidebar) = content_and_sidebar_viewport(vp, true, 0.30);
+        let sidebar = sidebar.expect("sidebar viewport");
+
+        assert_eq!(content.x, 0);
+        assert_eq!(content.y, 20);
+        assert_eq!(content.h, 700);
+        assert_eq!(content.w, 700 - GAP);
+        assert_eq!(sidebar.x, 700 + GAP);
+        assert_eq!(sidebar.y, 20);
+        assert_eq!(sidebar.w, 1000 - 700 - GAP);
+        assert_eq!(sidebar.h, 700);
     }
 }
 
@@ -397,6 +469,7 @@ pub struct Multiplexer {
     display: Display,
     viewport: Viewport,
     status_view: TerminalView,
+    sidebar: Sidebar,
     tabs: Vec<Node>,
     focus: usize,
     modifiers: ModifiersState,
@@ -429,6 +502,7 @@ impl Multiplexer {
             crate::TOYTERM_CONFIG.status_bar_font_size,
             None,
         );
+        let sidebar = Sidebar::new(display.clone(), viewport);
 
         // 最初のタブ（1枚なのでタブバーは出ない＝全面が端末）。
         let first = Node::Leaf(Box::new(TerminalWindow::with_viewport(
@@ -443,6 +517,7 @@ impl Multiplexer {
             display,
             viewport,
             status_view,
+            sidebar,
             tabs: vec![first],
             focus: 0,
             modifiers: ModifiersState::empty(),
@@ -458,6 +533,16 @@ impl Multiplexer {
 
     fn focused_root(&mut self) -> &mut Node {
         &mut self.tabs[self.focus]
+    }
+
+    /// サイドバーに表示する作業フォルダ。フォーカス中ペインのシェルの現在地を
+    /// 優先し、取れない環境（Windows 等）では起動ディレクトリへフォールバック。
+    fn focused_cwd(&mut self) -> std::path::PathBuf {
+        self.focused_root()
+            .focused_leaf_mut()
+            .pane_cwd()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
     }
 
     /// タブバーの高さ（px）。タブ1枚のときは 0（バー非表示）。
@@ -490,7 +575,14 @@ impl Multiplexer {
         };
         self.status_view.set_viewport(bar);
 
-        let cvp = self.content_viewport();
+        let (cvp, sidebar_vp) = content_and_sidebar_viewport(
+            self.content_viewport(),
+            self.sidebar.is_visible(),
+            crate::TOYTERM_CONFIG.sidebar_ratio,
+        );
+        if let Some(sidebar_vp) = sidebar_vp {
+            self.sidebar.set_viewport(sidebar_vp);
+        }
         for tab in &mut self.tabs {
             tab.set_viewport(cvp);
         }
@@ -563,6 +655,7 @@ impl Multiplexer {
             // 分割
             (true, KeyCode::KeyE) => Action::SplitVertical,
             (true, KeyCode::KeyO) => Action::SplitHorizontal,
+            (true, KeyCode::KeyF) => Action::ToggleSidebar,
             // フォーカス移動
             (true, KeyCode::ArrowUp) => Action::Focus(Dir::Up),
             (true, KeyCode::ArrowDown) => Action::Focus(Dir::Down),
@@ -638,7 +731,26 @@ impl Multiplexer {
             Action::Focus(dir) => {
                 self.tabs[self.focus].move_focus(dir);
             }
+
+            Action::ToggleSidebar => {
+                let cwd = self.focused_cwd();
+                self.sidebar.toggle(&cwd);
+                self.refresh_layout();
+            }
         }
+    }
+
+    fn handle_clicked_file(&mut self) {
+        let Some(path) = self.focused_root().take_clicked_file() else {
+            return;
+        };
+
+        if !self.sidebar.is_visible() {
+            let cwd = self.focused_cwd();
+            self.sidebar.toggle(&cwd);
+            self.refresh_layout();
+        }
+        self.sidebar.preview_pinned(&path);
     }
 
     /// 今このフレームを描画してよいか。最小化中（またはサイズ0）は描かない。
@@ -672,7 +784,12 @@ impl Multiplexer {
                     // ビューポートだけ 0 にして（drawable() が false になる）戻る。
                     // 復元時は非0の Resized が再度届き、下の通常経路で描き直す。
                     if new_size.width == 0 || new_size.height == 0 {
-                        self.viewport = Viewport { x: 0, y: 0, w: 0, h: 0 };
+                        self.viewport = Viewport {
+                            x: 0,
+                            y: 0,
+                            w: 0,
+                            h: 0,
+                        };
                         return;
                     }
                     // glium 0.34 の手書きサーフェスは自動リサイズされないため明示。
@@ -720,7 +837,9 @@ impl Multiplexer {
                         self.occluded = false;
                         self.window.request_redraw();
                     }
-                    self.focused_root().focused_leaf_mut().process_window_event(wev);
+                    self.focused_root()
+                        .focused_leaf_mut()
+                        .process_window_event(wev);
                 }
 
                 &WindowEvent::Occluded(occluded) => {
@@ -765,6 +884,7 @@ impl Multiplexer {
                         self.status_view.draw(&mut surface);
                     }
                     self.tabs[self.focus].draw(&mut surface);
+                    self.sidebar.draw(&mut surface);
 
                     surface.finish().expect("finish");
                 }
@@ -777,7 +897,11 @@ impl Multiplexer {
                     }
                 }
 
-                WindowEvent::KeyboardInput { event: key, is_synthetic, .. } => {
+                WindowEvent::KeyboardInput {
+                    event: key,
+                    is_synthetic,
+                    ..
+                } => {
                     // winit はウィンドウがフォーカスを得た瞬間、その時点で押されて
                     // いるキーを「合成の押下イベント」として発行する。Win+3 でこの窓へ
                     // 切替えると合成 Pressed「3」が、Ctrl+Tab で切替えると合成 Pressed
@@ -792,13 +916,17 @@ impl Multiplexer {
                         self.blink_start = Instant::now();
                         if !self.cursor_blink_on {
                             self.cursor_blink_on = true;
-                            self.focused_root().focused_leaf_mut().set_cursor_blink(true);
+                            self.focused_root()
+                                .focused_leaf_mut()
+                                .set_cursor_blink(true);
                         }
                     }
                     if let Some(action) = self.parse_shortcut(key) {
                         self.handle_action(action);
                     } else {
-                        self.focused_root().focused_leaf_mut().process_window_event(wev);
+                        self.focused_root()
+                            .focused_leaf_mut()
+                            .process_window_event(wev);
                     }
                 }
 
@@ -813,17 +941,37 @@ impl Multiplexer {
                     state: ElementState::Pressed,
                     ..
                 } => {
+                    if self.sidebar.contains(self.cursor_pos) {
+                        self.sidebar.on_click(self.cursor_pos);
+                        return;
+                    }
                     // クリックしたペインへフォーカスを移してから入力を渡す。
                     let p = self.cursor_pos;
                     self.focused_root().focused_leaf_mut().focus_changed(false);
                     self.tabs[self.focus].focus_at(p);
                     self.focused_root().focused_leaf_mut().focus_changed(true);
-                    self.focused_root().focused_leaf_mut().process_window_event(wev);
+                    self.focused_root()
+                        .focused_leaf_mut()
+                        .process_window_event(wev);
+                    self.handle_clicked_file();
                 }
 
-                // フォーカス・IME・ホイール・マウス離し等はフォーカス中ペインへ。
+                WindowEvent::MouseWheel { .. } => {
+                    if !self.sidebar.contains(self.cursor_pos) {
+                        self.focused_root()
+                            .focused_leaf_mut()
+                            .process_window_event(wev);
+                    }
+                }
+
+                WindowEvent::MouseInput { .. } if self.sidebar.contains(self.cursor_pos) => {}
+
+                // フォーカス・IME・マウス離し等はフォーカス中ペインへ。
                 _ => {
-                    self.focused_root().focused_leaf_mut().process_window_event(wev);
+                    self.focused_root()
+                        .focused_leaf_mut()
+                        .process_window_event(wev);
+                    self.handle_clicked_file();
                 }
             },
 
@@ -882,10 +1030,17 @@ impl Multiplexer {
                     }
                 }
 
+                // フォーカス中ペインの cd に追従する（非表示中は /proc も読まない）。
+                if self.sidebar.is_visible() {
+                    let cwd = self.focused_cwd();
+                    self.sidebar.refresh_if_stale(&cwd);
+                }
+
                 // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。
                 // 内容更新自体は上で汲み取り済みなので、再表示時にまとめて描ける。
                 let need = self.tabs[self.focus].needs_redraw()
-                    || (self.status_bar_height() > 0 && self.status_view.needs_redraw());
+                    || (self.status_bar_height() > 0 && self.status_view.needs_redraw())
+                    || self.sidebar.needs_redraw();
                 if need && !self.occluded && self.drawable() {
                     self.window.request_redraw();
                 }

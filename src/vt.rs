@@ -146,6 +146,9 @@ pub struct VtTerminal {
     images: Arc<Mutex<Vec<PositionedImage>>>,
     /// 直近の代替画面(Alt Screen)状態。切替時に画像を消すため。
     last_alt: Arc<AtomicBool>,
+    /// シェル（PTY 子プロセス）の PID。`cwd()` で /proc を引くために保持。
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    child_pid: Option<u32>,
 }
 
 fn window_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> WindowSize {
@@ -380,6 +383,8 @@ impl VtTerminal {
 
         let mut child = pair.slave.spawn_command(cmd).expect("spawn shell");
         let killer = child.clone_killer();
+        // 回収スレッドに move する前に PID を控える（cwd 追従に使う）。
+        let child_pid = child.process_id();
         let reader = pair.master.try_clone_reader().expect("pty reader");
         let writer: SharedWriter =
             Arc::new(Mutex::new(pair.master.take_writer().expect("pty writer")));
@@ -422,7 +427,13 @@ impl VtTerminal {
                                         processor.advance(&mut *term, &bytes);
                                     }
                                     Seg::Sixel(payload) => {
-                                        place_sixel(&payload, &term, &images, &winsize, &mut processor);
+                                        place_sixel(
+                                            &payload,
+                                            &term,
+                                            &images,
+                                            &winsize,
+                                            &mut processor,
+                                        );
                                     }
                                 }
                             }
@@ -459,6 +470,22 @@ impl VtTerminal {
             winsize,
             images,
             last_alt,
+            child_pid,
+        }
+    }
+
+    /// シェルの現在の作業ディレクトリ。Linux では /proc/<pid>/cwd を読むので
+    /// `cd` に追従できる。Windows には相当する安全な手段が無いため None を返す
+    /// （Phase 4 の OSC 7 シェル統合で対応予定）。呼び出し側でフォールバックする。
+    pub fn cwd(&self) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            let pid = self.child_pid?;
+            std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
         }
     }
 
@@ -476,23 +503,39 @@ impl VtTerminal {
 
     pub fn mouse_mode(&self) -> bool {
         use alacritty_terminal::term::TermMode;
-        self.term.lock().unwrap().mode().intersects(TermMode::MOUSE_MODE)
+        self.term
+            .lock()
+            .unwrap()
+            .mode()
+            .intersects(TermMode::MOUSE_MODE)
     }
 
     /// 代替画面(Alt Screen)中か。nvim/less 等の全画面 TUI で true。
     pub fn alt_screen(&self) -> bool {
         use alacritty_terminal::term::TermMode;
-        self.term.lock().unwrap().mode().contains(TermMode::ALT_SCREEN)
+        self.term
+            .lock()
+            .unwrap()
+            .mode()
+            .contains(TermMode::ALT_SCREEN)
     }
 
     pub fn sgr_mouse(&self) -> bool {
         use alacritty_terminal::term::TermMode;
-        self.term.lock().unwrap().mode().contains(TermMode::SGR_MOUSE)
+        self.term
+            .lock()
+            .unwrap()
+            .mode()
+            .contains(TermMode::SGR_MOUSE)
     }
 
     pub fn bracketed_paste(&self) -> bool {
         use alacritty_terminal::term::TermMode;
-        self.term.lock().unwrap().mode().contains(TermMode::BRACKETED_PASTE)
+        self.term
+            .lock()
+            .unwrap()
+            .mode()
+            .contains(TermMode::BRACKETED_PASTE)
     }
 
     /// スクロールバック（履歴）を消去する。
@@ -504,7 +547,10 @@ impl VtTerminal {
     /// スクロールバック表示を delta 行ぶん動かす（正で過去方向＝上）。
     pub fn scroll(&self, delta: i32) {
         use alacritty_terminal::grid::Scroll;
-        self.term.lock().unwrap().scroll_display(Scroll::Delta(delta));
+        self.term
+            .lock()
+            .unwrap()
+            .scroll_display(Scroll::Delta(delta));
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -550,7 +596,9 @@ impl VtTerminal {
 // 描画アダプタ：alacritty のグリッドを既存の描画形式(Line/Cell)へ変換する
 // ============================================================================
 
-use crate::terminal::{Cell as TCell, Color as TColor, Cursor as TCursor, CursorStyle, GraphicAttribute, Line as TLine};
+use crate::terminal::{
+    Cell as TCell, Color as TColor, Cursor as TCursor, CursorStyle, GraphicAttribute, Line as TLine,
+};
 use alacritty_terminal::term::cell::Flags;
 use vte::ansi::{Color as AColor, CursorShape, NamedColor};
 
@@ -594,7 +642,11 @@ impl VtTerminal {
                 rows[line as usize][col] = TCell::spacer(1);
                 continue;
             }
-            let width: u16 = if cell.flags.contains(Flags::WIDE_CHAR) { 2 } else { 1 };
+            let width: u16 = if cell.flags.contains(Flags::WIDE_CHAR) {
+                2
+            } else {
+                1
+            };
 
             let bold: i8 = if cell.flags.contains(Flags::DIM) {
                 -1
@@ -625,7 +677,10 @@ impl VtTerminal {
 
             let (cell_w, cell_h) = {
                 let ws = self.winsize.lock().unwrap();
-                (ws.cell_width.max(1) as usize, ws.cell_height.max(1) as usize)
+                (
+                    ws.cell_width.max(1) as usize,
+                    ws.cell_height.max(1) as usize,
+                )
             };
 
             let mut imgs = self.images.lock().unwrap();
@@ -745,12 +800,16 @@ fn map_color(c: AColor) -> TColor {
                 let r = to((i / 36) % 6);
                 let g = to((i / 6) % 6);
                 let b = to(i % 6);
-                TColor::Rgb { rgba: rgba_u32(r, g, b) }
+                TColor::Rgb {
+                    rgba: rgba_u32(r, g, b),
+                }
             }
             _ => {
                 // グレースケール 232..=255
                 let v = 8 + 10 * (i - 232);
-                TColor::Rgb { rgba: rgba_u32(v, v, v) }
+                TColor::Rgb {
+                    rgba: rgba_u32(v, v, v),
+                }
             }
         },
     }
@@ -855,7 +914,10 @@ mod tests {
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
         let proxy = EventProxy { writer, winsize };
 
-        let size = GridSize { cols: 80, lines: 24 };
+        let size = GridSize {
+            cols: 80,
+            lines: 24,
+        };
         let mut term = Term::new(Config::default(), &size, proxy);
         let mut processor: Processor = Processor::new();
 
@@ -879,7 +941,10 @@ mod tests {
         };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
-            &GridSize { cols: 80, lines: 24 },
+            &GridSize {
+                cols: 80,
+                lines: 24,
+            },
             proxy,
         )));
         let images: Arc<Mutex<Vec<PositionedImage>>> = Arc::new(Mutex::new(Vec::new()));
@@ -951,11 +1016,25 @@ mod tests {
     fn color_index_cube_and_grayscale_are_config_independent() {
         // 6x6x6 キューブ: 16=黒, 231=白
         assert_eq!(color_index_to_rgb(16), Rgb { r: 0, g: 0, b: 0 });
-        assert_eq!(color_index_to_rgb(231), Rgb { r: 255, g: 255, b: 255 });
+        assert_eq!(
+            color_index_to_rgb(231),
+            Rgb {
+                r: 255,
+                g: 255,
+                b: 255
+            }
+        );
         // 196 = 赤(5,0,0) -> (255,0,0)
         assert_eq!(color_index_to_rgb(196), Rgb { r: 255, g: 0, b: 0 });
         // グレースケール: 232=8, 255=238（v=8+10*23）
         assert_eq!(color_index_to_rgb(232), Rgb { r: 8, g: 8, b: 8 });
-        assert_eq!(color_index_to_rgb(255), Rgb { r: 238, g: 238, b: 238 });
+        assert_eq!(
+            color_index_to_rgb(255),
+            Rgb {
+                r: 238,
+                g: 238,
+                b: 238
+            }
+        );
     }
 }

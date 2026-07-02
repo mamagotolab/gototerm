@@ -165,6 +165,7 @@ color_background = 0x1A1B26B0   # Tokyo Night の背景＋透過
 |---|---|
 | `Ctrl + =` / `Ctrl + -` | フォント拡大 / 縮小 |
 | `Ctrl + Shift + C` / `Ctrl + Shift + V` | コピー / ペースト |
+| `Ctrl + Shift + F` | サイドバー表示 / 非表示 |
 | `Ctrl + Shift + L` | スクロールバックの履歴を消去 |
 | `Shift + マウスホイール` | 履歴スクロール |
 

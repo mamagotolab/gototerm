@@ -32,6 +32,13 @@ fonts_faint = [
 # 起動後に Ctrl+= / Ctrl+- でライブ調整も可能。
 font_size = 17
 
+# 右サイドバーの幅比率。Ctrl+Shift+F で表示したときだけ使われます。
+sidebar_ratio = 0.30
+
+# サイドバーの changed files 監視で無視するパス構成要素。
+# 例: ["target"] は target/foo.o と crates/app/target/foo.o の両方を無視します。
+watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
+
 # 配色は既定で Tokyo Night（Night バリアント）。背景だけ透過を上書きする例。
 # 1A1B26 = Tokyo Night の背景色。末尾2桁 = アルファ（不透明度）。
 # CC = 204/255 = 0.80（80%不透明＝20%透過）。コンポジタ側のブラーと併用すると綺麗。

@@ -30,6 +30,7 @@ serde = { version = "1", features = ["derive"] }
 config = { version = "0.13.1", default-features = false, features = ["toml"] }
 lazy_static = "1.4.0"
 lru = { version = "0.7.8", default-features = false }
+notify = "6"
 
 alacritty_terminal = "0.26.0"
 vte = "0.15"

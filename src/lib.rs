@@ -1,12 +1,16 @@
 mod cache;
 mod config;
 mod font;
+mod preview;
+mod sidebar;
 mod sixel;
 mod terminal;
-mod vt;
 mod utils;
 mod view;
+mod vt;
+mod watcher;
 pub mod window;
+mod workspace;
 
 pub mod multiplexer;
 

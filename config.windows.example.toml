@@ -15,6 +15,13 @@ shell = ["powershell.exe"]
 # フォントサイズ（px）。Windows は 11 くらいが見やすい。
 font_size = 11
 
+# 右サイドバーの幅比率。Ctrl+Shift+F で表示したときだけ使われます。
+sidebar_ratio = 0.30
+
+# サイドバーの changed files 監視で無視するパス構成要素。
+# 例: ["target"] は target/foo.obj と crates/app/target/foo.obj の両方を無視します。
+watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
+
 # フォント（先頭=主フォント、2番目以降=フォールバック）。
 # ★重要1: gototerm はフォント名ではなく「ファイルの絶対パス」で読みます。
 # ★重要2: 主フォント（先頭）は必ず Nerd Font 本体にしてください。

@@ -13,6 +13,11 @@ pub struct Config {
     // タブバー（複数タブのときだけ表示）の文字サイズ
     pub status_bar_font_size: u32,
 
+    // 右サイドバーの幅比率（表示中のみ使用）
+    pub sidebar_ratio: f64,
+    // ファイル監視で無視するパス構成要素。
+    pub watch_ignore: Vec<String>,
+
     // RRGGBBAA
     pub color_background: u32,
     pub color_foreground: u32,
@@ -69,6 +74,14 @@ impl Default for Config {
             font_size: 18,
 
             status_bar_font_size: 16,
+            sidebar_ratio: 0.30,
+            watch_ignore: vec![
+                ".git".to_owned(),
+                "node_modules".to_owned(),
+                "target".to_owned(),
+                "dist".to_owned(),
+                "__pycache__".to_owned(),
+            ],
 
             scroll_bar_width: 5,
             // 既定の配色は Tokyo Night（Night バリアント）。

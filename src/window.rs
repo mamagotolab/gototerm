@@ -1,3 +1,4 @@
+use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 
 use winit::{
@@ -8,11 +9,16 @@ use winit::{
 };
 
 use crate::terminal::TerminalSize;
-use crate::vt::VtTerminal;
 use crate::view::{Selection, TerminalView, Viewport};
+use crate::vt::VtTerminal;
 use crate::Display;
 
 type CursorPosition = PhysicalPosition<f64>;
+
+enum LinkTarget {
+    Url(String),
+    File(PathBuf),
+}
 
 /// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
 /// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
@@ -28,6 +34,63 @@ fn open_url(url: &str) {
     if let Err(e) = result {
         log::error!("URL を開けませんでした ({}): {}", url, e);
     }
+}
+
+fn is_link_token_char(c: char) -> bool {
+    // 空白を含むパスは端末上のトークン境界が曖昧なので、Phase 4 では扱わない。
+    !c.is_whitespace()
+        && c != '\0'
+        && !matches!(
+            c,
+            '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '│'
+        )
+}
+
+fn looks_like_path(token: &str) -> bool {
+    token.contains('/') || token.starts_with("./") || token.starts_with("~/")
+}
+
+fn resolve_existing_file_token(token: &str, cwd: &Path) -> Option<PathBuf> {
+    resolve_path_token(token, cwd).filter(|path| path.is_file())
+}
+
+pub(crate) fn resolve_path_token(token: &str, cwd: &Path) -> Option<PathBuf> {
+    if token.is_empty() || token.starts_with("http://") || token.starts_with("https://") {
+        return None;
+    }
+
+    let path = if let Some(rest) = token.strip_prefix("~/") {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(rest))?
+    } else {
+        let raw = Path::new(token);
+        if raw.is_absolute() {
+            raw.to_path_buf()
+        } else if cwd.is_absolute() {
+            cwd.join(raw)
+        } else {
+            std::env::current_dir().ok()?.join(cwd).join(raw)
+        }
+    };
+
+    Some(normalize_absolute_path(&path))
+}
+
+fn normalize_absolute_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::RootDir | Component::Prefix(_) | Component::Normal(_) => {
+                out.push(component.as_os_str());
+            }
+        }
+    }
+
+    out
 }
 
 /// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
@@ -91,6 +154,7 @@ pub struct TerminalWindow {
     /// 直近の IME 確定(Commit)時刻。確定 Enter を端末へ送らないため
     /// （Windows では確定 Enter が Commit とキー入力の両方で来る）。
     last_ime_commit: std::time::Instant,
+    clicked_file: Option<PathBuf>,
 }
 
 /// viewport とフォントから端末セル数を求めて VtTerminal を作る。
@@ -135,12 +199,7 @@ impl TerminalWindow {
         cwd: Option<&std::path::Path>,
     ) -> Self {
         let font_size = crate::TOYTERM_CONFIG.font_size;
-        let view = TerminalView::with_viewport(
-            display,
-            viewport,
-            font_size,
-            Some((0, viewport.h)),
-        );
+        let view = TerminalView::with_viewport(display, viewport, font_size, Some((0, viewport.h)));
 
         let terminal = {
             let parent_cwd = std::env::current_dir().expect("cwd");
@@ -176,6 +235,7 @@ impl TerminalWindow {
                 last_clicked: std::time::Instant::now() - std::time::Duration::from_secs(10),
             },
             last_ime_commit: std::time::Instant::now() - std::time::Duration::from_secs(10),
+            clicked_file: None,
         }
     }
 
@@ -374,24 +434,22 @@ impl TerminalWindow {
         self.view.viewport()
     }
 
+    /// このペインのシェルの現在の作業ディレクトリ（取れない環境では None）。
+    pub fn pane_cwd(&self) -> Option<std::path::PathBuf> {
+        self.terminal.cwd()
+    }
+
+    pub fn take_clicked_file(&mut self) -> Option<PathBuf> {
+        self.clicked_file.take()
+    }
+
     pub fn set_viewport(&mut self, new_viewport: Viewport) {
         log::debug!("viewport changed: {:?}", new_viewport);
         self.view.set_viewport(new_viewport);
         self.resize_buffer();
     }
 
-    /// 画面上の (row, col) にある URL を取り出す。クリック位置の文字から
-    /// 左右へ「URL に使える文字」を伸ばし、http(s):// で始まればその文字列を返す。
-    fn url_at(&self, row: usize, col: usize) -> Option<String> {
-        fn is_url_char(c: char) -> bool {
-            !c.is_whitespace()
-                && c != '\0'
-                && !matches!(
-                    c,
-                    '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '│'
-                )
-        }
-
+    fn token_at(&self, row: usize, col: usize) -> Option<String> {
         let line = self.view.lines.get(row)?;
 
         // 列ごとの文字を作る（幅2の全角は2列ぶん占有、幅0は前のセルの続き）。
@@ -409,29 +467,54 @@ impl TerminalWindow {
         }
 
         let clicked = *chars.get(col)?;
-        if !is_url_char(clicked) {
+        if !is_link_token_char(clicked) {
             return None;
         }
 
         let mut start = col;
-        while start > 0 && is_url_char(chars[start - 1]) {
+        while start > 0 && is_link_token_char(chars[start - 1]) {
             start -= 1;
         }
         let mut end = col;
-        while end + 1 < chars.len() && is_url_char(chars[end + 1]) {
+        while end + 1 < chars.len() && is_link_token_char(chars[end + 1]) {
             end += 1;
         }
 
         let token: String = chars[start..=end].iter().filter(|c| **c != '\0').collect();
-        // 末尾の句読点・閉じ記号は URL から除く。
-        let token = token
-            .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '。' | '、'))
-            .to_string();
+        // 末尾の句読点はリンク本体ではないことが多いので URL/パス共通で除く。
+        Some(
+            token
+                .trim_end_matches(|c| matches!(c, '.' | ',' | ';' | ':' | '!' | '?' | '。' | '、'))
+                .to_string(),
+        )
+    }
 
+    fn link_at(&self, row: usize, col: usize) -> Option<LinkTarget> {
+        let token = self.token_at(row, col)?;
         if token.starts_with("http://") || token.starts_with("https://") {
-            Some(token)
-        } else {
-            None
+            return Some(LinkTarget::Url(token));
+        }
+
+        let cwd = self
+            .terminal
+            .cwd()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        resolve_existing_file_token(&token, &cwd).map(LinkTarget::File)
+    }
+
+    fn link_like_at(&self, row: usize, col: usize) -> bool {
+        let Some(token) = self.token_at(row, col) else {
+            return false;
+        };
+        token.starts_with("http://") || token.starts_with("https://") || looks_like_path(&token)
+    }
+
+    fn handle_link_click(&mut self, row: usize, col: usize) {
+        match self.link_at(row, col) {
+            Some(LinkTarget::Url(url)) => open_url(&url),
+            Some(LinkTarget::File(path)) => self.clicked_file = Some(path),
+            None => {}
         }
     }
 
@@ -497,174 +580,166 @@ impl TerminalWindow {
     /// ウィンドウ全体の制御はマネージャ側が持ち、ここでは扱わない。
     pub fn process_window_event(&mut self, event: &WindowEvent) {
         match event {
-                &WindowEvent::Focused(gain) => self.focus_changed(gain),
+            &WindowEvent::Focused(gain) => self.focus_changed(gain),
 
-                WindowEvent::ModifiersChanged(new_states) => {
-                    self.modifiers = new_states.state();
+            WindowEvent::ModifiersChanged(new_states) => {
+                self.modifiers = new_states.state();
+            }
+
+            // IME（日本語入力など）の状態を処理する。
+            WindowEvent::Ime(ime) => match ime {
+                // 変換中の未確定文字列。カーソル位置にインライン表示する。
+                Ime::Preedit(text, _) => {
+                    let text = text.clone();
+                    self.view.update_contents(|view| view.preedit = text);
+                    // 変換中は内容更新が起きないので、ここで候補位置を更新する
+                    self.update_ime_position();
                 }
-
-                // IME（日本語入力など）の状態を処理する。
-                WindowEvent::Ime(ime) => match ime {
-                    // 変換中の未確定文字列。カーソル位置にインライン表示する。
-                    Ime::Preedit(text, _) => {
-                        let text = text.clone();
-                        self.view.update_contents(|view| view.preedit = text);
-                        // 変換中は内容更新が起きないので、ここで候補位置を更新する
-                        self.update_ime_position();
-                    }
-                    // 確定した文字列を PTY に流し、変換中表示を消す。
-                    Ime::Commit(text) => {
-                        self.terminal.write(text.as_bytes());
-                        self.view.update_contents(|view| view.preedit.clear());
-                        // 確定に使った Enter がこの直後にキー入力として来ても
-                        // 改行を送らないよう、確定時刻を記録しておく。
-                        self.last_ime_commit = std::time::Instant::now();
-                    }
-                    Ime::Enabled | Ime::Disabled => {
-                        self.view.update_contents(|view| view.preedit.clear());
-                        self.update_ime_position();
-                    }
-                },
-
-                WindowEvent::KeyboardInput { event, .. }
-                    if event.state == ElementState::Pressed =>
-                {
-                    self.on_key_press(event);
+                // 確定した文字列を PTY に流し、変換中表示を消す。
+                Ime::Commit(text) => {
+                    self.terminal.write(text.as_bytes());
+                    self.view.update_contents(|view| view.preedit.clear());
+                    // 確定に使った Enter がこの直後にキー入力として来ても
+                    // 改行を送らないよう、確定時刻を記録しておく。
+                    self.last_ime_commit = std::time::Instant::now();
                 }
+                Ime::Enabled | Ime::Disabled => {
+                    self.view.update_contents(|view| view.preedit.clear());
+                    self.update_ime_position();
+                }
+            },
 
-                WindowEvent::CursorMoved { position, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if event.state == ElementState::Pressed => {
+                self.on_key_press(event);
+            }
+
+            WindowEvent::CursorMoved { position, .. } => {
+                let viewport = self.viewport();
+                let x = position.x - viewport.x as f64;
+                let y = position.y - viewport.y as f64;
+                self.mouse.cursor_pos = CursorPosition { x, y };
+
+                // URL の上ではポインタ（手）カーソルにして「クリックできる」と
+                // 分かるようにする。mouse_mode のアプリにはマウスを渡すので変えない。
+                if !self.terminal.mouse_mode() {
+                    let cs = self.view.cell_size();
+                    let col = (x / cs.w.max(1) as f64) as i64;
+                    let row = (y / cs.h.max(1) as f64) as i64;
+                    let on_link =
+                        col >= 0 && row >= 0 && self.link_like_at(row as usize, col as usize);
+                    self.window.set_cursor_icon(if on_link {
+                        CursorIcon::Pointer
+                    } else {
+                        CursorIcon::Text
+                    });
+                }
+            }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                let is_inner = {
                     let viewport = self.viewport();
-                    let x = position.x - viewport.x as f64;
-                    let y = position.y - viewport.y as f64;
-                    self.mouse.cursor_pos = CursorPosition { x, y };
+                    let (w, h) = (viewport.w as f64, viewport.h as f64);
+                    let CursorPosition { x, y } = self.mouse.cursor_pos;
+                    0.0 <= x && x < w && 0.0 <= y && y < h
+                };
 
-                    // URL の上ではポインタ（手）カーソルにして「クリックできる」と
-                    // 分かるようにする。mouse_mode のアプリにはマウスを渡すので変えない。
-                    if !self.terminal.mouse_mode() {
-                        let cs = self.view.cell_size();
-                        let col = (x / cs.w.max(1) as f64) as i64;
-                        let row = (y / cs.h.max(1) as f64) as i64;
-                        let on_url = col >= 0
-                            && row >= 0
-                            && self.url_at(row as usize, col as usize).is_some();
-                        self.window.set_cursor_icon(if on_url {
-                            CursorIcon::Pointer
-                        } else {
-                            CursorIcon::Text
-                        });
-                    }
+                if !is_inner {
+                    self.mouse.pressed_pos = None;
+                    self.mouse.released_pos = None;
+                    self.mouse.selecting = false;
+                    return;
                 }
 
-                WindowEvent::MouseInput { state, button, .. } => {
-                    let is_inner = {
-                        let viewport = self.viewport();
-                        let (w, h) = (viewport.w as f64, viewport.h as f64);
-                        let CursorPosition { x, y } = self.mouse.cursor_pos;
-                        0.0 <= x && x < w && 0.0 <= y && y < h
+                // Shift 押下中はマウス報告を無視してローカル選択に回す
+                // （xterm の作法）。これで Claude Code 等のマウス報告アプリでも
+                // Shift+ドラッグで画面の文字を選択 → Ctrl+Shift+C でコピーできる。
+                // Released は「ドラッグ開始時にローカル選択だったか(selecting)」も見る。
+                // 途中で Shift を離してもボタンを離すまでローカル選択を続け、
+                // released_pos を必ず立てる（立たないと離した後も選択がマウスに
+                // 追従して固定できない）。
+                let report_to_app = self.terminal.mouse_mode() && !self.modifiers.shift_key();
+                let report = match state {
+                    ElementState::Pressed => report_to_app,
+                    ElementState::Released => report_to_app && !self.mouse.selecting,
+                };
+                if report {
+                    self.mouse.selecting = false;
+                    let button = match state {
+                        ElementState::Released if !self.terminal.sgr_mouse() => 3,
+                        _ => match button {
+                            MouseButton::Left => 0,
+                            MouseButton::Middle => 1,
+                            MouseButton::Right => 2,
+                            MouseButton::Back | MouseButton::Forward => 0,
+                            MouseButton::Other(button_id) => {
+                                // FIXME : Support multi button mouse?
+                                log::warn!("unknown mouse button : {}", button_id);
+                                0
+                            }
+                        },
                     };
 
-                    if !is_inner {
-                        self.mouse.pressed_pos = None;
-                        self.mouse.released_pos = None;
-                        self.mouse.selecting = false;
-                        return;
-                    }
-
-                    // Shift 押下中はマウス報告を無視してローカル選択に回す
-                    // （xterm の作法）。これで Claude Code 等のマウス報告アプリでも
-                    // Shift+ドラッグで画面の文字を選択 → Ctrl+Shift+C でコピーできる。
-                    // Released は「ドラッグ開始時にローカル選択だったか(selecting)」も見る。
-                    // 途中で Shift を離してもボタンを離すまでローカル選択を続け、
-                    // released_pos を必ず立てる（立たないと離した後も選択がマウスに
-                    // 追従して固定できない）。
-                    let report_to_app = self.terminal.mouse_mode() && !self.modifiers.shift_key();
-                    let report = match state {
-                        ElementState::Pressed => report_to_app,
-                        ElementState::Released => report_to_app && !self.mouse.selecting,
-                    };
-                    if report {
-                        self.mouse.selecting = false;
-                        let button = match state {
-                            ElementState::Released if !self.terminal.sgr_mouse() => 3,
-                            _ => match button {
-                                MouseButton::Left => 0,
-                                MouseButton::Middle => 1,
-                                MouseButton::Right => 2,
-                                MouseButton::Back | MouseButton::Forward => 0,
-                                MouseButton::Other(button_id) => {
-                                    // FIXME : Support multi button mouse?
-                                    log::warn!("unknown mouse button : {}", button_id);
-                                    0
-                                }
-                            },
-                        };
-
-                        #[rustfmt::skip]
+                    #[rustfmt::skip]
                         let mods =
                             if self.modifiers.shift_key()   { 0b00000100 } else { 0 }
                         |   if self.modifiers.alt_key()     { 0b00001000 } else { 0 }
                         |   if self.modifiers.control_key() { 0b00010000 } else { 0 };
 
-                        let CursorPosition { x, y } = self.mouse.cursor_pos;
-                        let cell_size = self.view.cell_size();
-                        let col = x.round() as u32 / cell_size.w + 1;
-                        let row = y.round() as u32 / cell_size.h + 1;
+                    let CursorPosition { x, y } = self.mouse.cursor_pos;
+                    let cell_size = self.view.cell_size();
+                    let col = x.round() as u32 / cell_size.w + 1;
+                    let row = y.round() as u32 / cell_size.h + 1;
 
-                        if self.terminal.sgr_mouse() {
-                            self.sgr_ext_mouse_report(button + mods, col, row, state);
-                        } else {
-                            self.normal_mouse_report(button + mods, col, row);
-                        }
+                    if self.terminal.sgr_mouse() {
+                        self.sgr_ext_mouse_report(button + mods, col, row, state);
                     } else {
-                        match state {
-                            ElementState::Pressed => {
-                                const CLICK_INTERVAL: std::time::Duration =
-                                    std::time::Duration::from_millis(400);
-                                if self.mouse.last_clicked.elapsed() > CLICK_INTERVAL {
-                                    self.mouse.click_count = 0;
-                                }
-
-                                self.mouse.click_count += 1;
-                                self.mouse.last_clicked = std::time::Instant::now();
-                                log::debug!("clicked {} times", self.mouse.click_count);
-
-                                self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
-                                self.mouse.released_pos = None;
-                                // 選択をスクロールに追従させるため押下時のスクロール量を記録。
-                                self.mouse.pressed_offset = self.terminal.display_offset() as i64;
-                                self.mouse.released_offset = self.mouse.pressed_offset;
-                                // Ctrl を押しながらの開始は矩形選択。
-                                self.mouse.block = self.modifiers.control_key();
-                                // このドラッグはローカル選択。離すまで継続する。
-                                self.mouse.selecting = true;
+                        self.normal_mouse_report(button + mods, col, row);
+                    }
+                } else {
+                    match state {
+                        ElementState::Pressed => {
+                            const CLICK_INTERVAL: std::time::Duration =
+                                std::time::Duration::from_millis(400);
+                            if self.mouse.last_clicked.elapsed() > CLICK_INTERVAL {
+                                self.mouse.click_count = 0;
                             }
-                            ElementState::Released => {
-                                self.mouse.selecting = false;
-                                self.mouse.released_pos = Some(self.mouse.cursor_pos);
-                                self.mouse.released_offset = self.terminal.display_offset() as i64;
 
-                                // ドラッグ（選択）でない単純な左クリックで、その位置に
-                                // URL があればブラウザで開く。mouse_mode が ON の
-                                // アプリ（nvim 等）はこの分岐に来ないので邪魔しない。
-                                if *button == MouseButton::Left {
-                                    if let Some(press) = self.mouse.pressed_pos {
-                                        let cs = self.view.cell_size();
-                                        let to_cell = |p: CursorPosition| {
-                                            (
-                                                (p.x / cs.w.max(1) as f64) as i64,
-                                                (p.y / cs.h.max(1) as f64) as i64,
-                                            )
-                                        };
-                                        let here = self.mouse.cursor_pos;
-                                        if to_cell(press) == to_cell(here) {
-                                            let (col, row) = to_cell(here);
-                                            if col >= 0 && row >= 0 {
-                                                if let Some(url) =
-                                                    self.url_at(row as usize, col as usize)
-                                                {
-                                                    open_url(&url);
-                                                }
-                                            }
+                            self.mouse.click_count += 1;
+                            self.mouse.last_clicked = std::time::Instant::now();
+                            log::debug!("clicked {} times", self.mouse.click_count);
+
+                            self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
+                            self.mouse.released_pos = None;
+                            // 選択をスクロールに追従させるため押下時のスクロール量を記録。
+                            self.mouse.pressed_offset = self.terminal.display_offset() as i64;
+                            self.mouse.released_offset = self.mouse.pressed_offset;
+                            // Ctrl を押しながらの開始は矩形選択。
+                            self.mouse.block = self.modifiers.control_key();
+                            // このドラッグはローカル選択。離すまで継続する。
+                            self.mouse.selecting = true;
+                        }
+                        ElementState::Released => {
+                            self.mouse.selecting = false;
+                            self.mouse.released_pos = Some(self.mouse.cursor_pos);
+                            self.mouse.released_offset = self.terminal.display_offset() as i64;
+
+                            // ドラッグ（選択）でない単純な左クリックで、その位置に
+                            // URL があればブラウザで開く。mouse_mode が ON の
+                            // アプリ（nvim 等）はこの分岐に来ないので邪魔しない。
+                            if *button == MouseButton::Left {
+                                if let Some(press) = self.mouse.pressed_pos {
+                                    let cs = self.view.cell_size();
+                                    let to_cell = |p: CursorPosition| {
+                                        (
+                                            (p.x / cs.w.max(1) as f64) as i64,
+                                            (p.y / cs.h.max(1) as f64) as i64,
+                                        )
+                                    };
+                                    let here = self.mouse.cursor_pos;
+                                    if to_cell(press) == to_cell(here) {
+                                        let (col, row) = to_cell(here);
+                                        if col >= 0 && row >= 0 {
+                                            self.handle_link_click(row as usize, col as usize);
                                         }
                                     }
                                 }
@@ -672,83 +747,96 @@ impl TerminalWindow {
                         }
                     }
                 }
+            }
 
-                WindowEvent::MouseWheel { delta, .. } => {
-                    // マウスホイールは行単位(LineDelta)、ノートPCのタッチパッドは
-                    // ピクセル単位(PixelDelta)で来る。後者はセルサイズで行数に換算する。
+            WindowEvent::MouseWheel { delta, .. } => {
+                // マウスホイールは行単位(LineDelta)、ノートPCのタッチパッドは
+                // ピクセル単位(PixelDelta)で来る。後者はセルサイズで行数に換算する。
+                let cell_size = self.view.cell_size();
+                let (dx, dy) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => (*x * 1.5, *y * 1.5),
+                    // タッチパッド等のピクセル単位スクロールはセルサイズで行数に換算。
+                    // winit は LineDelta も PixelDelta も同じ符号規約(正=上)なので、
+                    // 反転せずマウスホイールと同じ向きに揃える。
+                    MouseScrollDelta::PixelDelta(pos) => (
+                        pos.x as f32 / cell_size.w.max(1) as f32,
+                        pos.y as f32 / cell_size.h.max(1) as f32,
+                    ),
+                };
+
+                self.mouse.wheel_delta_x += dx;
+                self.mouse.wheel_delta_y += dy;
+
+                let horizontal = self.mouse.wheel_delta_x.trunc() as isize;
+                let vertical = self.mouse.wheel_delta_y.trunc() as isize;
+
+                self.mouse.wheel_delta_x %= 1.0;
+                self.mouse.wheel_delta_y %= 1.0;
+
+                // スクロールの振り分け：
+                //  ・Shift 押下 → 常に履歴スクロール（どんな画面でも遡れる保険）
+                //  ・アプリがマウス報告中(Claude Code 等の TUI) → ホイールを
+                //    マウスホイールイベントとして送り、アプリ自身にスクロールさせる。
+                //    （以前は矢印キーを送っていたため、Claude Code が入力履歴↑↓と
+                //     誤解してページが動かなかった）
+                //  ・代替画面(マウス非対応の less 等) → 矢印キー
+                //  ・通常画面 → ローカル履歴スクロール
+                if self.modifiers.shift_key() {
+                    self.terminal.scroll(vertical as i32);
+                } else if self.terminal.mouse_mode() {
                     let cell_size = self.view.cell_size();
-                    let (dx, dy) = match delta {
-                        MouseScrollDelta::LineDelta(x, y) => (*x * 1.5, *y * 1.5),
-                        // タッチパッド等のピクセル単位スクロールはセルサイズで行数に換算。
-                        // winit は LineDelta も PixelDelta も同じ符号規約(正=上)なので、
-                        // 反転せずマウスホイールと同じ向きに揃える。
-                        MouseScrollDelta::PixelDelta(pos) => (
-                            pos.x as f32 / cell_size.w.max(1) as f32,
-                            pos.y as f32 / cell_size.h.max(1) as f32,
-                        ),
-                    };
-
-                    self.mouse.wheel_delta_x += dx;
-                    self.mouse.wheel_delta_y += dy;
-
-                    let horizontal = self.mouse.wheel_delta_x.trunc() as isize;
-                    let vertical = self.mouse.wheel_delta_y.trunc() as isize;
-
-                    self.mouse.wheel_delta_x %= 1.0;
-                    self.mouse.wheel_delta_y %= 1.0;
-
-                    // スクロールの振り分け：
-                    //  ・Shift 押下 → 常に履歴スクロール（どんな画面でも遡れる保険）
-                    //  ・アプリがマウス報告中(Claude Code 等の TUI) → ホイールを
-                    //    マウスホイールイベントとして送り、アプリ自身にスクロールさせる。
-                    //    （以前は矢印キーを送っていたため、Claude Code が入力履歴↑↓と
-                    //     誤解してページが動かなかった）
-                    //  ・代替画面(マウス非対応の less 等) → 矢印キー
-                    //  ・通常画面 → ローカル履歴スクロール
-                    if self.modifiers.shift_key() {
-                        self.terminal.scroll(vertical as i32);
-                    } else if self.terminal.mouse_mode() {
-                        let cell_size = self.view.cell_size();
-                        let CursorPosition { x, y } = self.mouse.cursor_pos;
-                        let col = x.round().max(0.0) as u32 / cell_size.w.max(1) + 1;
-                        let row = y.round().max(0.0) as u32 / cell_size.h.max(1) + 1;
-                        let sgr = self.terminal.sgr_mouse();
-                        // 64=ホイール上, 65=下, 66=左, 67=右
-                        let v_btn: u8 = if vertical > 0 { 64 } else { 65 };
-                        for _ in 0..vertical.abs() {
-                            if sgr {
-                                self.sgr_ext_mouse_report(v_btn, col, row, &ElementState::Pressed);
-                            } else {
-                                self.normal_mouse_report(v_btn, col, row);
-                            }
-                        }
-                        let h_btn: u8 = if horizontal > 0 { 67 } else { 66 };
-                        for _ in 0..horizontal.abs() {
-                            if sgr {
-                                self.sgr_ext_mouse_report(h_btn, col, row, &ElementState::Pressed);
-                            } else {
-                                self.normal_mouse_report(h_btn, col, row);
-                            }
-                        }
-                    } else if self.terminal.alt_screen() {
-                        let vk: &[u8] = if vertical > 0 { b"\x1b[\x41" } else { b"\x1b[\x42" };
-                        for _ in 0..vertical.abs() {
-                            self.terminal.write(vk);
-                        }
-                        let hk: &[u8] = if horizontal > 0 { b"\x1b[\x43" } else { b"\x1b[\x44" };
-                        for _ in 0..horizontal.abs() {
-                            self.terminal.write(hk);
-                        }
-                    } else {
-                        self.terminal.scroll(vertical as i32);
-                        let hk: &[u8] = if horizontal > 0 { b"\x1b[\x43" } else { b"\x1b[\x44" };
-                        for _ in 0..horizontal.abs() {
-                            self.terminal.write(hk);
+                    let CursorPosition { x, y } = self.mouse.cursor_pos;
+                    let col = x.round().max(0.0) as u32 / cell_size.w.max(1) + 1;
+                    let row = y.round().max(0.0) as u32 / cell_size.h.max(1) + 1;
+                    let sgr = self.terminal.sgr_mouse();
+                    // 64=ホイール上, 65=下, 66=左, 67=右
+                    let v_btn: u8 = if vertical > 0 { 64 } else { 65 };
+                    for _ in 0..vertical.abs() {
+                        if sgr {
+                            self.sgr_ext_mouse_report(v_btn, col, row, &ElementState::Pressed);
+                        } else {
+                            self.normal_mouse_report(v_btn, col, row);
                         }
                     }
+                    let h_btn: u8 = if horizontal > 0 { 67 } else { 66 };
+                    for _ in 0..horizontal.abs() {
+                        if sgr {
+                            self.sgr_ext_mouse_report(h_btn, col, row, &ElementState::Pressed);
+                        } else {
+                            self.normal_mouse_report(h_btn, col, row);
+                        }
+                    }
+                } else if self.terminal.alt_screen() {
+                    let vk: &[u8] = if vertical > 0 {
+                        b"\x1b[\x41"
+                    } else {
+                        b"\x1b[\x42"
+                    };
+                    for _ in 0..vertical.abs() {
+                        self.terminal.write(vk);
+                    }
+                    let hk: &[u8] = if horizontal > 0 {
+                        b"\x1b[\x43"
+                    } else {
+                        b"\x1b[\x44"
+                    };
+                    for _ in 0..horizontal.abs() {
+                        self.terminal.write(hk);
+                    }
+                } else {
+                    self.terminal.scroll(vertical as i32);
+                    let hk: &[u8] = if horizontal > 0 {
+                        b"\x1b[\x43"
+                    } else {
+                        b"\x1b[\x44"
+                    };
+                    for _ in 0..horizontal.abs() {
+                        self.terminal.write(hk);
+                    }
                 }
+            }
 
-                _ => {}
+            _ => {}
         }
     }
 
@@ -757,11 +845,31 @@ impl TerminalWindow {
         fn ctrl_letter_code(code: KeyCode) -> Option<u8> {
             use KeyCode::*;
             let n: u8 = match code {
-                KeyA => 1, KeyB => 2, KeyC => 3, KeyD => 4, KeyE => 5,
-                KeyF => 6, KeyG => 7, KeyH => 8, KeyI => 9, KeyJ => 10,
-                KeyK => 11, KeyL => 12, KeyM => 13, KeyN => 14, KeyO => 15,
-                KeyP => 16, KeyQ => 17, KeyR => 18, KeyS => 19, KeyT => 20,
-                KeyU => 21, KeyV => 22, KeyW => 23, KeyX => 24, KeyY => 25,
+                KeyA => 1,
+                KeyB => 2,
+                KeyC => 3,
+                KeyD => 4,
+                KeyE => 5,
+                KeyF => 6,
+                KeyG => 7,
+                KeyH => 8,
+                KeyI => 9,
+                KeyJ => 10,
+                KeyK => 11,
+                KeyL => 12,
+                KeyM => 13,
+                KeyN => 14,
+                KeyO => 15,
+                KeyP => 16,
+                KeyQ => 17,
+                KeyR => 18,
+                KeyS => 19,
+                KeyT => 20,
+                KeyU => 21,
+                KeyV => 22,
+                KeyW => 23,
+                KeyX => 24,
+                KeyY => 25,
                 KeyZ => 26,
                 _ => return None,
             };
@@ -1039,7 +1147,8 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::dedent_common_indent;
+    use super::{dedent_common_indent, resolve_existing_file_token, resolve_path_token};
+    use std::path::{Path, PathBuf};
 
     #[test]
     fn dedent_common_indent_removes_shared_prefix() {
@@ -1058,5 +1167,68 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(dedent_common_indent(input), expected);
         }
+    }
+
+    fn test_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("toyterm-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    #[test]
+    fn resolves_absolute_path_token() {
+        let dir = test_dir("abs");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "hello").expect("write file");
+
+        assert_eq!(
+            resolve_path_token(file.to_str().unwrap(), Path::new("/tmp")),
+            Some(file)
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_home_path_token() {
+        let dir = test_dir("home");
+        let file = dir.join("note.txt");
+        std::fs::write(&file, "hello").expect("write file");
+        let old_home = std::env::var_os("HOME");
+        std::env::set_var("HOME", &dir);
+
+        assert_eq!(
+            resolve_path_token("~/note.txt", Path::new("/tmp")),
+            Some(file)
+        );
+
+        if let Some(home) = old_home {
+            std::env::set_var("HOME", home);
+        } else {
+            std::env::remove_var("HOME");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn resolves_relative_path_token_against_cwd() {
+        let dir = test_dir("rel");
+        std::fs::create_dir_all(dir.join("src")).expect("create src");
+        let file = dir.join("src/main.rs");
+        std::fs::write(&file, "fn main() {}").expect("write file");
+
+        assert_eq!(resolve_path_token("src/./main.rs", &dir), Some(file));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn existing_file_resolution_ignores_missing_token() {
+        let dir = test_dir("missing");
+
+        assert_eq!(resolve_existing_file_token("missing.txt", &dir), None);
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
