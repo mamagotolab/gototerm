@@ -16,6 +16,7 @@ use alacritty_terminal::vte::ansi::Rgb;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
 use vte::ansi::Processor;
 
+use crate::gt::{parse_gt_message, GtMessage};
 use crate::sixel;
 use crate::terminal::PositionedImage;
 
@@ -151,6 +152,7 @@ pub struct VtTerminal {
     winsize: Arc<Mutex<WindowSize>>,
     /// Sixel で描かれた画像。グリッドとは別に保持し、描画時に重ねる。
     images: Arc<Mutex<Vec<PositionedImage>>>,
+    gt_messages: Arc<Mutex<Vec<GtMessage>>>,
     /// 直近の代替画面(Alt Screen)状態。切替時に画像を消すため。
     last_alt: Arc<AtomicBool>,
     /// シェル（PTY 子プロセス）の PID。`cwd()` で /proc を引くために保持。
@@ -486,6 +488,16 @@ fn local_hostname() -> &'static str {
         .as_str()
 }
 
+fn push_gt_message(queue: &Arc<Mutex<Vec<GtMessage>>>, message: GtMessage) {
+    const GT_QUEUE_MAX: usize = 1000;
+    let mut queue = queue.lock().unwrap();
+    if queue.len() >= GT_QUEUE_MAX {
+        let drop_count = queue.len() + 1 - GT_QUEUE_MAX;
+        queue.drain(0..drop_count);
+    }
+    queue.push(message);
+}
+
 pub(crate) fn classify_shell_location(
     host: &str,
     path: PathBuf,
@@ -619,6 +631,7 @@ impl VtTerminal {
         let exited = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(true));
         let images: Arc<Mutex<Vec<PositionedImage>>> = Arc::new(Mutex::new(Vec::new()));
+        let gt_messages: Arc<Mutex<Vec<GtMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let last_alt = Arc::new(AtomicBool::new(false));
         let shell_location = Arc::new(Mutex::new(None));
 
@@ -628,6 +641,7 @@ impl VtTerminal {
             let exited = exited.clone();
             let dirty = dirty.clone();
             let images = images.clone();
+            let gt_messages = gt_messages.clone();
             let winsize = winsize.clone();
             let shell_location = shell_location.clone();
             std::thread::spawn(move || {
@@ -663,6 +677,10 @@ impl VtTerminal {
                                                     local_hostname(),
                                                 );
                                                 *shell_location.lock().unwrap() = Some(location);
+                                            }
+                                        } else if code == OscCode::Gt {
+                                            if let Some(message) = parse_gt_message(&payload) {
+                                                push_gt_message(&gt_messages, message);
                                             }
                                         }
                                     }
@@ -700,6 +718,7 @@ impl VtTerminal {
             dirty,
             winsize,
             images,
+            gt_messages,
             last_alt,
             child_pid,
             shell_location,
@@ -728,6 +747,10 @@ impl VtTerminal {
 
     pub fn location(&self) -> Option<ShellLocation> {
         self.shell_location.lock().unwrap().clone()
+    }
+
+    pub fn take_gt_messages(&self) -> Vec<GtMessage> {
+        std::mem::take(&mut *self.gt_messages.lock().unwrap())
     }
 
     /// 前回以降に画面内容が変わったか（変わっていれば true を返し、フラグを下げる）。

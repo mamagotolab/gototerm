@@ -43,6 +43,7 @@ pub struct Sidebar {
     watch_failed: bool,
     remote_location: Option<(String, PathBuf)>,
     follow_target: Option<PathBuf>,
+    ai_activity: Option<AiActivity>,
 }
 
 impl Sidebar {
@@ -73,6 +74,7 @@ impl Sidebar {
             watch_failed: false,
             remote_location: None,
             follow_target: None,
+            ai_activity: None,
         }
     }
 
@@ -286,6 +288,9 @@ impl Sidebar {
     fn selected_row_action(&self) -> Option<RowAction> {
         match self.mode {
             SidebarMode::Changes => {
+                if self.remote_location.is_some() {
+                    return None;
+                }
                 let change = self.changes.get(self.browse_selected)?;
                 Some(RowAction::PreviewFile(
                     self.watcher_root
@@ -313,6 +318,41 @@ impl Sidebar {
 
     pub fn take_follow_target(&mut self) -> Option<PathBuf> {
         self.follow_target.take()
+    }
+
+    pub fn apply_gt_event(
+        &mut self,
+        root: Option<&Path>,
+        kind: ChangeKind,
+        path: PathBuf,
+        tool: Option<String>,
+    ) {
+        let existing = self.changes.iter().position(|stored| stored.path == path);
+        let prev = existing.map(|index| self.changes.remove(index).kind);
+        let merged = merge_kind(prev, kind);
+        self.changes.insert(
+            0,
+            FileChange {
+                path: path.clone(),
+                kind: merged,
+            },
+        );
+        self.changes.truncate(100);
+
+        self.ai_activity = Some(AiActivity {
+            kind: merged,
+            path: path.clone(),
+            tool,
+            at: Instant::now(),
+        });
+
+        if self.remote_location.is_none() {
+            if let (Some(root), ChangeKind::New | ChangeKind::Modified) = (root, merged) {
+                self.follow_target = Some(root.join(path));
+            }
+        }
+
+        self.rebuild();
     }
 
     pub fn root(&self) -> Option<&Path> {
@@ -404,6 +444,7 @@ impl Sidebar {
         self.row_actions.clear();
         self.browse_selected = 0;
         self.follow_target = None;
+        self.ai_activity = None;
     }
 
     fn refresh(&mut self, cwd: &Path) {
@@ -514,6 +555,7 @@ impl Sidebar {
                 &[(" remote ", Color::BrightWhite), (&dir, Color::White)],
                 None,
             );
+            self.push_ai_activity(&mut lines, &mut row_actions, cols);
             push_line(&mut lines, &mut row_actions, cols, "", Color::White, None);
             push_line(
                 &mut lines,
@@ -544,7 +586,7 @@ impl Sidebar {
                 &mut lines,
                 &mut row_actions,
                 cols,
-                "リモートの内容を見るには（Phase 8b で対応予定）:",
+                "リモートの内容を見るには:",
                 Color::BrightBlack,
                 None,
             );
@@ -556,6 +598,8 @@ impl Sidebar {
                 Color::BrightWhite,
                 None,
             );
+            push_line(&mut lines, &mut row_actions, cols, "", Color::White, None);
+            self.push_changed_files(&mut lines, &mut row_actions, cols);
         } else if let Some(info) = &self.info {
             let dir = abbreviate_start(&info.cwd.display().to_string(), cols.saturating_sub(12));
             push_segments(
@@ -592,6 +636,7 @@ impl Sidebar {
                 }
             }
 
+            self.push_ai_activity(&mut lines, &mut row_actions, cols);
             self.push_mode_switch(&mut lines, &mut row_actions, cols);
             push_separator(&mut lines, &mut row_actions, cols);
             match self.mode {
@@ -647,6 +692,47 @@ impl Sidebar {
     ) {
         let hint = " ↑↓:選択  →/Enter:開く  ←:上へ  Esc:端末";
         push_line(lines, row_actions, cols, hint, Color::BrightBlack, None);
+    }
+
+    fn push_ai_activity(
+        &self,
+        lines: &mut Vec<Line>,
+        row_actions: &mut Vec<Option<RowAction>>,
+        cols: usize,
+    ) {
+        let Some(activity) = &self.ai_activity else {
+            return;
+        };
+        if activity.at.elapsed() > Duration::from_secs(60) {
+            return;
+        }
+
+        let (label, _) = change_label(activity.kind);
+        let suffix = activity
+            .tool
+            .as_ref()
+            .map(|tool| format!(" ({tool})"))
+            .unwrap_or_default();
+        let fixed = display_width(" ● claude  ") + display_width(label) + 1;
+        let available = cols
+            .saturating_sub(fixed)
+            .saturating_sub(display_width(&suffix));
+        let path = abbreviate_start(&activity.path.display().to_string(), available);
+        push_segments(
+            lines,
+            row_actions,
+            cols,
+            &[
+                (" ", Color::White),
+                ("●", Color::Green),
+                (" claude  ", Color::White),
+                (label, Color::BrightWhite),
+                (" ", Color::White),
+                (&path, Color::White),
+                (&suffix, Color::BrightBlack),
+            ],
+            None,
+        );
     }
 
     fn push_mode_switch(
@@ -738,6 +824,14 @@ impl Sidebar {
             let path = change.path.display().to_string();
             let path = abbreviate_start(&path, cols.saturating_sub(10));
             let marker = "   ";
+            let action = self.remote_location.is_none().then(|| {
+                RowAction::PreviewFile(
+                    self.watcher_root
+                        .as_deref()
+                        .unwrap_or_else(|| Path::new(""))
+                        .join(&change.path),
+                )
+            });
             push_segments(
                 lines,
                 row_actions,
@@ -748,12 +842,7 @@ impl Sidebar {
                     ("  ", Color::White),
                     (&path, Color::White),
                 ],
-                Some(RowAction::PreviewFile(
-                    self.watcher_root
-                        .as_deref()
-                        .unwrap_or_else(|| Path::new(""))
-                        .join(&change.path),
-                )),
+                action,
             );
         }
 
@@ -1010,6 +1099,13 @@ pub enum SidebarKeyResult {
 enum SidebarMode {
     Changes,
     Files,
+}
+
+struct AiActivity {
+    kind: ChangeKind,
+    path: PathBuf,
+    tool: Option<String>,
+    at: Instant,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

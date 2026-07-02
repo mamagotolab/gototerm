@@ -1,0 +1,173 @@
+#!/bin/sh
+
+OSC_START="$(printf '\033]7717;')"
+OSC_END="$(printf '\007')"
+MAX_BYTES=65536
+CHUNK_BYTES=8192
+
+has_tty() {
+    [ -w /dev/tty ]
+}
+
+b64() {
+    base64 | tr -d '\n'
+}
+
+b64_arg() {
+    printf '%s' "$1" | b64
+}
+
+emit() {
+    has_tty || return 0
+    printf '%s%s%s' "$OSC_START" "$1" "$OSC_END" > /dev/tty
+}
+
+send_event() {
+    kind=$1
+    path=$2
+    tool=$3
+
+    case "$kind" in
+        new|mod|del) ;;
+        *) return 0 ;;
+    esac
+
+    path_b64=$(b64_arg "$path")
+    msg="event;kind=$kind;path=$path_b64"
+    if [ -n "$tool" ]; then
+        tool_b64=$(b64_arg "$tool")
+        msg="$msg;tool=$tool_b64"
+    fi
+    emit "$msg"
+}
+
+send_view() {
+    file=$1
+    [ -r "$file" ] || return 0
+
+    size=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+    case "$size" in
+        ''|*[!0-9]*) return 0 ;;
+    esac
+
+    start=0
+    if [ "$size" -gt "$MAX_BYTES" ]; then
+        start=$((size - MAX_BYTES))
+    fi
+
+    path_b64=$(b64_arg "$file")
+    offset=$start
+    seq=0
+    while [ "$offset" -lt "$size" ]; do
+        remaining=$((size - offset))
+        count=$CHUNK_BYTES
+        if [ "$remaining" -le "$CHUNK_BYTES" ]; then
+            count=$remaining
+            last=1
+        else
+            last=0
+        fi
+        data=$(dd if="$file" bs=1 skip="$offset" count="$count" 2>/dev/null | b64)
+        emit "file;path=$path_b64;seq=$seq;last=$last;data=$data"
+        offset=$((offset + count))
+        seq=$((seq + 1))
+    done
+}
+
+json_string_jq() {
+    key=$1
+    jq -r "$key // empty" 2>/dev/null
+}
+
+json_string_fallback() {
+    key=$1
+    sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
+}
+
+run_hook() {
+    input=$(cat)
+    if command -v jq >/dev/null 2>&1; then
+        tool=$(printf '%s' "$input" | json_string_jq '.tool_name')
+        path=$(printf '%s' "$input" | json_string_jq '.tool_input.file_path')
+    else
+        tool=$(printf '%s' "$input" | json_string_fallback 'tool_name')
+        path=$(printf '%s' "$input" | json_string_fallback 'file_path')
+    fi
+
+    [ -n "$path" ] || return 0
+
+    kind=mod
+    if [ "$tool" = "Write" ]; then
+        kind=new
+    fi
+    send_event "$kind" "$path" "$tool"
+    case "$kind" in
+        new|mod) send_view "$path" ;;
+    esac
+}
+
+hook_snippet() {
+    cat <<'EOF'
+{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gt hook"
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
+}
+
+init_hooks() {
+    settings=.claude/settings.local.json
+    if [ -e "$settings" ]; then
+        printf '%s\n' "$settings already exists. Merge this snippet manually:" >&2
+        hook_snippet >&2
+        return 1
+    fi
+    mkdir -p .claude || return 1
+    hook_snippet > "$settings"
+    printf '%s\n' "wrote $settings"
+}
+
+usage() {
+    cat <<'EOF'
+usage:
+  gt view <file>
+  gt event <new|mod|del> <path> [tool]
+  gt hook
+  gt init-hooks
+EOF
+}
+
+cmd=$1
+shift 2>/dev/null || true
+
+case "$cmd" in
+    view)
+        [ $# -eq 1 ] || { usage >&2; exit 2; }
+        send_view "$1"
+        ;;
+    event)
+        [ $# -ge 2 ] || { usage >&2; exit 2; }
+        send_event "$1" "$2" "${3:-}"
+        ;;
+    hook)
+        run_hook
+        ;;
+    init-hooks)
+        init_hooks
+        ;;
+    *)
+        usage >&2
+        exit 2
+        ;;
+esac

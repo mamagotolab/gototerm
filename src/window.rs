@@ -8,6 +8,7 @@ use winit::{
     window::{CursorIcon, Window},
 };
 
+use crate::gt::GtMessage;
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
 use crate::vt::{ShellLocation, VtTerminal};
@@ -464,6 +465,10 @@ impl TerminalWindow {
 
     pub fn take_clicked_file(&mut self) -> Option<PathBuf> {
         self.clicked_file.take()
+    }
+
+    pub fn take_gt_messages(&mut self) -> Vec<GtMessage> {
+        self.terminal.take_gt_messages()
     }
 
     pub fn set_viewport(&mut self, new_viewport: Viewport) {

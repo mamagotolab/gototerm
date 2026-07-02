@@ -1,9 +1,9 @@
 [package]
 name = "gototerm"
-version = "0.2.13"
+version = "0.3.0"
 authors = ["mamagotolab"]
 edition = "2021"
-description = "日本語入力のストレスが少ない、軽量ターミナルエミュレータ（Wayland 向け・Sixel 画像対応）"
+description = "日本語入力のストレスが少ない、AI開発ワークベンチ付き軽量ターミナル（Sixel 画像対応）"
 license = "MIT"
 repository = "https://github.com/mamagotolab/gototerm"
 homepage = "https://mamagotolab.com"

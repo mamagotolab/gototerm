@@ -18,6 +18,7 @@ use winit::{
 };
 
 use crate::config::resolve_editor;
+use crate::gt::{GtFileAssembler, GtMessage};
 use crate::reader::{ReaderHeaderAction, ReaderPane, ReaderRequest};
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::terminal::{Cell, Color, Line};
@@ -221,6 +222,10 @@ impl Node {
             }
             Node::Empty => {}
         }
+    }
+
+    fn take_gt_messages(&mut self, out: &mut Vec<GtMessage>) {
+        self.for_each_leaf(&mut |w| out.extend(w.take_gt_messages()));
     }
 
     fn needs_redraw(&self) -> bool {
@@ -614,6 +619,12 @@ impl PreviewSlot {
         };
         win.check_update()
     }
+
+    fn take_gt_messages(&mut self, out: &mut Vec<GtMessage>) {
+        if let PreviewSlot::Editor { win, .. } = self {
+            out.extend(win.take_gt_messages());
+        }
+    }
 }
 
 pub struct Multiplexer {
@@ -625,6 +636,7 @@ pub struct Multiplexer {
     sidebar_focused: bool,
     preview_slot: PreviewSlot,
     editor_focused: bool,
+    gt_file_assembler: GtFileAssembler,
     tabs: Vec<Node>,
     focus: usize,
     modifiers: ModifiersState,
@@ -677,6 +689,7 @@ impl Multiplexer {
             sidebar_focused: false,
             preview_slot,
             editor_focused: false,
+            gt_file_assembler: GtFileAssembler::default(),
             tabs: vec![first],
             focus: 0,
             modifiers: ModifiersState::empty(),
@@ -1072,6 +1085,41 @@ impl Multiplexer {
         self.preview_slot = PreviewSlot::Editor { win, saved };
     }
 
+    fn handle_gt_messages(&mut self) {
+        let mut messages = Vec::new();
+        for tab in &mut self.tabs {
+            tab.take_gt_messages(&mut messages);
+        }
+        self.preview_slot.take_gt_messages(&mut messages);
+
+        if messages.is_empty() || !self.sidebar.is_visible() {
+            return;
+        }
+
+        for message in messages {
+            match message {
+                GtMessage::Event { kind, path, tool } => {
+                    let root = self.sidebar.root().map(Path::to_path_buf);
+                    self.sidebar
+                        .apply_gt_event(root.as_deref(), kind, path, tool);
+                }
+                GtMessage::FileChunk {
+                    path,
+                    seq,
+                    last,
+                    data,
+                } => {
+                    if let Some((path, bytes)) = self.gt_file_assembler.push(path, seq, last, data)
+                    {
+                        if let Some(reader) = self.preview_slot.reader_mut() {
+                            reader.show_remote_content(path, bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// 今このフレームを描画してよいか。最小化中（またはサイズ0）は描かない。
     /// Windows では最小化中も毎フレーム描画→SwapBuffers を呼んでしまうと、
     /// 隠れたウィンドウには画面合成(vblank)が来ないため、投げた描画コマンドが
@@ -1412,6 +1460,8 @@ impl Multiplexer {
                     self.refresh_layout();
                     self.update_status_bar();
                 }
+
+                self.handle_gt_messages();
 
                 if self.sidebar.is_visible() && self.preview_slot.check_update() {
                     if let PreviewSlot::Editor { mut saved, .. } =

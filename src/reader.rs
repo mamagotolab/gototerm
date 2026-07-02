@@ -143,6 +143,15 @@ impl ReaderPane {
         self.rebuild();
     }
 
+    pub fn show_remote_content(&mut self, path: PathBuf, bytes: Vec<u8>) {
+        self.pinned = true;
+        self.reader_scroll = 0;
+        self.reader_notice = Some(" (remote)".to_owned());
+        self.preview.set_memory_content(path, bytes);
+        self.refresh_reader_document();
+        self.rebuild();
+    }
+
     pub fn refresh_current(&mut self) {
         self.preview.refresh_current();
         self.reader_notice = None;

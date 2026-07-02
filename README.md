@@ -1,10 +1,14 @@
 # gototerm
 
-**日本語入力のストレスが少ない、軽量ターミナルエミュレータ。**
+**日本語入力のストレスが少ない、AI開発ワークベンチ付き軽量ターミナル。**
 
-gototerm（ゴトターム）は、日本語を打つ人のために作られた Linux 向けターミナルです。
+gototerm（ゴトターム）は、日本語を打つ人のために作られたターミナルです。
 変換中の文字がカーソル位置にそのまま表示され、変換候補も入力位置に出る ——
 「いつもの端末は日本語入力がもたつく・ズレる」という小さなストレスを減らすことを第一に設計しています。
+
+さらに `Ctrl+Shift+F` ひとつで、**ファイル一覧・プレビュー・ターミナルの3分割ワークベンチ**に切り替わります。
+Claude Code などの AI コーディングツールが「いま・どのファイルを・どう変えているか」を、
+隣のペインでリアルタイムに眺めながら作業できます。SSH 先の作業にも対応しています。
 
 > 名前は、プログラミングの `goto` と、開発元 [mamagotolab](https://github.com/mamagotolab) に由来します。
 
@@ -16,6 +20,7 @@ gototerm（ゴトターム）は、日本語を打つ人のために作られた
 ## なぜ gototerm か
 
 - **日本語入力が素直** — 変換中の文字（preedit）を端末内のカーソル位置にインライン表示。変換候補もカーソルに追従（fcitx5 等の Wayland text-input-v3 に対応）。
+- **AIの作業が見える** — Claude Code がファイルを書くそばから、中身が隣のペインに流れる。ファイル名の出力はクリックで即プレビュー。
 - **軽い** — GPU 必須の重量級端末に比べてメモリが小さい（実測でメモリ約 1/3、バイナリも約半分）。
 - **半透明＋ぼかし対応** — 背景の不透明度を細かく指定でき、Wayland コンポジタのブラーと相性良し。
 - **全角幅に配慮** — East Asian Width（曖昧幅）を設定で切り替え可能。日本語の表組みが崩れにくい。
@@ -75,15 +80,160 @@ cargo build --release
 
 > ℹ️ **terminfo の導入は不要です。**
 > 内部の VT エンジンに [alacritty_terminal](https://crates.io/crates/alacritty_terminal)
-> を採用し、`TERM=xterm-256color` として動作します。xterm-256color の terminfo は
-> ほぼ全ての環境に標準で入っているため、`tic` での導入は要りません。
+> を採用し、`TERM=xterm-256color` として動作します。
+
+---
+
+## ワークベンチ（3分割モード）
+
+### 30秒ではじめる
+
+1. gototerm を開いて `Ctrl+Shift+F` を押す
+2. 画面が3つに分かれます
+
+```
+┌─────────────┬───────────────────────────────┐
+│ ファイル一覧 │ プレビュー                     │
+│ (files /    │ 選んだファイル、または          │
+│  changes)   │ AIがいま書いているファイルの中身 │
+│             ├───────────────────────────────┤
+│ ↑↓ と ←→   │ ターミナル                     │
+│ で移動      │ （ここで Claude Code などを実行）│
+└─────────────┴───────────────────────────────┘
+```
+
+3. 矢印キーでファイルを選び、`Enter`（または `→`）で右上に中身が表示されます
+4. もう一度 `Ctrl+Shift+F` を2回押すと、元の全画面ターミナルに戻ります
+
+`Ctrl+Shift+F` は押すたびに「開いて一覧を操作 → ターミナルに居るときは一覧へフォーカス → 閉じる」と巡回します。
+`Esc` でいつでもターミナルに戻れます。
+
+### ファイル一覧の操作
+
+キーボードとマウス、どちらでも同じことができます。
+
+| したいこと | キーボード | マウス |
+|---|---|---|
+| 選択を移動 | `↑` `↓`（`PageUp/Down` `Home/End` も可） | — |
+| 一覧をスクロール | `↑` `↓`（自動追従） | ホイール |
+| フォルダに入る / ファイルを開く | `→` または `Enter` | クリック |
+| 親フォルダへ戻る | `←` または `Backspace` | `../` をクリック |
+| files ⇔ changes 切り替え | `Tab` | 切替行をクリック |
+| プレビューをスクロール | `PageUp` / `PageDown` | プレビュー上でホイール |
+| 開いたファイルを編集 | `e` | `[編集: nvim]` をクリック |
+| OS の既定アプリで開く | `o` | `[OSの既定アプリで開く]` をクリック |
+| ターミナルへ戻る | `Esc` | ターミナルをクリック |
+
+- 一覧のフォーカス中は選択行が反転表示され、最下行に操作ヒントが出ます。
+- フォーカス中に打った文字がシェルに流れることはありません。
+
+### 2つのモード：files と changes
+
+- **files** … いま居るフォルダのファイル一覧。フォルダを潜って探せます（シェルで `cd` すると一覧も付いてきます）。
+- **changes** … 作成・変更・削除されたファイルが新しい順に流れます。`NEW`（緑）/ `MOD`（黄）/ `DEL`（赤）のバッジ付き。
+  AI にコードや記事を書かせているとき、何が起きているかを一覧で把握できます。
+
+### プレビュー（右上）
+
+- Markdown（`.md`）は見出し・箇条書き・コードブロックを**整形表示**します。それ以外はテキスト表示。
+- 長い行は折り返し、`PageUp/Down` やホイールでスクロールできます。
+- **追従モード**（既定）では、AI やコマンドが最後に書き込んだファイルへ自動で切り替わり、追記が末尾に流れます。
+- ファイルを自分で選ぶと**ピン留め**（📌）され、勝手に切り替わらなくなります。
+  そのファイル自身への追記は反映され続けます。ヘッダの 📌 をクリックすると追従に戻ります。
+- **ターミナルに表示されたファイルパスはクリックできます**。
+  Claude Code の「`src/main.rs` を編集しました」のようなパスにマウスを載せると
+  手のカーソルに変わり、クリックでプレビューが開きます（URL は従来どおりブラウザ）。
+
+### プレビューから編集する
+
+`e`（または `[編集: nvim]` をクリック）で、**プレビュー枠がそのままエディタに変わります**。
+`:wq` で閉じると閲覧に戻り、編集後の内容が反映されています。
+
+- 使うエディタは `config.toml` の `editor` → 環境変数 `$EDITOR` → `nvim`（Windows は `notepad`）の順で決まります。
+- VSCode などの GUI エディタ派は `o`（OS の既定アプリで開く）が便利です。
+
+---
+
+## Claude Code と連携する
+
+ワークベンチは何もしなくてもファイルの変化を監視して changes に流しますが、
+`gt` コマンドを導入すると **Claude Code 自身から「どのツールで・どのファイルを触ったか」の正確な通知**を受け取れます。
+
+### 1. gt を置く（1回だけ）
+
+```sh
+install -m 755 assets/bin/gt ~/.local/bin/gt
+```
+
+（`~/.local/bin` が PATH に入っていることを確認してください）
+
+### 2. プロジェクトで hooks を設定する（プロジェクトごとに1回）
+
+Claude Code を使うプロジェクトのルートで:
+
+```sh
+gt init-hooks
+```
+
+`.claude/settings.local.json` にフック設定が書き込まれます。
+既にこのファイルがある場合は上書きせず、手動マージ用のスニペットを表示します。
+
+### 3. 使う
+
+そのプロジェクトで Claude Code が動くと:
+
+- サイドバーのヘッダに **`● claude MOD src/main.rs (Edit)`** のような作業中インジケータが出ます
+- changes 一覧に正確なイベントが流れます
+- プレビュー（追従モード）に、書き込み中のファイルの中身が流れます
+
+> 仕組み: フックはファイル内容をエスケープシーケンスに包んで端末に送ります（`docs/gt-protocol.md`）。
+> 受信内容は**表示専用**です。gototerm がディスクに書いたりコマンドを実行したりすることはありません。
+
+---
+
+## SSH 先で使う
+
+ワークベンチのファイル監視・一覧は手元のマシンを見るため、SSH 先の作業はそのままでは見えません。
+次の2つを SSH 先に置くと、**リモートの作業も手元のワークベンチに流れてきます**。
+（エスケープシーケンスは SSH を素通りするので、ポート転送などの設定は不要です）
+
+### cwd 追従（OSC 7）
+
+SSH 先のシェルに現在地を通知させます。`assets/shell-integration/` のスニペットを読み込むだけです。
+
+bash（`~/.bashrc` に追記）:
+
+```sh
+__gototerm_osc7() {
+    printf '\033]7;file://%s%s\033\\' "$HOSTNAME" "$PWD"
+}
+PROMPT_COMMAND="__gototerm_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+```
+
+zsh は `precmd`、fish は多くの環境で標準発行されます（`assets/shell-integration/osc7.zsh` / `osc7.fish` 参照）。
+
+これでリモート接続中はサイドバーが `host:path` 表示になり、手元のファイル一覧を誤って出さなくなります。
+
+### ファイルの中身を送る（gt）
+
+```sh
+scp assets/bin/gt remote:~/bin/gt
+ssh remote 'chmod +x ~/bin/gt'
+```
+
+SSH 先で:
+
+```sh
+gt view 記事.md      # このファイルの中身が、手元の右上プレビューに表示される
+gt init-hooks       # リモートの Claude Code の作業が、手元にリアルタイムで流れる
+```
 
 ---
 
 ## 設定マニュアル
 
-設定ファイルは **`~/.config/gototerm/config.toml`** です。自動生成されないので自分で作成します。
-同梱の [`config.example.toml`](./config.example.toml) をコピーするのが簡単です。
+設定ファイルは **`~/.config/gototerm/config.toml`**（Windows は `%APPDATA%\gototerm\config.toml`）です。
+自動生成されないので、同梱の [`config.example.toml`](./config.example.toml) をコピーして作ります。
 
 ```sh
 mkdir -p ~/.config/gototerm
@@ -113,13 +263,28 @@ fc-match -f '%{file}\n' 'JetBrainsMono Nerd Font'
 fc-match -f '%{file}\n' 'Noto Sans CJK JP'
 ```
 
-### 文字サイズ・その他
+### 基本設定
 
 ```toml
-font_size = 17                     # ピクセル。スケールに応じて調整。Ctrl+= / Ctrl+- でライブ変更も可
+font_size = 17                     # ピクセル。Ctrl+= / Ctrl+- でライブ変更も可
 shell = ["/usr/bin/fish"]          # 起動するシェル（省略時は $SHELL）
 east_asian_width_ambiguous = 1     # 曖昧幅文字を全角(2マス)扱いなら 1、半角扱いなら 0
 scroll_bar_width = 5               # スクロールバーの幅(px)。0 で非表示
+```
+
+### ワークベンチの設定
+
+```toml
+# [編集] で使うエディタ。空なら $EDITOR → nvim（Windows は notepad）の順で決まる。
+# 例: editor = ["nvim"] / ["vim"] / ["micro"] / ["helix"]
+# VSCode 等の GUI エディタ派は editor を設定せず [OSの既定アプリで開く] が簡単。
+editor = []
+
+sidebar_ratio = 0.25    # 左サイドバーの幅比率
+preview_ratio = 0.5     # 右側の上下分割比（上=プレビュー）
+
+# ファイル監視で無視するフォルダ名
+watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 ```
 
 ---
@@ -151,60 +316,19 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 | `color_bright_black` 〜 `color_bright_white` | 明るい 8 色 | Tokyo Night |
 | `scroll_bar_fg_color` / `scroll_bar_bg_color` | スクロールバー | Tokyo Night |
 
-別のテーマにしたいときは、必要なキーだけ上書きします（例：背景を透過させる）:
-
-```toml
-color_background = 0x1A1B26B0   # Tokyo Night の背景＋透過
-```
-
----
-
-## SSH・cwd 追従（OSC 7）
-
-gototerm は OSC 7 (`file://host/path`) を受け取ると、ペインの現在ディレクトリを追従します。
-`host` がローカルホストと異なる場合はリモート接続中として扱い、サイドバーはローカルファイルの監視・一覧を止めます。
-
-bash:
-
-```sh
-__gototerm_osc7() {
-    printf '\033]7;file://%s%s\033\\' "$HOSTNAME" "$PWD"
-}
-PROMPT_COMMAND="__gototerm_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
-```
-
-zsh:
-
-```sh
-__gototerm_osc7() {
-    printf '\033]7;file://%s%s\033\\' "$HOST" "$PWD"
-}
-autoload -Uz add-zsh-hook
-add-zsh-hook precmd __gototerm_osc7
-```
-
-fish は多くの環境で OSC 7 を標準発行します。発行されない場合は次を読み込んでください。
-
-```fish
-function __gototerm_osc7 --on-event fish_prompt
-    printf '\033]7;file://%s%s\033\\' (hostname) "$PWD"
-end
-```
-
-同じ内容のスニペットを `assets/shell-integration/osc7.bash`、
-`assets/shell-integration/osc7.zsh`、`assets/shell-integration/osc7.fish` に同梱しています。
-
 ---
 
 ## キー操作
 
 | キー | 動作 |
 |---|---|
+| `Ctrl + Shift + F` | ワークベンチ（開いて一覧へ → 一覧へフォーカス → 閉じる、の巡回） |
 | `Ctrl + =` / `Ctrl + -` | フォント拡大 / 縮小 |
 | `Ctrl + Shift + C` / `Ctrl + Shift + V` | コピー / ペースト |
-| `Ctrl + Shift + F` | サイドバー表示 / 非表示 |
 | `Ctrl + Shift + L` | スクロールバックの履歴を消去 |
 | `Shift + マウスホイール` | 履歴スクロール |
+
+ワークベンチ内の操作は[上の表](#ファイル一覧の操作)を参照してください。
 
 ### タブ
 
@@ -226,6 +350,8 @@ end
 | `Ctrl + Shift + Q` | 現在のペインを閉じる |
 | クリック | クリックしたペインにフォーカス |
 
+> 新しいペインは、元のペインのシェルが居た場所（cwd）で開きます。
+
 ---
 
 ## 対応・非対応
@@ -234,11 +360,13 @@ end
 - ✅ **完全な VT 互換**（alacritty_terminal エンジン採用）。nvim・Claude Code 等の
   高機能 TUI も正しく描画できる。SGR（RGB / 256 色）・Alternate Screen・
   Bracketed Paste・スクロールバック対応
-- ✅ タブ・画面分割（二分割を入れ子に。上のキー操作を参照）
+- ✅ タブ・画面分割・**3分割ワークベンチ**（ファイル一覧・プレビュー・AI作業の見える化）
 - ✅ **Sixel 画像表示**（yazi のプレビュー・アルバムアートなど。`?62;4c` で対応申告）
+- ✅ Linux（Wayland）/ Windows で動作
 - ⚠️ kitty graphics protocol は未対応（画像は Sixel のみ）
 - ⚠️ 画像はスクロールに追従しない（全画面 TUI での絶対配置は問題なし）
-- ⚠️ Linux で動作（Windows 対応は作業中）
+- ⚠️ Windows は背景の透過に未対応
+- ⚠️ Windows ローカルの cwd 追従はシェル統合（OSC 7）の導入が必要（`/proc` が無いため）
 
 ---
 

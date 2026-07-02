@@ -63,6 +63,18 @@ impl FilePreview {
         self.request_read(abs_path, display_path, false);
     }
 
+    pub fn set_memory_content(&mut self, display_path: PathBuf, bytes: Vec<u8>) {
+        self.target = Some(display_path);
+        self.target_abs = None;
+        self.pending = None;
+        self.queued = None;
+        self.content = if looks_binary(&bytes) {
+            PreviewContent::Binary
+        } else {
+            PreviewContent::Text(tail_lines(&bytes, usize::MAX))
+        };
+    }
+
     pub fn refresh_current(&mut self) {
         if let (Some(abs_path), Some(display_path)) = (&self.target_abs, &self.target) {
             self.request_read(abs_path.clone(), display_path.clone(), true);

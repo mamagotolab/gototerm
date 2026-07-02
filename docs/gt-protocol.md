@@ -34,10 +34,10 @@ ESC ] 7717 ; <type> ; <key>=<value> ; ... [; data=<base64>] (BEL | ESC \)
 
 | type | 意味 | キー |
 |---|---|---|
-| `event` | ファイル変更イベント | `kind=new\|mod\|del`、`path=<base64のパス>` |
+| `event` | ファイル変更イベント | `kind=new\|mod\|del`、`path=<base64のパス>`、任意で `tool=<base64のツール名>` |
 | `file` | ファイル内容のチャンク | `path=<base64>`、`seq=<0始まり>`、`last=0\|1`、`data=<base64>` |
 
-- パスは base64（`;` や非ASCIIを含み得るため）。内容チャンクは **生データ8KBまで**を base64 化。
+- パスと `tool` は base64（`;` や非ASCIIを含み得るため）。内容チャンクは **生データ8KBまで**を base64 化。
 - `seq=0` が新しい転送の開始（前の未完了転送は破棄）。`last=1` で完結し表示に反映。
 - 内容は送り手側で**末尾64KBに切ってから**送る（ローカルプレビューと同じ上限）。
 - 受信側の防御：1メッセージ最大1MBでそれ以上は破棄・不正な base64/欠落キーは黙って捨てる・
@@ -48,7 +48,7 @@ ESC ] 7717 ; <type> ; <key>=<value> ; ... [; data=<base64>] (BEL | ESC \)
 `gt`（POSIX sh・依存は base64/dd 程度・/dev/tty へ書く）:
 
 - `gt view <file>` … 末尾64KBを file メッセージで送出（手動プレビュー）
-- `gt event <kind> <path>` … event メッセージ送出
+- `gt event <kind> <path> [tool]` … event メッセージ送出
 - `gt hook` … Claude Code の PostToolUse フックから呼ぶ。stdin の JSON から
   file_path を取り、event＋file を送出（hooks の stdout は Claude Code に食われるので
   必ず /dev/tty へ書く）

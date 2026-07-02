@@ -1,6 +1,7 @@
 mod cache;
 mod config;
 mod font;
+mod gt;
 mod preview;
 mod reader;
 mod sidebar;
