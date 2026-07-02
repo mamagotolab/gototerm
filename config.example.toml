@@ -32,10 +32,10 @@ fonts_faint = [
 # 起動後に Ctrl+= / Ctrl+- でライブ調整も可能。
 font_size = 17
 
-# 右サイドバーの幅比率。Ctrl+Shift+F で表示したときだけ使われます。
-sidebar_ratio = 0.30
+# ワークベンチ左サイドバーの幅比率。Ctrl+Shift+F で表示したときだけ使われます。
+sidebar_ratio = 0.25
 
-# ファイルを開いた Reader 表示中の右サイドバー幅比率。
+# ワークベンチ右側の上下分割比（上=プレビュー）。
 preview_ratio = 0.50
 
 # サイドバーの changed files 監視で無視するパス構成要素。

@@ -18,6 +18,7 @@ use winit::{
 };
 
 use crate::config::resolve_editor;
+use crate::reader::{ReaderHeaderAction, ReaderPane, ReaderRequest};
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::terminal::{Cell, Color, Line};
 use crate::view::{TerminalView, Viewport};
@@ -56,7 +57,6 @@ enum Action {
     SplitVertical,
     SplitHorizontal,
     ToggleSidebar,
-    FocusSidebar,
     Focus(Dir),
 }
 
@@ -115,19 +115,23 @@ fn split_viewport(partition: Partition, ratio: f64, vp: Viewport) -> (Viewport, 
     }
 }
 
-/// サイドバー表示中だけ、タブバーを除いた領域の右側をサイドバーに割り当てる。
-fn content_and_sidebar_viewport(
-    vp: Viewport,
-    sidebar_visible: bool,
-    sidebar_ratio: f64,
-) -> (Viewport, Option<Viewport>) {
-    if !sidebar_visible {
-        return (vp, None);
-    }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct WorkbenchViewports {
+    sidebar: Viewport,
+    preview: Viewport,
+    terminal: Viewport,
+}
 
-    let ratio = (1.0 - sidebar_ratio).clamp(0.0, 1.0);
-    let (content, sidebar) = split_viewport(Partition::Vertical, ratio, vp);
-    (content, Some(sidebar))
+/// ワークベンチ表示中だけ、タブバー下を左一覧・右上プレビュー・右下端末に分ける。
+fn workbench_viewports(vp: Viewport, sidebar_ratio: f64, preview_ratio: f64) -> WorkbenchViewports {
+    let (sidebar, right) = split_viewport(Partition::Vertical, sidebar_ratio.clamp(0.0, 1.0), vp);
+    let (preview, terminal) =
+        split_viewport(Partition::Horizontal, preview_ratio.clamp(0.0, 1.0), right);
+    WorkbenchViewports {
+        sidebar,
+        preview,
+        terminal,
+    }
 }
 
 fn command_exists(command: &str) -> bool {
@@ -477,31 +481,53 @@ mod tests {
             w: 300,
             h: 200,
         };
-        let (content, sidebar) = content_and_sidebar_viewport(vp, false, 0.30);
 
-        assert_eq!(content, vp);
-        assert_eq!(sidebar, None);
+        assert_eq!(vp.x, 5);
+        assert_eq!(vp.y, 7);
+        assert_eq!(vp.w, 300);
+        assert_eq!(vp.h, 200);
     }
 
     #[test]
-    fn visible_sidebar_uses_right_side_after_gap() {
+    fn workbench_layout_uses_left_sidebar_and_right_preview_terminal() {
         let vp = Viewport {
             x: 0,
             y: 20,
             w: 1000,
             h: 700,
         };
-        let (content, sidebar) = content_and_sidebar_viewport(vp, true, 0.30);
-        let sidebar = sidebar.expect("sidebar viewport");
+        let layout = workbench_viewports(vp, 0.25, 0.5);
 
-        assert_eq!(content.x, 0);
-        assert_eq!(content.y, 20);
-        assert_eq!(content.h, 700);
-        assert_eq!(content.w, 700 - GAP);
-        assert_eq!(sidebar.x, 700 + GAP);
-        assert_eq!(sidebar.y, 20);
-        assert_eq!(sidebar.w, 1000 - 700 - GAP);
-        assert_eq!(sidebar.h, 700);
+        assert_eq!(layout.sidebar.x, 0);
+        assert_eq!(layout.sidebar.y, 20);
+        assert_eq!(layout.sidebar.w, 250 - GAP);
+        assert_eq!(layout.sidebar.h, 700);
+
+        assert_eq!(layout.preview.x, 250 + GAP);
+        assert_eq!(layout.preview.y, 20);
+        assert_eq!(layout.preview.w, 1000 - 250 - GAP);
+        assert_eq!(layout.preview.h, 350 - GAP);
+
+        assert_eq!(layout.terminal.x, 250 + GAP);
+        assert_eq!(layout.terminal.y, 20 + 350 + GAP);
+        assert_eq!(layout.terminal.w, 1000 - 250 - GAP);
+        assert_eq!(layout.terminal.h, 700 - 350 - GAP);
+    }
+
+    #[test]
+    fn workbench_layout_clamps_ratios() {
+        let vp = Viewport {
+            x: 0,
+            y: 0,
+            w: 100,
+            h: 80,
+        };
+        let layout = workbench_viewports(vp, 2.0, -1.0);
+
+        assert_eq!(layout.sidebar.w, 100 - GAP);
+        assert_eq!(layout.sidebar.y, 0);
+        assert_eq!(layout.preview.h, 0);
+        assert_eq!(layout.terminal.h, 80 - GAP);
     }
 }
 
@@ -515,6 +541,81 @@ impl SplitNode {
     }
 }
 
+enum PreviewSlot {
+    Reader(ReaderPane),
+    Editor {
+        win: Box<TerminalWindow>,
+        saved: Box<ReaderPane>,
+    },
+    Empty,
+}
+
+impl PreviewSlot {
+    fn reader_mut(&mut self) -> Option<&mut ReaderPane> {
+        match self {
+            PreviewSlot::Reader(reader) => Some(reader),
+            PreviewSlot::Editor { saved, .. } => Some(saved),
+            PreviewSlot::Empty => None,
+        }
+    }
+
+    fn visible_reader_mut(&mut self) -> Option<&mut ReaderPane> {
+        match self {
+            PreviewSlot::Reader(reader) => Some(reader),
+            _ => None,
+        }
+    }
+
+    fn editor_mut(&mut self) -> Option<&mut TerminalWindow> {
+        match self {
+            PreviewSlot::Editor { win, .. } => Some(win),
+            _ => None,
+        }
+    }
+
+    fn contains(&self, p: PhysicalPosition<f64>) -> bool {
+        match self {
+            PreviewSlot::Reader(reader) => reader.contains(p),
+            PreviewSlot::Editor { win, .. } => win.viewport().contains(p),
+            PreviewSlot::Empty => false,
+        }
+    }
+
+    fn set_viewport(&mut self, viewport: Viewport) {
+        match self {
+            PreviewSlot::Reader(reader) => reader.set_viewport(viewport),
+            PreviewSlot::Editor { win, saved } => {
+                win.set_viewport(viewport);
+                saved.set_viewport(viewport);
+            }
+            PreviewSlot::Empty => {}
+        }
+    }
+
+    fn draw(&mut self, surface: &mut glium::Frame) {
+        match self {
+            PreviewSlot::Reader(reader) => reader.draw(surface),
+            PreviewSlot::Editor { win, .. } => win.draw(surface),
+            PreviewSlot::Empty => {}
+        }
+    }
+
+    fn needs_redraw(&self) -> bool {
+        match self {
+            PreviewSlot::Reader(reader) => reader.needs_redraw(),
+            PreviewSlot::Editor { win, .. } => win.needs_redraw(),
+            PreviewSlot::Empty => false,
+        }
+    }
+
+    fn check_update(&mut self) -> bool {
+        let PreviewSlot::Editor { win, .. } = self else {
+            return false;
+        };
+        win.check_update()
+    }
+}
+
 pub struct Multiplexer {
     window: Rc<Window>,
     display: Display,
@@ -522,6 +623,8 @@ pub struct Multiplexer {
     status_view: TerminalView,
     sidebar: Sidebar,
     sidebar_focused: bool,
+    preview_slot: PreviewSlot,
+    editor_focused: bool,
     tabs: Vec<Node>,
     focus: usize,
     modifiers: ModifiersState,
@@ -555,6 +658,7 @@ impl Multiplexer {
             None,
         );
         let sidebar = Sidebar::new(display.clone(), viewport);
+        let preview_slot = PreviewSlot::Reader(ReaderPane::new(display.clone(), viewport));
 
         // 最初のタブ（1枚なのでタブバーは出ない＝全面が端末）。
         let first = Node::Leaf(Box::new(TerminalWindow::with_viewport(
@@ -571,6 +675,8 @@ impl Multiplexer {
             status_view,
             sidebar,
             sidebar_focused: false,
+            preview_slot,
+            editor_focused: false,
             tabs: vec![first],
             focus: 0,
             modifiers: ModifiersState::empty(),
@@ -622,14 +728,18 @@ impl Multiplexer {
         };
         self.status_view.set_viewport(bar);
 
-        let (cvp, sidebar_vp) = content_and_sidebar_viewport(
-            self.content_viewport(),
-            self.sidebar.is_visible(),
-            self.sidebar.current_ratio(),
-        );
-        if let Some(sidebar_vp) = sidebar_vp {
-            self.sidebar.set_viewport(sidebar_vp);
-        }
+        let cvp = if self.sidebar.is_visible() {
+            let viewports = workbench_viewports(
+                self.content_viewport(),
+                crate::TOYTERM_CONFIG.sidebar_ratio,
+                crate::TOYTERM_CONFIG.preview_ratio,
+            );
+            self.sidebar.set_viewport(viewports.sidebar);
+            self.preview_slot.set_viewport(viewports.preview);
+            viewports.terminal
+        } else {
+            self.content_viewport()
+        };
         for tab in &mut self.tabs {
             tab.set_viewport(cvp);
         }
@@ -703,7 +813,6 @@ impl Multiplexer {
             (true, KeyCode::KeyE) => Action::SplitVertical,
             (true, KeyCode::KeyO) => Action::SplitHorizontal,
             (true, KeyCode::KeyF) => Action::ToggleSidebar,
-            (true, KeyCode::KeyB) => Action::FocusSidebar,
             // フォーカス移動
             (true, KeyCode::ArrowUp) => Action::Focus(Dir::Up),
             (true, KeyCode::ArrowDown) => Action::Focus(Dir::Down),
@@ -780,22 +889,24 @@ impl Multiplexer {
                 self.tabs[self.focus].move_focus(dir);
             }
 
+            // 1キーで3状態を回す：非表示→開いてフォーカス／表示中(端末フォーカス)→
+            // サイドバーへフォーカス／サイドバーフォーカス中→閉じて端末へ。
+            // 旧 Ctrl+Shift+B（フォーカスのみ）はこのサイクルに統合した。
             Action::ToggleSidebar => {
-                let location = self.focused_location();
-                self.sidebar.toggle(&location);
-                if !self.sidebar.is_visible() {
-                    self.release_sidebar_focus();
-                }
-                self.refresh_layout();
-            }
-
-            Action::FocusSidebar => {
                 if !self.sidebar.is_visible() {
                     let location = self.focused_location();
                     self.sidebar.toggle(&location);
                     self.refresh_layout();
+                    self.focus_sidebar();
+                } else if !self.sidebar_focused {
+                    self.focus_sidebar();
+                } else {
+                    let location = self.focused_location();
+                    self.sidebar.toggle(&location);
+                    self.release_sidebar_focus();
+                    self.release_editor_focus();
+                    self.refresh_layout();
                 }
-                self.focus_sidebar();
             }
         }
     }
@@ -804,7 +915,14 @@ impl Multiplexer {
         if !self.sidebar.is_visible() || self.sidebar_focused {
             return;
         }
-        self.focused_root().focused_leaf_mut().focus_changed(false);
+        if self.editor_focused {
+            if let Some(editor) = self.preview_slot.editor_mut() {
+                editor.focus_changed(false);
+            }
+            self.editor_focused = false;
+        } else {
+            self.focused_root().focused_leaf_mut().focus_changed(false);
+        }
         self.sidebar_focused = true;
         self.sidebar.set_focused(true);
     }
@@ -816,6 +934,33 @@ impl Multiplexer {
         }
         self.sidebar_focused = false;
         self.sidebar.set_focused(false);
+        self.focused_root().focused_leaf_mut().focus_changed(true);
+    }
+
+    fn focus_editor(&mut self) {
+        if !self.sidebar.is_visible() || self.editor_focused {
+            return;
+        }
+        if self.sidebar_focused {
+            self.sidebar_focused = false;
+            self.sidebar.set_focused(false);
+        } else {
+            self.focused_root().focused_leaf_mut().focus_changed(false);
+        }
+        if let Some(editor) = self.preview_slot.editor_mut() {
+            editor.focus_changed(true);
+            self.editor_focused = true;
+        }
+    }
+
+    fn release_editor_focus(&mut self) {
+        if !self.editor_focused {
+            return;
+        }
+        if let Some(editor) = self.preview_slot.editor_mut() {
+            editor.focus_changed(false);
+        }
+        self.editor_focused = false;
         self.focused_root().focused_leaf_mut().focus_changed(true);
     }
 
@@ -842,38 +987,89 @@ impl Multiplexer {
             self.sidebar.toggle(&location);
             self.refresh_layout();
         }
-        self.sidebar.preview_pinned(&path);
+        let root = self.sidebar.root().map(Path::to_path_buf);
+        if let Some(reader) = self.preview_slot.reader_mut() {
+            reader.preview_pinned(&path, root.as_deref());
+        }
         self.refresh_layout();
     }
 
     fn handle_sidebar_request(&mut self, request: SidebarRequest) {
         match request {
-            SidebarRequest::EditFile(path) => {
-                let env_editor = std::env::var("EDITOR").ok();
-                let mut command =
-                    resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
-                if !command_exists(&command[0]) {
-                    self.sidebar.show_missing_editor(&command[0]);
-                    return;
+            SidebarRequest::PreviewFile(path) => {
+                let root = self.sidebar.root().map(Path::to_path_buf);
+                if let Some(reader) = self.preview_slot.reader_mut() {
+                    reader.preview_pinned(&path, root.as_deref());
                 }
-                command.push(path.to_string_lossy().into_owned());
-
-                let window = self.window.clone();
-                let display = self.display.clone();
-                self.tabs[self.focus].split_focused(
-                    Partition::Horizontal,
-                    &window,
-                    &display,
-                    Some(&command),
-                );
             }
-            SidebarRequest::OpenWithSystem(path) => {
-                crate::window::open_url(&path.to_string_lossy());
+            SidebarRequest::ScrollPreview(delta) => {
+                if let Some(reader) = self.preview_slot.reader_mut() {
+                    reader.scroll_by(delta);
+                }
             }
-            SidebarRequest::RefreshLayout => {
-                self.refresh_layout();
+            SidebarRequest::EditPreview => {
+                if let Some(request) = self
+                    .preview_slot
+                    .reader_mut()
+                    .and_then(|reader| reader.on_header_key(ReaderHeaderAction::Edit))
+                {
+                    self.handle_reader_request(request);
+                }
+            }
+            SidebarRequest::OpenPreview => {
+                if let Some(request) = self
+                    .preview_slot
+                    .reader_mut()
+                    .and_then(|reader| reader.on_header_key(ReaderHeaderAction::OpenWithSystem))
+                {
+                    self.handle_reader_request(request);
+                }
             }
         }
+    }
+
+    fn handle_reader_request(&mut self, request: ReaderRequest) {
+        match request {
+            ReaderRequest::EditFile(path) => self.open_editor_in_preview(path),
+            ReaderRequest::OpenWithSystem(path) => crate::window::open_url(&path.to_string_lossy()),
+        }
+    }
+
+    fn open_editor_in_preview(&mut self, path: std::path::PathBuf) {
+        let env_editor = std::env::var("EDITOR").ok();
+        let mut command = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
+        if !command_exists(&command[0]) {
+            if let Some(reader) = self.preview_slot.reader_mut() {
+                reader.show_missing_editor(&command[0]);
+            }
+            return;
+        }
+        command.push(path.to_string_lossy().into_owned());
+
+        let viewport = match &self.preview_slot {
+            PreviewSlot::Reader(reader) => reader.viewport(),
+            PreviewSlot::Editor { win, .. } => win.viewport(),
+            PreviewSlot::Empty => self.content_viewport(),
+        };
+        let cwd = path.parent().map(Path::to_path_buf);
+        let saved = match std::mem::replace(&mut self.preview_slot, PreviewSlot::Empty) {
+            PreviewSlot::Reader(reader) => Box::new(reader),
+            PreviewSlot::Editor { saved, .. } => saved,
+            PreviewSlot::Empty => return,
+        };
+        let mut win = Box::new(TerminalWindow::with_viewport_command(
+            self.window.clone(),
+            self.display.clone(),
+            viewport,
+            cwd.as_deref(),
+            Some(&command),
+        ));
+        win.focus_changed(true);
+        self.focused_root().focused_leaf_mut().focus_changed(false);
+        self.sidebar_focused = false;
+        self.sidebar.set_focused(false);
+        self.editor_focused = true;
+        self.preview_slot = PreviewSlot::Editor { win, saved };
     }
 
     /// 今このフレームを描画してよいか。最小化中（またはサイズ0）は描かない。
@@ -1007,6 +1203,9 @@ impl Multiplexer {
                         self.status_view.draw(&mut surface);
                     }
                     self.tabs[self.focus].draw(&mut surface);
+                    if self.sidebar.is_visible() {
+                        self.preview_slot.draw(&mut surface);
+                    }
                     self.sidebar.draw(&mut surface);
 
                     surface.finish().expect("finish");
@@ -1046,12 +1245,16 @@ impl Multiplexer {
                     }
                     if let Some(action) = self.parse_shortcut(key) {
                         self.handle_action(action);
-                        if self.sidebar_focused && !matches!(action, Action::FocusSidebar) {
+                        if self.sidebar_focused && !matches!(action, Action::ToggleSidebar) {
                             self.focused_root().focused_leaf_mut().focus_changed(false);
                         }
                     } else if self.sidebar_focused {
                         let result = self.sidebar.on_key(key);
                         self.handle_sidebar_key_result(result);
+                    } else if self.editor_focused {
+                        if let Some(editor) = self.preview_slot.editor_mut() {
+                            editor.process_window_event(wev);
+                        }
                     } else {
                         self.focused_root()
                             .focused_leaf_mut()
@@ -1077,10 +1280,25 @@ impl Multiplexer {
                         }
                         return;
                     }
+                    if self.sidebar.is_visible() && self.preview_slot.contains(self.cursor_pos) {
+                        if self.preview_slot.editor_mut().is_some() {
+                            self.focus_editor();
+                            if let Some(editor) = self.preview_slot.editor_mut() {
+                                editor.process_window_event(wev);
+                            }
+                        } else if let Some(reader) = self.preview_slot.visible_reader_mut() {
+                            if let Some(request) = reader.on_click(self.cursor_pos) {
+                                self.handle_reader_request(request);
+                            }
+                        }
+                        return;
+                    }
                     // クリックしたペインへフォーカスを移してから入力を渡す。
                     let p = self.cursor_pos;
                     if self.sidebar_focused {
                         self.release_sidebar_focus();
+                    } else if self.editor_focused {
+                        self.release_editor_focus();
                     } else {
                         self.focused_root().focused_leaf_mut().focus_changed(false);
                     }
@@ -1102,6 +1320,21 @@ impl Multiplexer {
                             }
                         };
                         self.sidebar.on_scroll(rows);
+                    } else if self.sidebar.is_visible()
+                        && self.preview_slot.contains(self.cursor_pos)
+                    {
+                        if let Some(reader) = self.preview_slot.visible_reader_mut() {
+                            let rows = match delta {
+                                MouseScrollDelta::LineDelta(_, y) => (*y * 1.5).trunc() as i32,
+                                MouseScrollDelta::PixelDelta(pos) => {
+                                    let cell_h = reader.cell_height();
+                                    (pos.y / cell_h.max(1) as f64).trunc() as i32
+                                }
+                            };
+                            reader.on_scroll(rows);
+                        } else if let Some(editor) = self.preview_slot.editor_mut() {
+                            editor.process_window_event(wev);
+                        }
                     } else {
                         self.focused_root()
                             .focused_leaf_mut()
@@ -1109,16 +1342,31 @@ impl Multiplexer {
                     }
                 }
 
-                WindowEvent::MouseInput { .. } if self.sidebar.contains(self.cursor_pos) => {}
+                WindowEvent::MouseInput { .. }
+                    if self.sidebar.contains(self.cursor_pos)
+                        || (self.sidebar.is_visible()
+                            && self.preview_slot.contains(self.cursor_pos)) => {}
 
                 WindowEvent::Ime(_) if self.sidebar_focused => {}
 
+                WindowEvent::Ime(_) if self.editor_focused => {
+                    if let Some(editor) = self.preview_slot.editor_mut() {
+                        editor.process_window_event(wev);
+                    }
+                }
+
                 // フォーカス・IME・マウス離し等はフォーカス中ペインへ。
                 _ => {
-                    self.focused_root()
-                        .focused_leaf_mut()
-                        .process_window_event(wev);
-                    self.handle_clicked_file();
+                    if self.editor_focused {
+                        if let Some(editor) = self.preview_slot.editor_mut() {
+                            editor.process_window_event(wev);
+                        }
+                    } else {
+                        self.focused_root()
+                            .focused_leaf_mut()
+                            .process_window_event(wev);
+                        self.handle_clicked_file();
+                    }
                 }
             },
 
@@ -1165,6 +1413,18 @@ impl Multiplexer {
                     self.update_status_bar();
                 }
 
+                if self.sidebar.is_visible() && self.preview_slot.check_update() {
+                    if let PreviewSlot::Editor { mut saved, .. } =
+                        std::mem::replace(&mut self.preview_slot, PreviewSlot::Empty)
+                    {
+                        saved.refresh_current();
+                        self.preview_slot = PreviewSlot::Reader(*saved);
+                        self.editor_focused = false;
+                        self.focused_root().focused_leaf_mut().focus_changed(true);
+                        self.refresh_layout();
+                    }
+                }
+
                 // カーソル点滅：530ms ごとに表示/非表示を切り替える。フェーズが
                 // 変わったフレームだけ set_cursor_blink で再描画を促す（毎フレーム
                 // 描かないので CPU を無駄に回さない）。
@@ -1181,13 +1441,27 @@ impl Multiplexer {
                 if self.sidebar.is_visible() {
                     let location = self.focused_location();
                     self.sidebar.refresh_if_stale(&location);
+                    let root = self.sidebar.root().map(Path::to_path_buf);
+                    if let Some(path) = self.sidebar.take_follow_target() {
+                        if let Some(reader) = self.preview_slot.reader_mut() {
+                            if reader.is_following() {
+                                reader.follow_target(path, root.as_deref());
+                            } else if reader.target_abs() == Some(path.as_path()) {
+                                reader.refresh_current();
+                            }
+                        }
+                    }
+                    if let Some(reader) = self.preview_slot.reader_mut() {
+                        reader.poll();
+                    }
                 }
 
                 // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。
                 // 内容更新自体は上で汲み取り済みなので、再表示時にまとめて描ける。
                 let need = self.tabs[self.focus].needs_redraw()
                     || (self.status_bar_height() > 0 && self.status_view.needs_redraw())
-                    || self.sidebar.needs_redraw();
+                    || self.sidebar.needs_redraw()
+                    || (self.sidebar.is_visible() && self.preview_slot.needs_redraw());
                 if need && !self.occluded && self.drawable() {
                     self.window.request_redraw();
                 }

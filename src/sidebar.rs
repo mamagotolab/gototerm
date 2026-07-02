@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use unicode_width::UnicodeWidthChar;
 use winit::{
     dpi::PhysicalPosition,
@@ -10,8 +9,6 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
-use crate::config::resolve_editor;
-use crate::preview::{FilePreview, PreviewLines};
 use crate::terminal::{Cell, Color, GraphicAttribute, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::vt::ShellLocation;
@@ -29,13 +26,7 @@ pub struct Sidebar {
     info: Option<WorkspaceInfo>,
     last_refresh: Instant,
     changes: Vec<FileChange>,
-    preview: FilePreview,
-    pinned: bool,
     mode: SidebarMode,
-    sidebar_view: SidebarView,
-    reader_scroll: usize,
-    reader_lines: Vec<StyledLine>,
-    reader_notice: Option<String>,
     browse_dir: PathBuf,
     browse_entries: Vec<(String, bool)>,
     browse_pending: Option<(PathBuf, Receiver<Result<Vec<(String, bool)>, String>>)>,
@@ -51,6 +42,7 @@ pub struct Sidebar {
     watcher_root: Option<PathBuf>,
     watch_failed: bool,
     remote_location: Option<(String, PathBuf)>,
+    follow_target: Option<PathBuf>,
 }
 
 impl Sidebar {
@@ -66,13 +58,7 @@ impl Sidebar {
             info: None,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
             changes: Vec::new(),
-            preview: FilePreview::new(),
-            pinned: false,
             mode: SidebarMode::Files,
-            sidebar_view: SidebarView::List,
-            reader_scroll: 0,
-            reader_lines: Vec::new(),
-            reader_notice: None,
             browse_dir: PathBuf::new(),
             browse_entries: Vec::new(),
             browse_pending: None,
@@ -86,6 +72,7 @@ impl Sidebar {
             watcher_root: None,
             watch_failed: false,
             remote_location: None,
+            follow_target: None,
         }
     }
 
@@ -148,10 +135,6 @@ impl Sidebar {
             return SidebarKeyResult::ReleaseFocus;
         }
 
-        if self.sidebar_view == SidebarView::Reader {
-            return self.on_reader_key(code);
-        }
-
         self.on_list_key(code)
     }
 
@@ -171,23 +154,7 @@ impl Sidebar {
                 self.set_browse_dir(path);
                 None
             }
-            RowAction::PreviewFile(path) => {
-                self.preview_pinned(&path);
-                Some(SidebarRequest::RefreshLayout)
-            }
-            RowAction::Unpin => {
-                self.unpin();
-                None
-            }
-            RowAction::EditFile(path) => Some(SidebarRequest::EditFile(path)),
-            RowAction::CloseReader => {
-                self.sidebar_view = SidebarView::List;
-                self.reader_scroll = 0;
-                self.reader_notice = None;
-                self.rebuild();
-                Some(SidebarRequest::RefreshLayout)
-            }
-            RowAction::OpenWithSystem(path) => Some(SidebarRequest::OpenWithSystem(path)),
+            RowAction::PreviewFile(path) => Some(SidebarRequest::PreviewFile(path)),
         }
     }
 
@@ -201,14 +168,12 @@ impl Sidebar {
                 self.move_list_selection(1);
                 SidebarKeyResult::Consumed
             }
-            KeyCode::PageUp => {
-                self.move_list_selection(-(self.list_page_step() as isize));
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::PageDown => {
-                self.move_list_selection(self.list_page_step() as isize);
-                SidebarKeyResult::Consumed
-            }
+            KeyCode::PageUp => SidebarKeyResult::Request(SidebarRequest::ScrollPreview(
+                -(self.list_page_step() as isize),
+            )),
+            KeyCode::PageDown => SidebarKeyResult::Request(SidebarRequest::ScrollPreview(
+                self.list_page_step() as isize,
+            )),
             KeyCode::Home => {
                 self.set_list_selection(0);
                 SidebarKeyResult::Consumed
@@ -218,7 +183,8 @@ impl Sidebar {
                 self.set_list_selection(last);
                 SidebarKeyResult::Consumed
             }
-            KeyCode::Enter => self
+            // → は Enter と同義（yazi/ranger 流儀: ←で戻る/→で進む）。
+            KeyCode::Enter | KeyCode::ArrowRight => self
                 .selected_row_action()
                 .and_then(|action| self.run_row_action(action))
                 .map_or(SidebarKeyResult::Consumed, SidebarKeyResult::Request),
@@ -234,59 +200,14 @@ impl Sidebar {
                 self.run_row_action(RowAction::ToggleMode);
                 SidebarKeyResult::Consumed
             }
-            _ => SidebarKeyResult::Consumed,
-        }
-    }
-
-    fn on_reader_key(&mut self, code: KeyCode) -> SidebarKeyResult {
-        match code {
-            KeyCode::ArrowUp => {
-                self.scroll_reader_by(-1);
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::ArrowDown => {
-                self.scroll_reader_by(1);
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::PageUp => {
-                self.scroll_reader_by(-(self.reader_body_slots() as isize));
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::PageDown => {
-                self.scroll_reader_by(self.reader_body_slots() as isize);
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::Home => {
-                self.set_reader_scroll(0);
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::End => {
-                let max = reader_scroll_max(self.reader_lines.len(), self.reader_body_slots());
-                self.set_reader_scroll(max);
-                SidebarKeyResult::Consumed
-            }
-            KeyCode::Backspace | KeyCode::ArrowLeft => self
-                .run_row_action(RowAction::CloseReader)
-                .map_or(SidebarKeyResult::Consumed, SidebarKeyResult::Request),
-            KeyCode::KeyE => self
-                .reader_action(|action| matches!(action, RowAction::EditFile(_)))
-                .and_then(|action| self.run_row_action(action))
-                .map_or(SidebarKeyResult::Consumed, SidebarKeyResult::Request),
-            KeyCode::KeyO => self
-                .reader_action(|action| matches!(action, RowAction::OpenWithSystem(_)))
-                .and_then(|action| self.run_row_action(action))
-                .map_or(SidebarKeyResult::Consumed, SidebarKeyResult::Request),
+            KeyCode::KeyE => SidebarKeyResult::Request(SidebarRequest::EditPreview),
+            KeyCode::KeyO => SidebarKeyResult::Request(SidebarRequest::OpenPreview),
             _ => SidebarKeyResult::Consumed,
         }
     }
 
     pub fn on_scroll(&mut self, delta: i32) {
         if !self.visible || delta == 0 {
-            return;
-        }
-
-        if self.sidebar_view == SidebarView::Reader {
-            self.scroll_reader_by(-(delta as isize));
             return;
         }
 
@@ -305,24 +226,6 @@ impl Sidebar {
         let clamped = clamp_browse_scroll(next, self.browse_entries.len(), visible);
         if clamped != self.browse_scroll {
             self.browse_scroll = clamped.min(max);
-            self.rebuild();
-        }
-    }
-
-    fn scroll_reader_by(&mut self, delta: isize) {
-        let next = if delta.is_negative() {
-            self.reader_scroll.saturating_sub(delta.unsigned_abs())
-        } else {
-            self.reader_scroll.saturating_add(delta as usize)
-        };
-        self.set_reader_scroll(next);
-    }
-
-    fn set_reader_scroll(&mut self, offset: usize) {
-        let clamped =
-            clamp_reader_scroll(offset, self.reader_lines.len(), self.reader_body_slots());
-        if clamped != self.reader_scroll {
-            self.reader_scroll = clamped;
             self.rebuild();
         }
     }
@@ -408,55 +311,18 @@ impl Sidebar {
         }
     }
 
-    fn reader_action(&self, predicate: impl Fn(&RowAction) -> bool) -> Option<RowAction> {
-        self.row_actions
-            .iter()
-            .flatten()
-            .find(|action| predicate(action))
-            .cloned()
+    pub fn take_follow_target(&mut self) -> Option<PathBuf> {
+        self.follow_target.take()
     }
 
-    pub fn preview_pinned(&mut self, abs_path: &Path) {
-        let display_path = self
-            .watcher_root
+    pub fn root(&self) -> Option<&Path> {
+        self.watcher_root
             .as_deref()
             .or_else(|| self.info.as_ref().map(|info| info.cwd.as_path()))
-            .and_then(|root| abs_path.strip_prefix(root).ok())
-            .filter(|path| !path.as_os_str().is_empty())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| abs_path.to_path_buf());
-
-        self.pinned = true;
-        self.sidebar_view = SidebarView::Reader;
-        self.reader_scroll = 0;
-        self.reader_notice = None;
-        self.preview
-            .set_target_abs(abs_path.to_path_buf(), display_path);
-        self.refresh_reader_document();
-        self.rebuild();
-    }
-
-    pub fn current_ratio(&self) -> f64 {
-        if self.sidebar_view == SidebarView::Reader {
-            crate::TOYTERM_CONFIG.preview_ratio
-        } else {
-            crate::TOYTERM_CONFIG.sidebar_ratio
-        }
-    }
-
-    pub fn show_missing_editor(&mut self, command: &str) {
-        self.reader_notice = Some(format!(
-            " （編集コマンドが見つかりません: {command}。config.toml の editor で設定できます）"
-        ));
-        self.refresh_reader_document();
-        self.rebuild();
     }
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.view.set_viewport(viewport);
-        if self.sidebar_view == SidebarView::Reader {
-            self.refresh_reader_document();
-        }
         self.rebuild();
     }
 
@@ -485,10 +351,6 @@ impl Sidebar {
             return;
         }
         let mut changed = self.drain_watcher(cwd);
-        if self.preview.poll() {
-            self.refresh_reader_document();
-            changed = true;
-        }
         if self.poll_browse_dir() {
             changed = true;
         }
@@ -534,19 +396,14 @@ impl Sidebar {
         self.watcher_root = None;
         self.watch_failed = false;
         self.changes.clear();
-        self.preview.clear();
-        self.pinned = false;
         self.mode = SidebarMode::Files;
-        self.sidebar_view = SidebarView::List;
-        self.reader_scroll = 0;
-        self.reader_lines.clear();
-        self.reader_notice = None;
         self.browse_entries.clear();
         self.browse_pending = None;
         self.browse_error = None;
         self.browse_scroll = 0;
         self.row_actions.clear();
         self.browse_selected = 0;
+        self.follow_target = None;
     }
 
     fn refresh(&mut self, cwd: &Path) {
@@ -554,15 +411,6 @@ impl Sidebar {
         self.info = Some(workspace::collect(cwd));
         if self.browse_dir.as_os_str().is_empty() {
             self.browse_dir = cwd.to_path_buf();
-        }
-        if self.pinned
-            && self
-                .preview
-                .target_abs()
-                .is_some_and(|path| !path.starts_with(cwd))
-        {
-            self.preview.refresh_current();
-            self.refresh_reader_document();
         }
         self.last_refresh = Instant::now();
         self.rebuild();
@@ -576,15 +424,10 @@ impl Sidebar {
         // 失敗した root では再試行しない（毎tickの再試行はフリーズの元）。
         if self.watcher_root.as_deref() != Some(cwd) {
             self.changes.clear();
-            self.preview.clear();
-            self.pinned = false;
             self.watcher = None;
             self.watch_failed = false;
             self.watcher_root = Some(cwd.to_path_buf());
-            self.sidebar_view = SidebarView::List;
-            self.reader_scroll = 0;
-            self.reader_lines.clear();
-            self.reader_notice = None;
+            self.follow_target = None;
             self.set_browse_dir_for_root(cwd.to_path_buf());
             self.watcher_pending = Some(spawn_watcher(cwd));
             changed = true;
@@ -642,40 +485,12 @@ impl Sidebar {
 
             match kind {
                 ChangeKind::New | ChangeKind::Modified => {
-                    if self.pinned {
-                        let changed_abs = root.join(&change.path);
-                        if self.preview.target_abs() == Some(changed_abs.as_path()) {
-                            self.preview.notify_changed(root, change.path);
-                        }
-                    } else {
-                        self.preview.notify_changed(root, change.path);
-                    }
+                    self.follow_target = Some(root.join(&change.path));
                 }
-                ChangeKind::Deleted => {
-                    if self.pinned {
-                        let changed_abs = root.join(&change.path);
-                        if self.preview.target_abs() == Some(changed_abs.as_path()) {
-                            self.preview.mark_deleted(change.path);
-                        }
-                    } else if self.preview.target() == Some(change.path.as_path()) {
-                        if let Some(next) = self
-                            .changes
-                            .iter()
-                            .skip(1)
-                            .find(|stored| stored.kind != ChangeKind::Deleted)
-                        {
-                            self.preview.set_target(root, next.path.clone());
-                        } else {
-                            self.preview.mark_deleted(change.path);
-                        }
-                    }
-                }
+                ChangeKind::Deleted => {}
             }
         }
         self.changes.truncate(100);
-        if self.sidebar_view == SidebarView::Reader {
-            self.refresh_reader_document();
-        }
     }
 
     fn rebuild(&mut self) {
@@ -777,21 +592,15 @@ impl Sidebar {
                 }
             }
 
-            if self.sidebar_view == SidebarView::Reader {
-                self.push_reader(&mut lines, &mut row_actions, cols, rows);
-            } else {
-                self.push_mode_switch(&mut lines, &mut row_actions, cols);
-                push_separator(&mut lines, &mut row_actions, cols);
-                match self.mode {
-                    SidebarMode::Changes => {
-                        self.push_changed_files(&mut lines, &mut row_actions, cols);
-                    }
-                    SidebarMode::Files => {
-                        self.push_file_browser(&mut lines, &mut row_actions, cols);
-                    }
+            self.push_mode_switch(&mut lines, &mut row_actions, cols);
+            push_separator(&mut lines, &mut row_actions, cols);
+            match self.mode {
+                SidebarMode::Changes => {
+                    self.push_changed_files(&mut lines, &mut row_actions, cols);
                 }
-                push_separator(&mut lines, &mut row_actions, cols);
-                self.push_preview(&mut lines, &mut row_actions, cols, content_rows);
+                SidebarMode::Files => {
+                    self.push_file_browser(&mut lines, &mut row_actions, cols);
+                }
             }
         }
 
@@ -813,9 +622,6 @@ impl Sidebar {
     }
 
     fn apply_selection_style(&self, lines: &mut [Line], row_actions: &[Option<RowAction>]) {
-        if self.sidebar_view != SidebarView::List {
-            return;
-        }
         let Some(selected) = self.selected_row_action() else {
             return;
         };
@@ -839,11 +645,7 @@ impl Sidebar {
         row_actions: &mut Vec<Option<RowAction>>,
         cols: usize,
     ) {
-        let hint = if self.sidebar_view == SidebarView::Reader {
-            " ↑↓:スクロール  e:編集  BS:戻る  Esc:端末"
-        } else {
-            " ↑↓:選択  Enter:開く  BS:上へ  Esc:端末"
-        };
+        let hint = " ↑↓:選択  →/Enter:開く  ←:上へ  Esc:端末";
         push_line(lines, row_actions, cols, hint, Color::BrightBlack, None);
     }
 
@@ -935,11 +737,7 @@ impl Sidebar {
             let (label, color) = change_label(change.kind);
             let path = change.path.display().to_string();
             let path = abbreviate_start(&path, cols.saturating_sub(10));
-            let marker = if self.preview.target() == Some(change.path.as_path()) {
-                " ▶ "
-            } else {
-                "   "
-            };
+            let marker = "   ";
             push_segments(
                 lines,
                 row_actions,
@@ -981,166 +779,6 @@ impl Sidebar {
                 None,
             );
         }
-    }
-
-    fn push_preview(
-        &self,
-        lines: &mut Vec<Line>,
-        row_actions: &mut Vec<Option<RowAction>>,
-        cols: usize,
-        rows: usize,
-    ) {
-        if let Some(target) = self.preview.target() {
-            let suffix = if self.pinned {
-                " 📌 (クリックで追従に戻る)"
-            } else {
-                " follow"
-            };
-            let available = cols.saturating_sub(3 + display_width(suffix));
-            let path = abbreviate_start(&target.display().to_string(), available);
-            let action = self.pinned.then_some(RowAction::Unpin);
-            push_line(
-                lines,
-                row_actions,
-                cols,
-                &format!(" ▶ {path}{suffix}"),
-                Color::BrightWhite,
-                action,
-            );
-            if let Some(abs_path) = self.preview.target_abs() {
-                let env_editor = std::env::var("EDITOR").ok();
-                let editor = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
-                // 起動する実体を見せるため、引数ではなく先頭コマンドだけ表示する。
-                push_line(
-                    lines,
-                    row_actions,
-                    cols,
-                    &format!("   [クリックで編集: {}]", editor[0]),
-                    Color::Cyan,
-                    Some(RowAction::EditFile(abs_path.to_path_buf())),
-                );
-            }
-        }
-
-        let available = rows.saturating_sub(lines.len());
-        if available == 0 {
-            return;
-        }
-
-        match self.preview.lines() {
-            PreviewLines::Text(text_lines) => {
-                let start = text_lines.len().saturating_sub(available);
-                for line in &text_lines[start..] {
-                    push_line(lines, row_actions, cols, line, Color::White, None);
-                }
-            }
-            PreviewLines::Message(message) => {
-                push_line(lines, row_actions, cols, message, Color::BrightBlack, None);
-            }
-        }
-    }
-
-    fn push_reader(
-        &self,
-        lines: &mut Vec<Line>,
-        row_actions: &mut Vec<Option<RowAction>>,
-        cols: usize,
-        rows: usize,
-    ) {
-        push_line(
-            lines,
-            row_actions,
-            cols,
-            " ← 戻る",
-            Color::BrightWhite,
-            Some(RowAction::CloseReader),
-        );
-
-        if let Some(target) = self.preview.target() {
-            let suffix = if self.pinned { " 📌" } else { "" };
-            let available = cols.saturating_sub(1 + display_width(suffix));
-            let path = abbreviate_start(&target.display().to_string(), available);
-            push_line(
-                lines,
-                row_actions,
-                cols,
-                &format!(" {path}{suffix}"),
-                Color::BrightWhite,
-                None,
-            );
-        }
-
-        if let Some(abs_path) = self.preview.target_abs() {
-            let env_editor = std::env::var("EDITOR").ok();
-            let editor = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
-            push_line(
-                lines,
-                row_actions,
-                cols,
-                &format!(" [編集: {}]", editor[0]),
-                Color::Cyan,
-                Some(RowAction::EditFile(abs_path.to_path_buf())),
-            );
-            push_line(
-                lines,
-                row_actions,
-                cols,
-                " [OSの既定アプリで開く]",
-                Color::Cyan,
-                Some(RowAction::OpenWithSystem(abs_path.to_path_buf())),
-            );
-        }
-
-        if let Some(notice) = &self.reader_notice {
-            push_line(lines, row_actions, cols, notice, Color::BrightBlack, None);
-        }
-
-        push_separator(lines, row_actions, cols);
-
-        let available = rows.saturating_sub(lines.len());
-        if available == 0 {
-            return;
-        }
-
-        let scroll = clamp_reader_scroll(self.reader_scroll, self.reader_lines.len(), available);
-        for line in self.reader_lines.iter().skip(scroll).take(available) {
-            push_styled_line(lines, row_actions, cols, line, None);
-        }
-    }
-
-    fn refresh_reader_document(&mut self) {
-        self.reader_lines = match self.preview.lines() {
-            PreviewLines::Text(text_lines) => {
-                let joined = text_lines.join("\n");
-                if self
-                    .preview
-                    .target()
-                    .and_then(Path::extension)
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(is_markdown_extension)
-                {
-                    render_markdown(&joined)
-                        .into_iter()
-                        .flat_map(|line| wrap_styled_line(&line, self.reader_wrap_cols()))
-                        .collect()
-                } else {
-                    text_lines
-                        .iter()
-                        .flat_map(|line| wrap_line(line, self.reader_wrap_cols()))
-                        .map(|line| styled_plain(line, Color::White))
-                        .collect()
-                }
-            }
-            PreviewLines::Message(message) => {
-                vec![styled_plain(message.to_owned(), Color::BrightBlack)]
-            }
-        };
-
-        self.reader_scroll = clamp_reader_scroll(
-            self.reader_scroll,
-            self.reader_lines.len(),
-            self.reader_body_slots(),
-        );
     }
 
     fn push_file_browser(
@@ -1259,24 +897,6 @@ impl Sidebar {
         }
     }
 
-    fn unpin(&mut self) {
-        self.pinned = false;
-        if let Some(root) = self.watcher_root.as_deref() {
-            if let Some(next) = self
-                .changes
-                .iter()
-                .find(|stored| stored.kind != ChangeKind::Deleted)
-            {
-                self.preview.set_target(root, next.path.clone());
-            } else {
-                self.preview.clear();
-            }
-        } else {
-            self.preview.clear();
-        }
-        self.rebuild();
-    }
-
     fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             SidebarMode::Changes => SidebarMode::Files,
@@ -1371,26 +991,13 @@ impl Sidebar {
             base
         }
     }
-
-    fn reader_wrap_cols(&self) -> usize {
-        let cols = (self.view.viewport().w / self.view.cell_size().w).max(1) as usize;
-        cols.saturating_sub(1).max(1)
-    }
-
-    fn reader_body_slots(&self) -> usize {
-        let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
-        let header_rows = 5
-            + usize::from(self.preview.target_abs().is_some())
-            + usize::from(self.reader_notice.is_some())
-            + usize::from(self.focused);
-        rows.saturating_sub(header_rows)
-    }
 }
 
 pub enum SidebarRequest {
-    EditFile(PathBuf),
-    OpenWithSystem(PathBuf),
-    RefreshLayout,
+    PreviewFile(PathBuf),
+    ScrollPreview(isize),
+    EditPreview,
+    OpenPreview,
 }
 
 pub enum SidebarKeyResult {
@@ -1405,22 +1012,12 @@ enum SidebarMode {
     Files,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SidebarView {
-    List,
-    Reader,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RowAction {
     ToggleMode,
     BrowseParent,
     BrowseDir(PathBuf),
     PreviewFile(PathBuf),
-    Unpin,
-    EditFile(PathBuf),
-    OpenWithSystem(PathBuf),
-    CloseReader,
 }
 
 /// watcher の生成をバックグラウンドで行う（生成＝ディレクトリ登録は
@@ -1508,14 +1105,6 @@ fn browse_scroll_max(len: usize, visible: usize) -> usize {
     len.saturating_sub(visible)
 }
 
-pub(crate) fn clamp_reader_scroll(offset: usize, len: usize, visible: usize) -> usize {
-    offset.min(reader_scroll_max(len, visible))
-}
-
-fn reader_scroll_max(len: usize, visible: usize) -> usize {
-    len.saturating_sub(visible)
-}
-
 fn change_label(kind: ChangeKind) -> (&'static str, Color) {
     match kind {
         ChangeKind::New => ("NEW", Color::Green),
@@ -1548,19 +1137,25 @@ fn push_line(
     row_actions.push(action);
 }
 
-fn push_styled_line(
-    lines: &mut Vec<Line>,
-    row_actions: &mut Vec<Option<RowAction>>,
-    cols: usize,
-    line: &StyledLine,
-    action: Option<RowAction>,
-) {
-    lines.push(Line::from_cells(cells_for_styled_line(line, cols), false));
-    row_actions.push(action);
-}
-
 fn cells_for_line(text: &str, cols: usize, fg: Color) -> Vec<Cell> {
-    cells_for_segments(&[(text, fg)], cols)
+    let mut cells = Vec::new();
+    let mut used = 0usize;
+
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width == 0 || used + width > cols {
+            return cells;
+        }
+        let mut cell = Cell::head(ch, width as u16, GraphicAttribute::default());
+        cell.attr.fg = fg;
+        cells.push(cell);
+        for i in 1..width {
+            cells.push(Cell::spacer(i as u16));
+        }
+        used += width;
+    }
+
+    cells
 }
 
 fn push_segments(
@@ -1570,41 +1165,21 @@ fn push_segments(
     segments: &[(&str, Color)],
     action: Option<RowAction>,
 ) {
-    lines.push(Line::from_cells(cells_for_segments(segments, cols), false));
-    row_actions.push(action);
-}
-
-fn cells_for_segments(segments: &[(&str, Color)], cols: usize) -> Vec<Cell> {
-    let styled: Vec<StyledSegment> = segments
-        .iter()
-        .map(|(text, fg)| StyledSegment {
-            text: (*text).to_owned(),
-            style: TextStyle {
-                fg: *fg,
-                bold: false,
-            },
-        })
-        .collect();
-    cells_for_styled_line(&styled, cols)
-}
-
-fn cells_for_styled_line(segments: &StyledLine, cols: usize) -> Vec<Cell> {
     let mut cells = Vec::new();
     let mut used = 0usize;
 
-    for segment in segments {
-        for ch in segment.text.chars() {
+    for (text, fg) in segments {
+        for ch in text.chars() {
             let width = UnicodeWidthChar::width(ch).unwrap_or(0);
             if width == 0 || used + width > cols {
-                return cells;
+                lines.push(Line::from_cells(cells, false));
+                row_actions.push(action);
+                return;
             }
 
-            let attr = GraphicAttribute {
-                fg: segment.style.fg,
-                bold: i8::from(segment.style.bold),
-                ..GraphicAttribute::default()
-            };
-            cells.push(Cell::head(ch, width as u16, attr));
+            let mut cell = Cell::head(ch, width as u16, GraphicAttribute::default());
+            cell.attr.fg = *fg;
+            cells.push(cell);
             for i in 1..width {
                 cells.push(Cell::spacer(i as u16));
             }
@@ -1612,287 +1187,8 @@ fn cells_for_styled_line(segments: &StyledLine, cols: usize) -> Vec<Cell> {
         }
     }
 
-    cells
-}
-
-pub(crate) type StyledLine = Vec<StyledSegment>;
-
-#[derive(Clone, Debug)]
-pub(crate) struct StyledSegment {
-    text: String,
-    style: TextStyle,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct TextStyle {
-    fg: Color,
-    bold: bool,
-}
-
-fn styled_plain(text: String, fg: Color) -> StyledLine {
-    vec![StyledSegment {
-        text,
-        style: TextStyle { fg, bold: false },
-    }]
-}
-
-pub(crate) fn wrap_line(line: &str, cols: usize) -> Vec<String> {
-    let cols = cols.max(1);
-    if line.is_empty() {
-        return vec![String::new()];
-    }
-
-    let mut out = Vec::new();
-    let mut current = String::new();
-    let mut used = 0usize;
-    for ch in line.chars() {
-        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if width == 0 {
-            continue;
-        }
-        if used > 0 && used + width > cols {
-            out.push(current);
-            current = String::new();
-            used = 0;
-        }
-        current.push(ch);
-        used += width;
-    }
-    out.push(current);
-    out
-}
-
-fn wrap_styled_line(line: &StyledLine, cols: usize) -> Vec<StyledLine> {
-    let cols = cols.max(1);
-    if line.is_empty() || styled_width(line) == 0 {
-        return vec![Vec::new()];
-    }
-
-    let mut out = Vec::new();
-    let mut current = Vec::new();
-    let mut used = 0usize;
-    for segment in line {
-        for ch in segment.text.chars() {
-            let width = UnicodeWidthChar::width(ch).unwrap_or(0);
-            if width == 0 {
-                continue;
-            }
-            if used > 0 && used + width > cols {
-                out.push(current);
-                current = Vec::new();
-                used = 0;
-            }
-            push_char_segment(&mut current, ch, segment.style);
-            used += width;
-        }
-    }
-    out.push(current);
-    out
-}
-
-fn push_char_segment(line: &mut StyledLine, ch: char, style: TextStyle) {
-    line.push(StyledSegment {
-        text: ch.to_string(),
-        style,
-    });
-}
-
-fn styled_width(line: &StyledLine) -> usize {
-    line.iter()
-        .map(|segment| display_width(&segment.text))
-        .sum()
-}
-
-pub(crate) fn render_markdown(src: &str) -> Vec<StyledLine> {
-    let mut renderer = MarkdownRenderer::new();
-    let parser = Parser::new_ext(src, Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES);
-    for event in parser {
-        renderer.handle(event);
-    }
-    renderer.finish()
-}
-
-struct MarkdownRenderer {
-    lines: Vec<StyledLine>,
-    current: StyledLine,
-    style: TextStyle,
-    list_depth: usize,
-    in_code_block: bool,
-    image_alt: Option<String>,
-}
-
-impl MarkdownRenderer {
-    fn new() -> Self {
-        Self {
-            lines: Vec::new(),
-            current: Vec::new(),
-            style: TextStyle {
-                fg: Color::White,
-                bold: false,
-            },
-            list_depth: 0,
-            in_code_block: false,
-            image_alt: None,
-        }
-    }
-
-    fn handle(&mut self, event: Event<'_>) {
-        match event {
-            Event::Start(tag) => self.start(tag),
-            Event::End(tag) => self.end(tag),
-            Event::Text(text) => self.text(&text, false),
-            Event::Code(text) => self.text(&text, true),
-            Event::SoftBreak | Event::HardBreak => self.flush_current(),
-            Event::Rule => self
-                .lines
-                .push(styled_plain(" ────".to_owned(), Color::BrightBlack)),
-            _ => {}
-        }
-    }
-
-    fn start(&mut self, tag: Tag<'_>) {
-        match tag {
-            Tag::Heading { level, .. } => {
-                self.flush_current();
-                self.style = TextStyle {
-                    fg: Color::Cyan,
-                    bold: true,
-                };
-                self.push_text(&format!("{} ", heading_marks(level)));
-            }
-            Tag::List(_) => self.list_depth += 1,
-            Tag::Item => {
-                self.flush_current();
-                self.push_text(&format!(
-                    "{}• ",
-                    "  ".repeat(self.list_depth.saturating_sub(1))
-                ));
-            }
-            Tag::CodeBlock(_) => {
-                self.flush_current();
-                self.in_code_block = true;
-                self.style = TextStyle {
-                    fg: Color::Green,
-                    bold: false,
-                };
-            }
-            Tag::BlockQuote(_) => {
-                self.flush_current();
-                self.current.push(StyledSegment {
-                    text: "│ ".to_owned(),
-                    style: TextStyle {
-                        fg: Color::BrightBlack,
-                        bold: false,
-                    },
-                });
-            }
-            Tag::Strong => self.style.bold = true,
-            Tag::Image { .. } => self.image_alt = Some(String::new()),
-            _ => {}
-        }
-    }
-
-    fn end(&mut self, tag: TagEnd) {
-        match tag {
-            TagEnd::Heading(_) => {
-                self.flush_current();
-                self.style = TextStyle {
-                    fg: Color::White,
-                    bold: false,
-                };
-            }
-            TagEnd::List(_) => self.list_depth = self.list_depth.saturating_sub(1),
-            TagEnd::Item => self.flush_current(),
-            TagEnd::CodeBlock => {
-                self.flush_current();
-                self.in_code_block = false;
-                self.style = TextStyle {
-                    fg: Color::White,
-                    bold: false,
-                };
-            }
-            TagEnd::BlockQuote(_) => {
-                self.flush_current();
-            }
-            TagEnd::Strong => self.style.bold = false,
-            TagEnd::Image => {
-                if let Some(alt) = self.image_alt.take() {
-                    self.push_text(&format!("[画像: {alt}]"));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn text(&mut self, text: &str, inline_code: bool) {
-        if let Some(alt) = &mut self.image_alt {
-            alt.push_str(text);
-            return;
-        }
-
-        let previous = self.style;
-        if inline_code {
-            self.style = TextStyle {
-                fg: Color::Yellow,
-                bold: previous.bold,
-            };
-        }
-
-        if self.in_code_block {
-            for (index, line) in text.split('\n').enumerate() {
-                if index > 0 {
-                    self.flush_current();
-                }
-                self.push_text(line);
-            }
-        } else {
-            self.push_text(text);
-        }
-
-        if inline_code {
-            self.style = previous;
-        }
-    }
-
-    fn push_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        self.current.push(StyledSegment {
-            text: text.to_owned(),
-            style: self.style,
-        });
-    }
-
-    fn flush_current(&mut self) {
-        if self.current.is_empty() {
-            return;
-        }
-        self.lines.push(std::mem::take(&mut self.current));
-    }
-
-    fn finish(mut self) -> Vec<StyledLine> {
-        self.flush_current();
-        if self.lines.is_empty() {
-            self.lines.push(Vec::new());
-        }
-        self.lines
-    }
-}
-
-fn heading_marks(level: HeadingLevel) -> &'static str {
-    match level {
-        HeadingLevel::H1 => "#",
-        HeadingLevel::H2 => "##",
-        HeadingLevel::H3 => "###",
-        HeadingLevel::H4 => "####",
-        HeadingLevel::H5 => "#####",
-        HeadingLevel::H6 => "######",
-    }
-}
-
-fn is_markdown_extension(ext: &str) -> bool {
-    ext.eq_ignore_ascii_case("md") || ext.eq_ignore_ascii_case("markdown")
+    lines.push(Line::from_cells(cells, false));
+    row_actions.push(action);
 }
 
 fn abbreviate_start(text: &str, max_width: usize) -> String {
@@ -1928,20 +1224,12 @@ fn display_width(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_browse_scroll, clamp_reader_scroll, click_row, keep_selection_visible,
-        render_markdown, sidebar_action_at, sort_entries, wrap_line, RowAction, StyledLine,
+        clamp_browse_scroll, click_row, keep_selection_visible, sidebar_action_at, sort_entries,
+        RowAction,
     };
     use crate::view::Viewport;
     use std::path::PathBuf;
     use winit::dpi::PhysicalPosition;
-
-    fn line_text(line: &StyledLine) -> String {
-        line.iter().map(|segment| segment.text.as_str()).collect()
-    }
-
-    fn rendered_text(src: &str) -> Vec<String> {
-        render_markdown(src).iter().map(line_text).collect()
-    }
 
     #[test]
     fn click_row_uses_viewport_origin_and_cell_height() {
@@ -1972,7 +1260,7 @@ mod tests {
         let actions = vec![
             None,
             Some(RowAction::PreviewFile(file.clone())),
-            Some(RowAction::Unpin),
+            Some(RowAction::BrowseParent),
         ];
 
         assert_eq!(sidebar_action_at(&actions, 0), None);
@@ -1980,7 +1268,10 @@ mod tests {
             sidebar_action_at(&actions, 1),
             Some(&RowAction::PreviewFile(file))
         );
-        assert_eq!(sidebar_action_at(&actions, 2), Some(&RowAction::Unpin));
+        assert_eq!(
+            sidebar_action_at(&actions, 2),
+            Some(&RowAction::BrowseParent)
+        );
         assert_eq!(sidebar_action_at(&actions, 3), None);
     }
 
@@ -2072,48 +1363,5 @@ mod tests {
         assert_eq!(keep_selection_visible(99, 19, 20, 5), 15);
         assert_eq!(keep_selection_visible(3, 0, 0, 5), 0);
         assert_eq!(keep_selection_visible(3, 2, 4, 0), 3);
-    }
-
-    #[test]
-    fn clamp_reader_scroll_stays_within_visible_range() {
-        assert_eq!(clamp_reader_scroll(0, 20, 5), 0);
-        assert_eq!(clamp_reader_scroll(12, 20, 5), 12);
-        assert_eq!(clamp_reader_scroll(99, 20, 5), 15);
-        assert_eq!(clamp_reader_scroll(3, 4, 10), 0);
-    }
-
-    #[test]
-    fn wrap_line_wraps_ascii() {
-        assert_eq!(wrap_line("abcdef", 3), vec!["abc", "def"]);
-    }
-
-    #[test]
-    fn wrap_line_wraps_mixed_width_text() {
-        assert_eq!(wrap_line("ab日本cd", 4), vec!["ab日", "本cd"]);
-    }
-
-    #[test]
-    fn wrap_line_keeps_exact_boundary() {
-        assert_eq!(wrap_line("abcd", 4), vec!["abcd"]);
-    }
-
-    #[test]
-    fn wrap_line_preserves_empty_line() {
-        assert_eq!(wrap_line("", 4), vec![""]);
-    }
-
-    #[test]
-    fn render_markdown_formats_representative_blocks() {
-        let lines = rendered_text(
-            "# Title\n\nnormal `code`\n\n- item\n\n> quote\n\n```rust\nlet x = 1;\n```\n\n---\n\n![alt](image.png)",
-        );
-
-        assert!(lines.contains(&"# Title".to_owned()));
-        assert!(lines.contains(&"normal code".to_owned()));
-        assert!(lines.contains(&"• item".to_owned()));
-        assert!(lines.contains(&"│ quote".to_owned()));
-        assert!(lines.contains(&"let x = 1;".to_owned()));
-        assert!(lines.contains(&" ────".to_owned()));
-        assert!(lines.contains(&"[画像: alt]".to_owned()));
     }
 }

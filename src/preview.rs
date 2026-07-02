@@ -42,26 +42,12 @@ impl FilePreview {
         }
     }
 
-    pub fn clear(&mut self) {
-        self.target = None;
-        self.target_abs = None;
-        self.content = PreviewContent::Empty;
-        self.pending = None;
-        self.queued = None;
-        self.last_read = Instant::now() - READ_DEBOUNCE;
-    }
-
     pub fn target(&self) -> Option<&Path> {
         self.target.as_deref()
     }
 
     pub fn target_abs(&self) -> Option<&Path> {
         self.target_abs.as_deref()
-    }
-
-    pub fn set_target(&mut self, root: &Path, rel_path: PathBuf) {
-        let abs_path = root.join(&rel_path);
-        self.set_target_abs(abs_path, rel_path);
     }
 
     pub fn set_target_abs(&mut self, abs_path: PathBuf, display_path: PathBuf) {
@@ -71,19 +57,10 @@ impl FilePreview {
         self.request_read(abs_path, display_path, true);
     }
 
-    pub fn notify_changed(&mut self, root: &Path, rel_path: PathBuf) {
-        let abs_path = root.join(&rel_path);
-        self.target = Some(rel_path.clone());
+    pub fn notify_target_abs(&mut self, abs_path: PathBuf, display_path: PathBuf) {
+        self.target = Some(display_path.clone());
         self.target_abs = Some(abs_path.clone());
-        self.request_read(abs_path, rel_path, false);
-    }
-
-    pub fn mark_deleted(&mut self, rel_path: PathBuf) {
-        self.target = Some(rel_path);
-        self.target_abs = None;
-        self.content = PreviewContent::Deleted;
-        self.pending = None;
-        self.queued = None;
+        self.request_read(abs_path, display_path, false);
     }
 
     pub fn refresh_current(&mut self) {

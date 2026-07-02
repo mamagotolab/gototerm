@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod font;
 mod preview;
+mod reader;
 mod sidebar;
 mod sixel;
 mod terminal;

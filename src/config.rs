@@ -17,9 +17,9 @@ pub struct Config {
     // タブバー（複数タブのときだけ表示）の文字サイズ
     pub status_bar_font_size: u32,
 
-    // 右サイドバーの幅比率（表示中のみ使用）
+    // ワークベンチ左サイドバーの幅比率（表示中のみ使用）
     pub sidebar_ratio: f64,
-    // Reader 表示中の右サイドバー幅比率。
+    // ワークベンチ右側の上下分割比（上=プレビュー）。
     #[serde(default = "default_preview_ratio")]
     pub preview_ratio: f64,
     // ファイル監視で無視するパス構成要素。
@@ -82,7 +82,7 @@ impl Default for Config {
             font_size: 18,
 
             status_bar_font_size: 16,
-            sidebar_ratio: 0.30,
+            sidebar_ratio: 0.25,
             preview_ratio: default_preview_ratio(),
             watch_ignore: vec![
                 ".git".to_owned(),
