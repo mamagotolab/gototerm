@@ -162,11 +162,12 @@ impl Sidebar {
 
     fn on_list_key(&mut self, code: KeyCode) -> SidebarKeyResult {
         match code {
-            KeyCode::ArrowUp => {
+            // 上下移動：矢印＋ vim の k/j（ranger/yazi 流儀）。
+            KeyCode::ArrowUp | KeyCode::KeyK => {
                 self.move_list_selection(-1);
                 SidebarKeyResult::Consumed
             }
-            KeyCode::ArrowDown => {
+            KeyCode::ArrowDown | KeyCode::KeyJ => {
                 self.move_list_selection(1);
                 SidebarKeyResult::Consumed
             }
@@ -185,12 +186,13 @@ impl Sidebar {
                 self.set_list_selection(last);
                 SidebarKeyResult::Consumed
             }
-            // → は Enter と同義（yazi/ranger 流儀: ←で戻る/→で進む）。
-            KeyCode::Enter | KeyCode::ArrowRight => self
+            // 開く／進む：Enter・→・vim の l（yazi/ranger 流儀: hで戻る/lで進む）。
+            KeyCode::Enter | KeyCode::ArrowRight | KeyCode::KeyL => self
                 .selected_row_action()
                 .and_then(|action| self.run_row_action(action))
                 .map_or(SidebarKeyResult::Consumed, SidebarKeyResult::Request),
-            KeyCode::Backspace | KeyCode::ArrowLeft => {
+            // 親へ戻る：Backspace・←・vim の h。
+            KeyCode::Backspace | KeyCode::ArrowLeft | KeyCode::KeyH => {
                 if self.mode == SidebarMode::Files {
                     return self
                         .run_row_action(RowAction::BrowseParent)
@@ -691,7 +693,7 @@ impl Sidebar {
         row_actions: &mut Vec<Option<RowAction>>,
         cols: usize,
     ) {
-        let hint = " ↑↓:選択  →/Enter:開く  ←:上へ  Esc:端末";
+        let hint = " j/k:選択  l:開く  h:上へ  Esc:端末";
         push_line(lines, row_actions, cols, hint, Color::BrightBlack, None);
     }
 
