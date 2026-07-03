@@ -24,6 +24,9 @@ pub struct Sidebar {
     view: TerminalView,
     visible: bool,
     info: Option<WorkspaceInfo>,
+    /// バックグラウンドで取得中の workspace 情報（git status は Windows では
+    /// プロセス起動が重く、UI スレッドで実行すると数百 ms 固まるため）。
+    info_pending: Option<(PathBuf, Receiver<WorkspaceInfo>)>,
     last_refresh: Instant,
     changes: Vec<FileChange>,
     mode: SidebarMode,
@@ -59,6 +62,7 @@ impl Sidebar {
             ),
             visible: false,
             info: None,
+            info_pending: None,
             last_refresh: Instant::now() - REFRESH_INTERVAL,
             changes: Vec::new(),
             mode: SidebarMode::Files,
@@ -482,15 +486,40 @@ impl Sidebar {
         if self.poll_browse_dir() {
             changed = true;
         }
+        if self.poll_workspace() {
+            changed = true;
+        }
         // cd やフォーカス切替で作業フォルダが変わったら、5秒を待たずに反映する。
-        let cwd_changed = self
-            .info
+        // 取得中／取得済みの cwd と比べる（info の反映が遅れても再発注しないため）。
+        let current_cwd = self
+            .info_pending
             .as_ref()
-            .map_or(true, |info| info.cwd.as_path() != cwd);
+            .map(|(p, _)| p.as_path())
+            .or_else(|| self.info.as_ref().map(|info| info.cwd.as_path()));
+        let cwd_changed = current_cwd != Some(cwd);
         if cwd_changed || self.last_refresh.elapsed() >= REFRESH_INTERVAL {
             self.refresh(cwd);
         } else if changed {
             self.rebuild();
+        }
+    }
+
+    /// バックグラウンドの git 取得が完了していれば取り込む。true=更新した。
+    fn poll_workspace(&mut self) -> bool {
+        let Some((_, rx)) = &self.info_pending else {
+            return false;
+        };
+        match rx.try_recv() {
+            Ok(info) => {
+                self.info = Some(info);
+                self.info_pending = None;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                self.info_pending = None;
+                false
+            }
         }
     }
 
@@ -519,6 +548,7 @@ impl Sidebar {
 
     fn clear_live_state(&mut self) {
         // リモート出力をローカルFSとして扱わないため、監視・一覧・プレビュー状態を捨てる。
+        self.info_pending = None;
         self.watcher = None;
         self.watcher_pending = None;
         self.watcher_root = None;
@@ -537,7 +567,11 @@ impl Sidebar {
 
     fn refresh(&mut self, cwd: &Path) {
         self.drain_watcher(cwd);
-        self.info = Some(workspace::collect(cwd));
+        // git status はバックグラウンドで取る（Windows で UI が固まるのを防ぐ）。
+        // 既に同じ cwd を取得中なら二重発注しない。
+        if self.info_pending.as_ref().map(|(p, _)| p.as_path()) != Some(cwd) {
+            self.info_pending = Some(spawn_workspace_collect(cwd));
+        }
         if self.browse_dir.as_os_str().is_empty() {
             self.browse_dir = cwd.to_path_buf();
         }
@@ -1223,6 +1257,17 @@ fn spawn_watcher(root: &Path) -> (PathBuf, Receiver<Result<WorkspaceWatcher, not
         let _ = tx.send(WorkspaceWatcher::new(&thread_root));
     });
     (root_owned, rx)
+}
+
+/// git status を別スレッドで取る（Windows のプロセス起動遅延で UI を固めない）。
+fn spawn_workspace_collect(cwd: &Path) -> (PathBuf, Receiver<WorkspaceInfo>) {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let cwd_owned = cwd.to_path_buf();
+    let thread_cwd = cwd_owned.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(workspace::collect(&thread_cwd));
+    });
+    (cwd_owned, rx)
 }
 
 fn spawn_read_dir(dir: PathBuf) -> (PathBuf, Receiver<Result<Vec<(String, bool)>, String>>) {

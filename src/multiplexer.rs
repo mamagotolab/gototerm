@@ -1187,13 +1187,19 @@ impl Multiplexer {
     }
 
     fn handle_gt_messages(&mut self) {
+        // ワークベンチを閉じている間は汲まない。毎 tick 全ペインのミューテックスを
+        // ロックするのを避ける（分割数が多いほど効く。表示していなければ捨てるだけ）。
+        if !self.sidebar.is_visible() {
+            return;
+        }
+
         let mut messages = Vec::new();
         for tab in &mut self.tabs {
             tab.take_gt_messages(&mut messages);
         }
         self.preview_slot.take_gt_messages(&mut messages);
 
-        if messages.is_empty() || !self.sidebar.is_visible() {
+        if messages.is_empty() {
             return;
         }
 

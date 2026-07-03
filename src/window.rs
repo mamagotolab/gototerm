@@ -16,11 +16,6 @@ use crate::Display;
 
 type CursorPosition = PhysicalPosition<f64>;
 
-enum LinkTarget {
-    Url(String),
-    File(PathBuf),
-}
-
 /// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
 /// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
 /// 引数をパスと誤解してフォルダを開くことがあるため使わない。
@@ -517,32 +512,38 @@ impl TerminalWindow {
         )
     }
 
-    fn link_at(&self, row: usize, col: usize) -> Option<LinkTarget> {
-        let token = self.token_at(row, col)?;
-        if token.starts_with("http://") || token.starts_with("https://") {
-            return Some(LinkTarget::Url(token));
-        }
-
-        let cwd = self
-            .terminal
-            .cwd()
-            .or_else(|| std::env::current_dir().ok())
-            .unwrap_or_else(|| PathBuf::from("."));
-        resolve_existing_file_token(&token, &cwd).map(LinkTarget::File)
-    }
-
-    fn link_like_at(&self, row: usize, col: usize) -> bool {
+    /// ホバー時に手カーソルを出すか（stat しない軽い判定）。
+    /// URL は常に。ファイルパスは Ctrl+クリックで開くので Ctrl 押下時だけ。
+    fn should_show_link_pointer(&self, row: usize, col: usize) -> bool {
         let Some(token) = self.token_at(row, col) else {
             return false;
         };
-        token.starts_with("http://") || token.starts_with("https://") || looks_like_path(&token)
+        if token.starts_with("http://") || token.starts_with("https://") {
+            return true;
+        }
+        looks_like_path(&token) && self.modifiers.control_key()
     }
 
-    fn handle_link_click(&mut self, row: usize, col: usize) {
-        match self.link_at(row, col) {
-            Some(LinkTarget::Url(url)) => open_url(&url),
-            Some(LinkTarget::File(path)) => self.clicked_file = Some(path),
-            None => {}
+    /// クリックでリンクを開く。URL は素のクリックで、ファイルは Ctrl+クリックのとき
+    /// だけ（画面上のパスを普通にクリックしてプレビューが誤爆で開くのを防ぐ）。
+    /// URL 判定を先にして、素のクリックでは stat しない。
+    fn handle_link_click(&mut self, row: usize, col: usize, ctrl: bool) {
+        let Some(token) = self.token_at(row, col) else {
+            return;
+        };
+        if token.starts_with("http://") || token.starts_with("https://") {
+            open_url(&token);
+            return;
+        }
+        if ctrl {
+            let cwd = self
+                .terminal
+                .cwd()
+                .or_else(|| std::env::current_dir().ok())
+                .unwrap_or_else(|| PathBuf::from("."));
+            if let Some(path) = resolve_existing_file_token(&token, &cwd) {
+                self.clicked_file = Some(path);
+            }
         }
     }
 
@@ -647,19 +648,16 @@ impl TerminalWindow {
                 let y = position.y - viewport.y as f64;
                 self.mouse.cursor_pos = CursorPosition { x, y };
 
-                // Ctrl を押している間だけ、リンク/パスの上でポインタ（手）カーソルに
-                // する。修飾なしの素のクリックで開くと、ターミナル上のパス（Claude Code
-                // の出力・ls・git 等で大量に出る）を普通にクリックしただけでプレビューが
-                // 開いてしまうため、Ctrl+クリックのときだけ開く方式に合わせた affordance。
+                // リンクの上ではポインタ（手）カーソルにして「クリックできる」と
+                // 分かるようにする。URL は常に、ファイルパスは Ctrl 押下時のみ。
                 // mouse_mode のアプリにはマウスを渡すので変えない。
                 if !self.terminal.mouse_mode() {
                     let cs = self.view.cell_size();
                     let col = (x / cs.w.max(1) as f64) as i64;
                     let row = (y / cs.h.max(1) as f64) as i64;
-                    let on_link = self.modifiers.control_key()
-                        && col >= 0
+                    let on_link = col >= 0
                         && row >= 0
-                        && self.link_like_at(row as usize, col as usize);
+                        && self.should_show_link_pointer(row as usize, col as usize);
                     self.window.set_cursor_icon(if on_link {
                         CursorIcon::Pointer
                     } else {
@@ -756,11 +754,10 @@ impl TerminalWindow {
                             self.mouse.released_pos = Some(self.mouse.cursor_pos);
                             self.mouse.released_offset = self.terminal.display_offset() as i64;
 
-                            // Ctrl+クリック（ドラッグでない単純クリック）で、その位置の
-                            // URL/ファイルパスを開く。素のクリックで開くと、画面上のパスを
-                            // 触っただけでプレビューが開いて誤爆するため Ctrl を必須にした。
-                            // mouse_mode が ON のアプリ（nvim 等）はこの分岐に来ない。
-                            if *button == MouseButton::Left && self.modifiers.control_key() {
+                            // ドラッグ（選択）でない単純な左クリック。URL は素のクリックで
+                            // 開き、ファイルは Ctrl+クリックのときだけ開く（handle_link_click
+                            // 内で判定）。mouse_mode が ON のアプリ（nvim 等）はここに来ない。
+                            if *button == MouseButton::Left {
                                 if let Some(press) = self.mouse.pressed_pos {
                                     let cs = self.view.cell_size();
                                     let to_cell = |p: CursorPosition| {
@@ -773,7 +770,12 @@ impl TerminalWindow {
                                     if to_cell(press) == to_cell(here) {
                                         let (col, row) = to_cell(here);
                                         if col >= 0 && row >= 0 {
-                                            self.handle_link_click(row as usize, col as usize);
+                                            let ctrl = self.modifiers.control_key();
+                                            self.handle_link_click(
+                                                row as usize,
+                                                col as usize,
+                                                ctrl,
+                                            );
                                         }
                                     }
                                 }
