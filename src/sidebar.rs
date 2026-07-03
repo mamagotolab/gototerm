@@ -658,7 +658,8 @@ impl Sidebar {
         self.row_actions = row_actions;
 
         self.view.update_contents(|view| {
-            view.bg_color = Color::Black;
+            // メインターミナルと同じ透過にする（color_background のアルファを使う）。
+            view.bg_color = Color::Background;
             view.lines = lines;
             view.images = Vec::new();
             view.cursor = None;
