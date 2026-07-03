@@ -3,7 +3,10 @@
 OSC_START="$(printf '\033]7717;')"
 OSC_END="$(printf '\007')"
 MAX_BYTES=65536
-CHUNK_BYTES=8192
+# 1メッセージの生データ上限。base64 で約1.37倍に膨らむ。
+# Windows のコンソール層（ConPTY）は長い OSC 文字列を黙って落とすため、
+# ヘッダ込みでも 4KB を大きく下回るサイズに抑える（8192 では Windows で届かなかった）。
+CHUNK_BYTES=2048
 
 has_tty() {
     [ -w /dev/tty ]
