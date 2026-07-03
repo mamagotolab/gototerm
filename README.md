@@ -159,6 +159,9 @@ cargo build --release
 ワークベンチは何もしなくてもファイルの変化を監視して changes に流しますが、
 `gt` コマンドを導入すると **Claude Code 自身から「どのツールで・どのファイルを触ったか」の正確な通知**を受け取れます。
 
+> `gt` は gototerm に同梱の小さなシェルスクリプトです（`assets/bin/gt`）。パッケージマネージャからは
+> 入りません。リポジトリが無い環境では GitHub から直接取得できます（「SSH 先で使う」の節参照）。
+
 ### 1. gt を置く（1回だけ）
 
 `gt` は **Claude Code が動いているマシン**に置きます（シェルスクリプトなので Linux / WSL / SSH 先用です）。
@@ -227,9 +230,21 @@ zsh は `precmd`、fish は多くの環境で標準発行されます（`assets/
 
 ### ファイルの中身を送る（gt）
 
+`gt` は gototerm に同梱の小さなシェルスクリプトです（`assets/bin/gt`）。
+リポジトリが手元にあるなら scp で:
+
 ```sh
 scp assets/bin/gt remote:~/bin/gt
 ssh remote 'chmod +x ~/bin/gt'
+```
+
+手元にリポジトリが無い場合（Windows の exe だけ使っている場合など）は、
+**SSH 先で直接** GitHub から取得できます:
+
+```sh
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/mamagotolab/gototerm/main/assets/bin/gt -o ~/.local/bin/gt
+chmod +x ~/.local/bin/gt
 ```
 
 SSH 先で:
