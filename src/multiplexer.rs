@@ -871,18 +871,6 @@ impl Multiplexer {
             PhysicalKey::Unidentified(_) => return None,
         };
 
-        // フォーカス移動は Alt+矢印（Ctrl は伴わない）。リサイズに Ctrl+Shift+矢印 を
-        // 譲ったため、移動をこちらへ引っ越した。
-        if self.modifiers.alt_key() && !self.modifiers.control_key() {
-            return match code {
-                KeyCode::ArrowUp => Some(Action::Focus(Dir::Up)),
-                KeyCode::ArrowDown => Some(Action::Focus(Dir::Down)),
-                KeyCode::ArrowLeft => Some(Action::Focus(Dir::Left)),
-                KeyCode::ArrowRight => Some(Action::Focus(Dir::Right)),
-                _ => None,
-            };
-        }
-
         if !self.modifiers.control_key() {
             return None;
         }
@@ -898,6 +886,12 @@ impl Multiplexer {
             (true, KeyCode::KeyE) => Action::SplitVertical,
             (true, KeyCode::KeyO) => Action::SplitHorizontal,
             (true, KeyCode::KeyF) => Action::ToggleSidebar,
+            // フォーカス移動は vim 流 H/J/K/L。Alt+矢印 は Hyprland/IME に
+            // 横取りされて届かなかったため、確実に届く Ctrl+Shift+英字にした。
+            (true, KeyCode::KeyH) => Action::Focus(Dir::Left),
+            (true, KeyCode::KeyJ) => Action::Focus(Dir::Down),
+            (true, KeyCode::KeyK) => Action::Focus(Dir::Up),
+            (true, KeyCode::KeyL) => Action::Focus(Dir::Right),
             // ペインのリサイズ（境界を矢印方向へ動かす）
             (true, KeyCode::ArrowUp) => Action::Resize(Dir::Up),
             (true, KeyCode::ArrowDown) => Action::Resize(Dir::Down),

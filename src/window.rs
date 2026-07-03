@@ -972,13 +972,14 @@ impl TerminalWindow {
             (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
             (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),
 
-            // Ctrl+Shift+C/V/L: コピー・ペースト・履歴クリア
+            // Ctrl+Shift+C/V: コピー・ペースト。履歴クリアは Ctrl+Shift+Delete
+            //（Ctrl+Shift+L はペインのフォーカス移動＝右 に使うため移設した）。
             (true, true, KeyCode::KeyC) => {
                 clear = false;
                 self.copy_clipboard();
             }
             (true, true, KeyCode::KeyV) => self.paste_clipboard(),
-            (true, true, KeyCode::KeyL) => {
+            (true, true, KeyCode::Delete) => {
                 self.terminal.clear_history();
             }
 
