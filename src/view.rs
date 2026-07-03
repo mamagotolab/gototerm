@@ -816,6 +816,20 @@ fn color_to_rgba(color: Color) -> u32 {
     }
 }
 
+/// ワークベンチのサイドバー/プレビュー用の背景色。
+/// ターミナルの透過（color_background のアルファ）は活かしつつ、罫線や文字が
+/// 読めるよう不透明側へ 60% 寄せる。結果としてターミナルより少し濃くなるので、
+/// 境界のコントラストも出る（clear はアルファをそのまま書き込むため、透過に
+/// すると文字の裏まで壁紙が透けて読みにくくなるのを防ぐ）。
+pub(crate) fn panel_bg_color() -> Color {
+    let bg = crate::TOYTERM_CONFIG.color_background;
+    let a = bg & 0xFF;
+    let a2 = a + (0xFF - a) * 3 / 5;
+    Color::Rgb {
+        rgba: (bg & 0xFFFF_FF00) | a2,
+    }
+}
+
 #[derive(Clone, Copy)]
 pub struct PixelRect {
     pub x: i32,

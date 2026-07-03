@@ -742,6 +742,37 @@ impl Multiplexer {
         self.focused_root().focused_leaf_mut().pane_location()
     }
 
+    /// フォーカスを矢印方向へ動かす。ワークベンチ表示中は3領域
+    /// （左=サイドバー／右上=プレビュー／右下=ターミナル）もまたぐ。
+    /// ターミナル領域内では従来どおり分割ツリーを辿り、端に達したら隣の領域へ。
+    fn move_focus_workbench(&mut self, dir: Dir) {
+        if !self.sidebar.is_visible() {
+            self.tabs[self.focus].move_focus(dir);
+            return;
+        }
+        if self.sidebar_focused {
+            // サイドバーから右 → ターミナルへ。
+            if matches!(dir, Dir::Right) {
+                self.release_sidebar_focus();
+            }
+            return;
+        }
+        if self.editor_focused {
+            // エディタ（プレビュー枠）から左 → サイドバーへ。
+            if matches!(dir, Dir::Left) {
+                self.focus_sidebar();
+            }
+            return;
+        }
+        // ターミナル領域。まず分割ツリー内で移動し、端に達したら隣の領域へ。
+        if self.tabs[self.focus].move_focus(dir) {
+            return;
+        }
+        if matches!(dir, Dir::Left) {
+            self.focus_sidebar();
+        }
+    }
+
     /// ペイン境界を矢印方向へ動かす。ワークベンチ表示中はその3分割の境界
     /// （左右=サイドバー幅／上下=プレビュー高さ）を、そうでなければフォーカス中の
     /// 分割境界を動かす。1回あたり 3%。
@@ -965,7 +996,7 @@ impl Multiplexer {
             }
 
             Action::Focus(dir) => {
-                self.tabs[self.focus].move_focus(dir);
+                self.move_focus_workbench(dir);
             }
 
             Action::Resize(dir) => {

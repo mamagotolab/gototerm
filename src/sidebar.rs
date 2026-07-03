@@ -658,8 +658,8 @@ impl Sidebar {
         self.row_actions = row_actions;
 
         self.view.update_contents(|view| {
-            // メインターミナルと同じ透過にする（color_background のアルファを使う）。
-            view.bg_color = Color::Background;
+            // 透過は残しつつ罫線・文字が読める中間の背景（ターミナルより少し濃い）。
+            view.bg_color = crate::view::panel_bg_color();
             view.lines = lines;
             view.images = Vec::new();
             view.cursor = None;
