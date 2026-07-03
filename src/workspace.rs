@@ -15,9 +15,20 @@ pub struct WorkspaceInfo {
 }
 
 pub fn collect(cwd: &Path) -> WorkspaceInfo {
-    let git = Command::new("git")
-        .args(["status", "--porcelain=v2", "--branch"])
-        .current_dir(cwd)
+    let mut cmd = Command::new("git");
+    cmd.args(["status", "--porcelain=v2", "--branch"])
+        .current_dir(cwd);
+    // Windows でコンソール窓を出さない。これが無いと git を呼ぶたび（5秒ごと・
+    // cd ごと）に一瞬コマンドプロンプトが開き、分割で cwd 切替が増えると
+    // 「画面が何度も開く」ように見える。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let git = cmd
         .output()
         .ok()
         .filter(|output| output.status.success())

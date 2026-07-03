@@ -24,9 +24,14 @@ pub(crate) fn open_url(url: &str) {
     #[cfg(not(windows))]
     let result = Command::new("xdg-open").arg(url).spawn();
     #[cfg(windows)]
-    let result = Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
+    let result = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
     if let Err(e) = result {
         log::error!("URL を開けませんでした ({}): {}", url, e);
     }

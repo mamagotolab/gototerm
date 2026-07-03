@@ -1,6 +1,6 @@
 [package]
 name = "gototerm"
-version = "0.3.2"
+version = "0.3.3"
 authors = ["mamagotolab"]
 edition = "2021"
 description = "日本語入力のストレスが少ない、AI開発ワークベンチ付き軽量ターミナル（Sixel 画像対応）"
