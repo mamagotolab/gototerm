@@ -647,14 +647,19 @@ impl TerminalWindow {
                 let y = position.y - viewport.y as f64;
                 self.mouse.cursor_pos = CursorPosition { x, y };
 
-                // URL の上ではポインタ（手）カーソルにして「クリックできる」と
-                // 分かるようにする。mouse_mode のアプリにはマウスを渡すので変えない。
+                // Ctrl を押している間だけ、リンク/パスの上でポインタ（手）カーソルに
+                // する。修飾なしの素のクリックで開くと、ターミナル上のパス（Claude Code
+                // の出力・ls・git 等で大量に出る）を普通にクリックしただけでプレビューが
+                // 開いてしまうため、Ctrl+クリックのときだけ開く方式に合わせた affordance。
+                // mouse_mode のアプリにはマウスを渡すので変えない。
                 if !self.terminal.mouse_mode() {
                     let cs = self.view.cell_size();
                     let col = (x / cs.w.max(1) as f64) as i64;
                     let row = (y / cs.h.max(1) as f64) as i64;
-                    let on_link =
-                        col >= 0 && row >= 0 && self.link_like_at(row as usize, col as usize);
+                    let on_link = self.modifiers.control_key()
+                        && col >= 0
+                        && row >= 0
+                        && self.link_like_at(row as usize, col as usize);
                     self.window.set_cursor_icon(if on_link {
                         CursorIcon::Pointer
                     } else {
@@ -751,10 +756,11 @@ impl TerminalWindow {
                             self.mouse.released_pos = Some(self.mouse.cursor_pos);
                             self.mouse.released_offset = self.terminal.display_offset() as i64;
 
-                            // ドラッグ（選択）でない単純な左クリックで、その位置に
-                            // URL があればブラウザで開く。mouse_mode が ON の
-                            // アプリ（nvim 等）はこの分岐に来ないので邪魔しない。
-                            if *button == MouseButton::Left {
+                            // Ctrl+クリック（ドラッグでない単純クリック）で、その位置の
+                            // URL/ファイルパスを開く。素のクリックで開くと、画面上のパスを
+                            // 触っただけでプレビューが開いて誤爆するため Ctrl を必須にした。
+                            // mouse_mode が ON のアプリ（nvim 等）はこの分岐に来ない。
+                            if *button == MouseButton::Left && self.modifiers.control_key() {
                                 if let Some(press) = self.mouse.pressed_pos {
                                     let cs = self.view.cell_size();
                                     let to_cell = |p: CursorPosition| {

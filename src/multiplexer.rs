@@ -59,6 +59,7 @@ enum Action {
     SplitHorizontal,
     ToggleSidebar,
     Focus(Dir),
+    Resize(Dir),
 }
 
 /// タブ内のペイン木。葉が端末、節が分割。
@@ -188,6 +189,30 @@ impl Node {
 
     fn take_clicked_file(&mut self) -> Option<std::path::PathBuf> {
         self.focused_leaf_mut().take_clicked_file()
+    }
+
+    /// フォーカス中ペインを含む、軸 `axis` に一致する最も内側の分割の境界を
+    /// `delta` だけ動かす（絶対方向＝矢印の向きに境界が動く）。戻り値 true=動かした。
+    fn resize_focused(&mut self, axis: Partition, delta: f64) -> bool {
+        match self {
+            Node::Leaf(_) | Node::Empty => false,
+            Node::Split(s) => {
+                // フォーカス側の子を先に試し、より内側の一致を優先する。
+                let deeper = if s.focus_first {
+                    s.first.resize_focused(axis, delta)
+                } else {
+                    s.second.resize_focused(axis, delta)
+                };
+                if deeper {
+                    return true;
+                }
+                if s.partition == axis {
+                    s.ratio = (s.ratio + delta).clamp(0.15, 0.85);
+                    return true;
+                }
+                false
+            }
+        }
     }
 
     fn set_viewport(&mut self, vp: Viewport) {
@@ -649,6 +674,10 @@ pub struct Multiplexer {
     /// カーソル点滅の起点と現在の表示フェーズ。
     blink_start: Instant,
     cursor_blink_on: bool,
+    /// ワークベンチの左サイドバー幅・上プレビュー高さの比率（実行時に
+    /// Ctrl+Shift+矢印 で変えられる。初期値は config）。
+    sidebar_ratio: f64,
+    preview_ratio: f64,
 }
 
 impl Multiplexer {
@@ -698,6 +727,8 @@ impl Multiplexer {
             occluded: false,
             blink_start: Instant::now(),
             cursor_blink_on: true,
+            sidebar_ratio: crate::TOYTERM_CONFIG.sidebar_ratio,
+            preview_ratio: crate::TOYTERM_CONFIG.preview_ratio,
         };
         mux.refresh_layout();
         mux
@@ -709,6 +740,34 @@ impl Multiplexer {
 
     fn focused_location(&mut self) -> ShellLocation {
         self.focused_root().focused_leaf_mut().pane_location()
+    }
+
+    /// ペイン境界を矢印方向へ動かす。ワークベンチ表示中はその3分割の境界
+    /// （左右=サイドバー幅／上下=プレビュー高さ）を、そうでなければフォーカス中の
+    /// 分割境界を動かす。1回あたり 3%。
+    fn resize(&mut self, dir: Dir) {
+        const STEP: f64 = 0.03;
+        let (axis, sign) = match dir {
+            Dir::Left => (Partition::Vertical, -1.0),
+            Dir::Right => (Partition::Vertical, 1.0),
+            Dir::Up => (Partition::Horizontal, -1.0),
+            Dir::Down => (Partition::Horizontal, 1.0),
+        };
+        let delta = STEP * sign;
+
+        if self.sidebar.is_visible() {
+            match axis {
+                Partition::Vertical => {
+                    self.sidebar_ratio = (self.sidebar_ratio + delta).clamp(0.15, 0.6);
+                }
+                Partition::Horizontal => {
+                    self.preview_ratio = (self.preview_ratio + delta).clamp(0.15, 0.85);
+                }
+            }
+            self.refresh_layout();
+        } else if self.tabs[self.focus].resize_focused(axis, delta) {
+            self.refresh_layout();
+        }
     }
 
     /// タブバーの高さ（px）。タブ1枚のときは 0（バー非表示）。
@@ -744,8 +803,8 @@ impl Multiplexer {
         let cvp = if self.sidebar.is_visible() {
             let viewports = workbench_viewports(
                 self.content_viewport(),
-                crate::TOYTERM_CONFIG.sidebar_ratio,
-                crate::TOYTERM_CONFIG.preview_ratio,
+                self.sidebar_ratio,
+                self.preview_ratio,
             );
             self.sidebar.set_viewport(viewports.sidebar);
             self.preview_slot.set_viewport(viewports.preview);
@@ -811,6 +870,19 @@ impl Multiplexer {
             PhysicalKey::Code(c) => c,
             PhysicalKey::Unidentified(_) => return None,
         };
+
+        // フォーカス移動は Alt+矢印（Ctrl は伴わない）。リサイズに Ctrl+Shift+矢印 を
+        // 譲ったため、移動をこちらへ引っ越した。
+        if self.modifiers.alt_key() && !self.modifiers.control_key() {
+            return match code {
+                KeyCode::ArrowUp => Some(Action::Focus(Dir::Up)),
+                KeyCode::ArrowDown => Some(Action::Focus(Dir::Down)),
+                KeyCode::ArrowLeft => Some(Action::Focus(Dir::Left)),
+                KeyCode::ArrowRight => Some(Action::Focus(Dir::Right)),
+                _ => None,
+            };
+        }
+
         if !self.modifiers.control_key() {
             return None;
         }
@@ -826,11 +898,11 @@ impl Multiplexer {
             (true, KeyCode::KeyE) => Action::SplitVertical,
             (true, KeyCode::KeyO) => Action::SplitHorizontal,
             (true, KeyCode::KeyF) => Action::ToggleSidebar,
-            // フォーカス移動
-            (true, KeyCode::ArrowUp) => Action::Focus(Dir::Up),
-            (true, KeyCode::ArrowDown) => Action::Focus(Dir::Down),
-            (true, KeyCode::ArrowLeft) => Action::Focus(Dir::Left),
-            (true, KeyCode::ArrowRight) => Action::Focus(Dir::Right),
+            // ペインのリサイズ（境界を矢印方向へ動かす）
+            (true, KeyCode::ArrowUp) => Action::Resize(Dir::Up),
+            (true, KeyCode::ArrowDown) => Action::Resize(Dir::Down),
+            (true, KeyCode::ArrowLeft) => Action::Resize(Dir::Left),
+            (true, KeyCode::ArrowRight) => Action::Resize(Dir::Right),
             _ => return None,
         };
         Some(action)
@@ -900,6 +972,10 @@ impl Multiplexer {
 
             Action::Focus(dir) => {
                 self.tabs[self.focus].move_focus(dir);
+            }
+
+            Action::Resize(dir) => {
+                self.resize(dir);
             }
 
             // 1キーで3状態を回す：非表示→開いてフォーカス／表示中(端末フォーカス)→
