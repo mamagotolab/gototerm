@@ -86,7 +86,7 @@ cargo build --release
 
 ## ワークベンチ（3分割モード）
 
-### 30秒ではじめる
+### クイックスタート — 3分割を試す
 
 1. gototerm を開いて `Ctrl+Shift+F` を押す
 2. 画面が3つに分かれます
@@ -161,9 +161,14 @@ cargo build --release
 
 ### 1. gt を置く（1回だけ）
 
-```sh
-install -m 755 assets/bin/gt ~/.local/bin/gt
-```
+`gt` は **Claude Code が動いているマシン**に置きます（シェルスクリプトなので Linux / WSL / SSH 先用です）。
+
+| Claude Code をどこで動かしているか | gt を置く場所 |
+|---|---|
+| Linux ローカル | `install -m 755 assets/bin/gt ~/.local/bin/gt` |
+| Windows の **WSL 内** | WSL の中で同上 |
+| **SSH 先**のサーバ | 「SSH 先で使う」の節を参照（scp で送る） |
+| Windows ネイティブ（PowerShell 上の Claude Code） | 現状**未対応**（sh スクリプトのため）。ファイル監視ベースの changes 表示は gt なしでも動きます |
 
 （`~/.local/bin` が PATH に入っていることを確認してください）
 
@@ -197,6 +202,9 @@ gt init-hooks
 次の2つを SSH 先に置くと、**リモートの作業も手元のワークベンチに流れてきます**。
 （エスケープシーケンスは SSH を素通りするので、ポート転送などの設定は不要です）
 
+> **Windows から使う場合**：WSL は不要です。PowerShell から `ssh サーバ名` でつなぐ普通の使い方で
+> 構いません。`gt` や下のスニペットを置くのは**接続先（Linux サーバ側）**で、Windows 側の準備は要りません。
+
 ### cwd 追従（OSC 7）
 
 SSH 先のシェルに現在地を通知させます。`assets/shell-integration/` のスニペットを読み込むだけです。
@@ -213,6 +221,9 @@ PROMPT_COMMAND="__gototerm_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 zsh は `precmd`、fish は多くの環境で標準発行されます（`assets/shell-integration/osc7.zsh` / `osc7.fish` 参照）。
 
 これでリモート接続中はサイドバーが `host:path` 表示になり、手元のファイル一覧を誤って出さなくなります。
+
+**Windows ローカルの PowerShell** で cwd 追従したい場合は、PowerShell 用スニペット
+`assets/shell-integration/osc7.ps1` を `$PROFILE` から読み込んでください（SSH とは別の話ですが同じ仕組みです）。
 
 ### ファイルの中身を送る（gt）
 

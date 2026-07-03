@@ -435,7 +435,13 @@ pub(crate) fn parse_osc7(payload: &str) -> Option<(String, PathBuf)> {
     let rest = payload.strip_prefix("file://")?;
     let slash = rest.find('/')?;
     let (host, path) = rest.split_at(slash);
-    let path = percent_decode_path(path)?;
+    let mut path = percent_decode_path(path)?;
+    // Windows の file URI は "/C:/Users/..." の形になる（PowerShell からの
+    // OSC 7 など）。先頭の "/" を剥がさないと存在しないパスとして扱われる。
+    let b = path.as_bytes();
+    if b.len() >= 3 && b[0] == b'/' && b[1].is_ascii_alphabetic() && b[2] == b':' {
+        path.remove(0);
+    }
     Some((host.to_string(), PathBuf::from(path)))
 }
 
@@ -1246,6 +1252,20 @@ mod tests {
         assert_eq!(
             parse_osc7("file:///tmp"),
             Some(("".to_string(), PathBuf::from("/tmp")))
+        );
+    }
+
+    #[test]
+    fn parse_osc7_strips_leading_slash_of_windows_drive_path() {
+        // PowerShell 等が送る Windows 形式: file://HOST/C:/Users/naoto
+        assert_eq!(
+            parse_osc7("file://DESKTOP/C:/Users/naoto"),
+            Some(("DESKTOP".to_string(), PathBuf::from("C:/Users/naoto")))
+        );
+        // Unix パスの先頭スラッシュは剥がさない
+        assert_eq!(
+            parse_osc7("file://host/code"),
+            Some(("host".to_string(), PathBuf::from("/code")))
         );
     }
 
