@@ -35,6 +35,8 @@ pub struct Sidebar {
     row_actions: Vec<Option<RowAction>>,
     focused: bool,
     browse_selected: usize,
+    /// `/` 検索中の入力文字列（None=非検索）。前方一致で選択がジャンプする。
+    search: Option<String>,
     watcher: Option<WorkspaceWatcher>,
     /// バックグラウンドで生成中の watcher。生成（ディレクトリ登録）は
     /// フォルダ規模によってはブロックするので、UI スレッドでは行わない。
@@ -68,6 +70,7 @@ impl Sidebar {
             row_actions: Vec::new(),
             focused: false,
             browse_selected: 0,
+            search: None,
             watcher: None,
             watcher_pending: None,
             watcher_root: None,
@@ -98,6 +101,10 @@ impl Sidebar {
             return;
         }
         self.focused = focused && self.visible;
+        // フォーカスが外れたら検索状態を捨てる（再フォーカスで入力欄が残らないよう）。
+        if !self.focused {
+            self.search = None;
+        }
         self.rebuild();
     }
 
@@ -133,11 +140,90 @@ impl Sidebar {
             PhysicalKey::Unidentified(_) => return SidebarKeyResult::Consumed,
         };
 
+        // 検索中は入力欄として振る舞い、他のキー（h/j/k/l 等）は横取りしない。
+        if self.search.is_some() {
+            return self.on_search_key(code, key.text.as_deref());
+        }
+
         if code == KeyCode::Escape {
             return SidebarKeyResult::ReleaseFocus;
         }
 
+        // `/` で検索開始（ranger/yazi 流儀）。数が多い一覧で頭文字ジャンプに使う。
+        if key.text.as_deref() == Some("/") {
+            self.search = Some(String::new());
+            self.rebuild();
+            return SidebarKeyResult::Consumed;
+        }
+
         self.on_list_key(code)
+    }
+
+    fn on_search_key(&mut self, code: KeyCode, text: Option<&str>) -> SidebarKeyResult {
+        match code {
+            // Enter/Esc で検索終了（選択はジャンプ先に残す）。
+            KeyCode::Escape | KeyCode::Enter => {
+                self.search = None;
+                self.rebuild();
+            }
+            KeyCode::Backspace => {
+                if let Some(q) = self.search.as_mut() {
+                    q.pop();
+                }
+                self.jump_to_search();
+            }
+            _ => {
+                // 制御文字でない入力文字だけをクエリに足す。
+                if let Some(t) = text {
+                    if !t.is_empty() && t.chars().all(|c| !c.is_control()) {
+                        if let Some(q) = self.search.as_mut() {
+                            q.push_str(t);
+                        }
+                        self.jump_to_search();
+                    }
+                }
+            }
+        }
+        SidebarKeyResult::Consumed
+    }
+
+    /// クエリに前方一致（大文字小文字無視）する最初の項目へ選択を移す。
+    fn jump_to_search(&mut self) {
+        let Some(query) = self.search.clone() else {
+            return;
+        };
+        if query.is_empty() {
+            self.rebuild();
+            return;
+        }
+        let q = query.to_lowercase();
+        match self.mode {
+            SidebarMode::Files => {
+                let parent_rows = usize::from(self.browse_dir.parent().is_some());
+                if let Some(i) = self
+                    .browse_entries
+                    .iter()
+                    .position(|(name, _)| name.to_lowercase().starts_with(&q))
+                {
+                    self.set_list_selection(parent_rows + i);
+                    return;
+                }
+            }
+            SidebarMode::Changes => {
+                if let Some(i) = self.changes.iter().take(5).position(|c| {
+                    c.path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_lowercase().starts_with(&q))
+                        .unwrap_or(false)
+                }) {
+                    self.set_list_selection(i);
+                    return;
+                }
+            }
+        }
+        // 一致なし：クエリ表示を更新するため再描画だけする。
+        self.rebuild();
     }
 
     fn run_row_action(&mut self, action: RowAction) -> Option<SidebarRequest> {
@@ -693,7 +779,13 @@ impl Sidebar {
         row_actions: &mut Vec<Option<RowAction>>,
         cols: usize,
     ) {
-        let hint = " j/k:選択  l:開く  h:上へ  Esc:端末";
+        // 検索中はクエリを見せる。カーソル代わりに末尾へ '_' を付ける。
+        if let Some(query) = &self.search {
+            let line = format!(" /{query}_");
+            push_line(lines, row_actions, cols, &line, Color::BrightYellow, None);
+            return;
+        }
+        let hint = " j/k:選択 l:開く h:上へ /:検索 Esc:端末";
         push_line(lines, row_actions, cols, hint, Color::BrightBlack, None);
     }
 
@@ -994,6 +1086,7 @@ impl Sidebar {
             SidebarMode::Changes => SidebarMode::Files,
             SidebarMode::Files => SidebarMode::Changes,
         };
+        self.search = None;
         self.browse_selected = 0;
         self.browse_scroll = 0;
         if self.mode == SidebarMode::Files && self.browse_entries.is_empty() {
@@ -1016,6 +1109,7 @@ impl Sidebar {
 
     fn set_browse_dir(&mut self, dir: PathBuf) {
         self.browse_dir = dir;
+        self.search = None;
         self.browse_scroll = 0;
         self.browse_selected = 0;
         self.request_browse_dir();
