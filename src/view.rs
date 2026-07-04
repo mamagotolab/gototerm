@@ -69,6 +69,11 @@ pub struct TerminalView {
     pub selection_range: Option<Selection>,
     pub scroll_bar: Option<(u32, u32)>,
     pub bg_color: Color,
+    /// 既定背景色のセルで背景クアッドを描かず、下地の clear に任せるか。
+    /// パネル（サイドバー/プレビュー）で true にすると、不透明な下地に半透明の
+    /// セル背景が重なってアルファが落ち壁紙が透ける不具合を避けられる。
+    /// ターミナルは透過がこのクアッド由来なので false のまま。
+    pub skip_default_bg: bool,
     pub view_focused: bool,
     // カーソル点滅の表示フェーズ。false の間はカーソルを描かない。
     cursor_blink_on: bool,
@@ -159,6 +164,7 @@ impl TerminalView {
             selection_range: None,
             scroll_bar,
             bg_color: Color::Black,
+            skip_default_bg: false,
             view_focused: false,
             cursor_blink_on: true,
             updated: false,
@@ -255,7 +261,13 @@ impl TerminalView {
 
             let vertices = glium::VertexBuffer::new(&self.display, &vs).unwrap();
 
-            let texture = texture::Texture2d::with_mipmaps(
+            // データ長が寸法と合わない・寸法が0・GLの上限超過などで失敗し得る。
+            // 1枚の不正な画像でアプリ全体を落とさないよう、失敗したらスキップする。
+            let expected = (img.width * img.height * 3) as usize;
+            if img.width == 0 || img.height == 0 || img.data.len() < expected {
+                continue;
+            }
+            let texture = match texture::Texture2d::with_mipmaps(
                 &self.display,
                 glium::texture::RawImage2d {
                     data: img.data.clone().into(),
@@ -264,8 +276,10 @@ impl TerminalView {
                     format: glium::texture::ClientFormat::U8U8U8,
                 },
                 texture::MipmapsOption::NoMipmap,
-            )
-            .expect("Failed to create texture");
+            ) {
+                Ok(texture) => texture,
+                Err(_) => continue,
+            };
 
             self.draw_queries_img.push(DrawQuery {
                 vertices,
@@ -399,7 +413,13 @@ impl TerminalView {
                 let blinking = cell.attr.blinking;
 
                 // Background
-                {
+                // パネル（skip_default_bg=true）では、セル背景が既定の背景色の
+                // ときに背景クアッドを描かず下地の clear に任せる。半透明の背景色を
+                // 不透明な下地に重ねると二重合成でアルファが下がり、そのセルだけ
+                // 壁紙が透けて灰色ブロックになるのを避けるため。反転・選択・カーソルで
+                // 具体色になったセルは bg != Background なので従来どおり描く。
+                // ターミナルは透過がこのクアッド由来なので描く（skip_default_bg=false）。
+                if !(self.skip_default_bg && matches!(bg, Color::Background)) {
                     let rect = PixelRect {
                         x: (j as u32 * cell_size.w) as i32,
                         y: (i as u32 * cell_size.h) as i32,
@@ -817,16 +837,13 @@ fn color_to_rgba(color: Color) -> u32 {
 }
 
 /// ワークベンチのサイドバー/プレビュー用の背景色。
-/// ターミナルの透過（color_background のアルファ）は活かしつつ、罫線や文字が
-/// 読めるよう不透明側へ 60% 寄せる。結果としてターミナルより少し濃くなるので、
-/// 境界のコントラストも出る（clear はアルファをそのまま書き込むため、透過に
-/// すると文字の裏まで壁紙が透けて読みにくくなるのを防ぐ）。
+/// 背景色（Tokyo Night の紺）を**不透明**で塗る。半透明にすると壁紙が透けて
+/// 色がくすみ、罫線・文字も読みにくくなるため。ターミナルはユーザ設定どおり
+/// 透過のままなので、「パネルはソリッド／ターミナルは透過」で境界も締まる。
 pub(crate) fn panel_bg_color() -> Color {
     let bg = crate::TOYTERM_CONFIG.color_background;
-    let a = bg & 0xFF;
-    let a2 = a + (0xFF - a) * 3 / 5;
     Color::Rgb {
-        rgba: (bg & 0xFFFF_FF00) | a2,
+        rgba: (bg & 0xFFFF_FF00) | 0xFF,
     }
 }
 

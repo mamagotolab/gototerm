@@ -1,6 +1,6 @@
 [package]
 name = "gototerm"
-version = "0.3.3"
+version = "0.3.4"
 authors = ["mamagotolab"]
 edition = "2021"
 description = "日本語入力のストレスが少ない、AI開発ワークベンチ付き軽量ターミナル（Sixel 画像対応）"
@@ -32,6 +32,8 @@ lazy_static = "1.4.0"
 lru = { version = "0.7.8", default-features = false }
 notify = "6"
 pulldown-cmark = "0.13.4"
+# 画像プレビューのデコード。よく使う形式だけに絞って依存を軽くする。
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
 alacritty_terminal = "0.26.0"
 vte = "0.15"

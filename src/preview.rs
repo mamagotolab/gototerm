@@ -7,12 +7,27 @@ use std::time::{Duration, Instant};
 const TAIL_BYTES: u64 = 64 * 1024;
 const BINARY_SCAN_BYTES: usize = 8 * 1024;
 const READ_DEBOUNCE: Duration = Duration::from_millis(100);
+/// これより大きい画像ファイルはデコードしない（メモリ・時間の暴発を防ぐ）。
+const IMAGE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 
 pub enum PreviewContent {
     Text(Vec<String>),
+    /// プレビュー領域に収まるよう縮小済みの RGB 画像（3バイト/画素・行0＝上）。
+    Image { rgb: Vec<u8>, w: u32, h: u32 },
     Binary,
     Deleted,
     Empty,
+}
+
+/// 拡張子から画像ファイルか判定する。
+pub(crate) fn is_image_path(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp")
+    )
 }
 
 struct PreviewRead {
@@ -28,6 +43,8 @@ pub struct FilePreview {
     pending: Option<Receiver<PreviewRead>>,
     last_read: Instant,
     queued: Option<(PathBuf, PathBuf)>,
+    /// 画像を収める表示領域（px）。ペインのリサイズで更新される。
+    fit: (u32, u32),
 }
 
 impl FilePreview {
@@ -39,6 +56,26 @@ impl FilePreview {
             pending: None,
             last_read: Instant::now() - READ_DEBOUNCE,
             queued: None,
+            fit: (640, 480),
+        }
+    }
+
+    /// 画像プレビューの収まる領域（px）を設定する。変わったら true。
+    pub fn set_fit(&mut self, w: u32, h: u32) -> bool {
+        let next = (w.max(1), h.max(1));
+        if self.fit != next {
+            self.fit = next;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 現在プレビュー中が画像なら (RGB, 幅, 高さ) を返す。
+    pub fn image(&self) -> Option<(&[u8], u32, u32)> {
+        match &self.content {
+            PreviewContent::Image { rgb, w, h } => Some((rgb, *w, *h)),
+            _ => None,
         }
     }
 
@@ -113,6 +150,7 @@ impl FilePreview {
     pub fn lines(&self) -> PreviewLines<'_> {
         match &self.content {
             PreviewContent::Text(lines) => PreviewLines::Text(lines.as_slice()),
+            PreviewContent::Image { .. } => PreviewLines::Message("(画像)"),
             PreviewContent::Binary => PreviewLines::Message("(バイナリファイル)"),
             PreviewContent::Deleted => PreviewLines::Message("(削除されました)"),
             PreviewContent::Empty => {
@@ -132,16 +170,57 @@ impl FilePreview {
     fn spawn_read(&mut self, abs_path: PathBuf, display_path: PathBuf) {
         let (tx, rx) = mpsc::channel();
         let thread_target = display_path.clone();
+        let fit = self.fit;
         self.pending = Some(rx);
         self.last_read = Instant::now();
 
         std::thread::spawn(move || {
-            let content = read_tail(&abs_path);
+            let content = if is_image_path(&abs_path) {
+                read_image(&abs_path, fit.0, fit.1)
+            } else {
+                read_tail(&abs_path)
+            };
             let _ = tx.send(PreviewRead {
                 target: thread_target,
                 content,
             });
         });
+    }
+}
+
+/// 画像を表示領域 (fit_w × fit_h) に収まるよう縮小して RGB で返す（拡大はしない）。
+fn read_image(path: &Path, fit_w: u32, fit_h: u32) -> PreviewContent {
+    let Ok(meta) = std::fs::metadata(path) else {
+        return PreviewContent::Deleted;
+    };
+    if meta.len() > IMAGE_MAX_BYTES {
+        return PreviewContent::Text(vec!["(画像が大きすぎるため表示しません)".to_owned()]);
+    }
+
+    // 拡張子ではなく中身（マジックバイト）で形式を判定する。拡張子と実体が
+    // 食い違うファイル（.jpg なのに実は png 等）でも開けるようにするため。
+    let reader = match image::ImageReader::open(path).and_then(|r| r.with_guessed_format()) {
+        Ok(reader) => reader,
+        Err(_) => return PreviewContent::Deleted,
+    };
+    let img = match reader.decode() {
+        Ok(img) => img,
+        Err(e) => {
+            // 未対応形式・壊れたデータは理由を出す（どの形式がダメか分かるように）。
+            return PreviewContent::Text(vec![
+                "(この画像は表示できませんでした)".to_owned(),
+                format!("  {e}"),
+            ]);
+        }
+    };
+
+    // thumbnail は縦横比を保って fit 内に収める（元より大きくはしない）。
+    let rgb = img.thumbnail(fit_w.max(1), fit_h.max(1)).to_rgb8();
+    let (w, h) = rgb.dimensions();
+    PreviewContent::Image {
+        rgb: rgb.into_raw(),
+        w,
+        h,
     }
 }
 
@@ -241,5 +320,16 @@ mod tests {
     #[test]
     fn expands_tabs_to_four_spaces() {
         assert_eq!(tail_lines(b"a\tb", 10), vec!["a    b".to_owned()]);
+    }
+
+    #[test]
+    fn detects_image_extensions_case_insensitively() {
+        assert!(is_image_path(Path::new("a.png")));
+        assert!(is_image_path(Path::new("b.JPG")));
+        assert!(is_image_path(Path::new("dir/c.jpeg")));
+        assert!(is_image_path(Path::new("d.WebP")));
+        assert!(!is_image_path(Path::new("e.txt")));
+        assert!(!is_image_path(Path::new("f.rs")));
+        assert!(!is_image_path(Path::new("noext")));
     }
 }

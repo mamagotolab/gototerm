@@ -6,7 +6,7 @@ use winit::dpi::PhysicalPosition;
 
 use crate::config::resolve_editor;
 use crate::preview::{FilePreview, PreviewLines};
-use crate::terminal::{Cell, Color, GraphicAttribute, Line};
+use crate::terminal::{Cell, Color, GraphicAttribute, Line, PositionedImage};
 use crate::view::{TerminalView, Viewport};
 use crate::Display;
 
@@ -54,8 +54,24 @@ impl ReaderPane {
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.view.set_viewport(viewport);
+        // 画像は表示領域に合わせて縮小済みなので、ペインの大きさが変わったら
+        // 収まるサイズで取り直す。
+        if self.update_fit() && self.preview.image().is_some() {
+            self.preview.refresh_current();
+        }
         self.refresh_reader_document();
         self.rebuild();
+    }
+
+    /// 画像を収める領域（px）をビューポートから概算して preview に伝える。
+    /// ヘッダ行ぶんはざっくり差し引く。戻り値 true=変わった。
+    fn update_fit(&mut self) -> bool {
+        let vp = self.view.viewport();
+        let cw = self.view.cell_size().w.max(1);
+        let ch = self.view.cell_size().h.max(1);
+        let w = vp.w.saturating_sub(cw * 2);
+        let h = vp.h.saturating_sub(ch * 5);
+        self.preview.set_fit(w, h)
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
@@ -123,6 +139,7 @@ impl ReaderPane {
         self.pinned = true;
         self.reader_scroll = 0;
         self.reader_notice = None;
+        self.update_fit();
         self.preview
             .set_target_abs(abs_path.to_path_buf(), display_path);
         self.refresh_reader_document();
@@ -138,6 +155,7 @@ impl ReaderPane {
             .filter(|path| !path.as_os_str().is_empty())
             .map(Path::to_path_buf)
             .unwrap_or_else(|| abs_path.clone());
+        self.update_fit();
         self.preview.notify_target_abs(abs_path, display_path);
         self.refresh_reader_document();
         self.rebuild();
@@ -270,15 +288,31 @@ impl ReaderPane {
             push_separator(&mut lines, &mut row_actions, cols);
         }
 
-        let available = rows.saturating_sub(lines.len());
-        if available > 0 {
-            let scroll = if self.pinned {
-                clamp_reader_scroll(self.reader_scroll, self.reader_lines.len(), available)
-            } else {
-                self.reader_lines.len().saturating_sub(available)
-            };
-            for line in self.reader_lines.iter().skip(scroll).take(available) {
-                push_styled_line(&mut lines, &mut row_actions, cols, line, None);
+        // 画像プレビューはヘッダの下に画像を1枚だけ置き、本文テキストは出さない。
+        let mut images = Vec::new();
+        if let Some((rgb, w, h)) = self.preview.image() {
+            let header_rows = lines.len();
+            let cw = self.view.cell_size().w.max(1);
+            // 横方向は中央寄せ（画像が幅より小さいとき）。
+            let x_off = self.view.viewport().w.saturating_sub(w) / 2;
+            images.push(PositionedImage {
+                row: header_rows as isize,
+                col: (x_off / cw) as isize,
+                width: w as u64,
+                height: h as u64,
+                data: rgb.to_vec(),
+            });
+        } else {
+            let available = rows.saturating_sub(lines.len());
+            if available > 0 {
+                let scroll = if self.pinned {
+                    clamp_reader_scroll(self.reader_scroll, self.reader_lines.len(), available)
+                } else {
+                    self.reader_lines.len().saturating_sub(available)
+                };
+                for line in self.reader_lines.iter().skip(scroll).take(available) {
+                    push_styled_line(&mut lines, &mut row_actions, cols, line, None);
+                }
             }
         }
 
@@ -286,10 +320,12 @@ impl ReaderPane {
         row_actions.truncate(rows);
         self.row_actions = row_actions;
         self.view.update_contents(|view| {
-            // 透過は残しつつ罫線・文字が読める中間の背景（ターミナルより少し濃い）。
+            // パネルは不透明な Tokyo Night 背景。既定背景セルは下地に任せて
+            // 半透明の二重合成（灰色ブロック）を防ぐ。
             view.bg_color = crate::view::panel_bg_color();
+            view.skip_default_bg = true;
             view.lines = lines;
-            view.images = Vec::new();
+            view.images = images;
             view.cursor = None;
             view.selection_range = None;
         });

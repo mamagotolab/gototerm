@@ -780,8 +780,10 @@ impl Sidebar {
         self.row_actions = row_actions;
 
         self.view.update_contents(|view| {
-            // 透過は残しつつ罫線・文字が読める中間の背景（ターミナルより少し濃い）。
+            // パネルは不透明な Tokyo Night 背景。既定背景セルは下地に任せて
+            // 半透明の二重合成（灰色ブロック）を防ぐ。
             view.bg_color = crate::view::panel_bg_color();
+            view.skip_default_bg = true;
             view.lines = lines;
             view.images = Vec::new();
             view.cursor = None;
@@ -819,8 +821,17 @@ impl Sidebar {
             push_line(lines, row_actions, cols, &line, Color::BrightYellow, None);
             return;
         }
+        // ソリッド背景では BrightBlack(#414868) だと暗くて沈むので、Tokyo Night の
+        // コメント色(#565F89)で読める明るさにする。
         let hint = " j/k:選択 l:開く h:上へ /:検索 Esc:端末";
-        push_line(lines, row_actions, cols, hint, Color::BrightBlack, None);
+        push_line(
+            lines,
+            row_actions,
+            cols,
+            hint,
+            Color::Rgb { rgba: 0x565F_89FF },
+            None,
+        );
     }
 
     fn push_ai_activity(
