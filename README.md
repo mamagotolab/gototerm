@@ -8,7 +8,7 @@ gototerm（ゴトターム）は、日本語を打つ人のために作られた
 
 さらに `Ctrl+Shift+F` ひとつで、**ファイル一覧・プレビュー・ターミナルの3分割ワークベンチ**に切り替わります。
 Claude Code などの AI コーディングツールが「いま・どのファイルを・どう変えているか」を、
-隣のペインでリアルタイムに眺めながら作業できます。SSH 先の作業にも対応しています。
+隣のペインでリアルタイムに眺めながら作業できます。
 
 > 名前は、プログラミングの `goto` と、開発元 [mamagotolab](https://github.com/mamagotolab) に由来します。
 
@@ -162,7 +162,13 @@ cargo build --release
 `gt` コマンドを導入すると **Claude Code 自身から「どのツールで・どのファイルを触ったか」の正確な通知**を受け取れます。
 
 > `gt` は gototerm に同梱の小さなシェルスクリプトです（`assets/bin/gt`）。パッケージマネージャからは
-> 入りません。リポジトリが無い環境では GitHub から直接取得できます（「SSH 先で使う」の節参照）。
+> 入りません。リポジトリが手元に無い環境（Windows の exe だけ使っている場合など）では、GitHub から直接取得できます:
+>
+> ```sh
+> mkdir -p ~/.local/bin
+> curl -fsSL https://raw.githubusercontent.com/mamagotolab/gototerm/main/assets/bin/gt -o ~/.local/bin/gt
+> chmod +x ~/.local/bin/gt
+> ```
 
 ### 1. gt を置く（1回だけ）
 
@@ -172,7 +178,6 @@ cargo build --release
 |---|---|
 | Linux ローカル | `install -m 755 assets/bin/gt ~/.local/bin/gt` |
 | Windows の **WSL 内** | WSL の中で同上 |
-| **SSH 先**のサーバ | 「SSH 先で使う」の節を参照（scp で送る） |
 | Windows ネイティブ（PowerShell 上の Claude Code） | 現状**未対応**（sh スクリプトのため）。ファイル監視ベースの changes 表示は gt なしでも動きます |
 
 （`~/.local/bin` が PATH に入っていることを確認してください）
@@ -201,18 +206,10 @@ gt init-hooks
 
 ---
 
-## SSH 先で使う
+## cwd 追従（OSC 7）
 
-ワークベンチのファイル監視・一覧は手元のマシンを見るため、SSH 先の作業はそのままでは見えません。
-次の2つを SSH 先に置くと、**リモートの作業も手元のワークベンチに流れてきます**。
-（エスケープシーケンスは SSH を素通りするので、ポート転送などの設定は不要です）
-
-> **Windows から使う場合**：WSL は不要です。PowerShell から `ssh サーバ名` でつなぐ普通の使い方で
-> 構いません。`gt` や下のスニペットを置くのは**接続先（Linux サーバ側）**で、Windows 側の準備は要りません。
-
-### cwd 追従（OSC 7）
-
-SSH 先のシェルに現在地を通知させます。`assets/shell-integration/` のスニペットを読み込むだけです。
+シェルに現在地（cwd）を通知させると、`cd` に合わせてサイドバーのファイル一覧が付いてきます。
+`assets/shell-integration/` のスニペットを、お使いのシェルの起動ファイルから読み込むだけです。
 
 bash（`~/.bashrc` に追記）:
 
@@ -224,41 +221,17 @@ PROMPT_COMMAND="__gototerm_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
 ```
 
 zsh は `precmd`、fish は多くの環境で標準発行されます（`assets/shell-integration/osc7.zsh` / `osc7.fish` 参照）。
+Windows ローカルの PowerShell は `osc7.ps1` を `$PROFILE` から読み込みます（Windows は `/proc` が無いため、cwd 追従にはこの設定が必要です）。
 
-これでリモート接続中はサイドバーが `host:path` 表示になり、手元のファイル一覧を誤って出さなくなります。
-
-**Windows ローカルの PowerShell** で cwd 追従したい場合は、PowerShell 用スニペット
-`assets/shell-integration/osc7.ps1` を `$PROFILE` から読み込んでください（SSH とは別の話ですが同じ仕組みです）。
-
-### ファイルの中身を送る（gt）
-
-`gt` は gototerm に同梱の小さなシェルスクリプトです（`assets/bin/gt`）。
-リポジトリが手元にあるなら scp で:
-
-```sh
-scp assets/bin/gt remote:~/bin/gt
-ssh remote 'chmod +x ~/bin/gt'
-```
-
-手元にリポジトリが無い場合（Windows の exe だけ使っている場合など）は、
-**SSH 先で直接** GitHub から取得できます:
-
-```sh
-mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/mamagotolab/gototerm/main/assets/bin/gt -o ~/.local/bin/gt
-chmod +x ~/.local/bin/gt
-```
-
-SSH 先で:
-
-```sh
-gt view 記事.md      # このファイルの中身が、手元の右上プレビューに表示される
-gt init-hooks       # リモートの Claude Code の作業が、手元にリアルタイムで流れる
-```
+> エスケープシーケンスは SSH を素通りするので、上のスニペットや `gt` を接続先（Linux サーバ側）に置けば、
+> リモートの作業も手元のワークベンチに流せます（ポート転送などの追加設定は不要）。
 
 ---
 
-## 設定マニュアル
+## カスタマイズ
+
+フォント・色・ワークベンチの比率などは設定ファイルで変更できます
+（配色は [色の設定](#色の設定)、キー操作は[キー操作](#キー操作)を参照）。
 
 設定ファイルは **`~/.config/gototerm/config.toml`**（Windows は `%APPDATA%\gototerm\config.toml`）です。
 自動生成されないので、同梱の [`config.example.toml`](./config.example.toml) をコピーして作ります。
@@ -298,6 +271,9 @@ font_size = 17                     # ピクセル。Ctrl+= / Ctrl+- でライブ
 shell = ["/usr/bin/fish"]          # 起動するシェル（省略時は $SHELL）
 east_asian_width_ambiguous = 1     # 曖昧幅文字を全角(2マス)扱いなら 1、半角扱いなら 0
 scroll_bar_width = 5               # スクロールバーの幅(px)。0 で非表示
+status_bar_font_size = 16          # タブバー（複数タブのときだけ表示）の文字サイズ
+cursor_blink = true                # カーソルを点滅させるか
+cursor_thickness = 8               # バー/下線カーソルの太さ(px)。ブロックカーソルには影響しない
 ```
 
 ### ワークベンチの設定
@@ -347,6 +323,8 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 ---
 
 ## キー操作
+
+> キーバインドは現状すべて固定です。`config.toml` での割り当て変更には対応していません。
 
 | キー | 動作 |
 |---|---|
