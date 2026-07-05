@@ -324,7 +324,8 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 
 ## キー操作
 
-> キーバインドは現状すべて固定です。`config.toml` での割り当て変更には対応していません。
+> 下表のアプリ側キーバインドは `config.toml` の `[keybindings]` で個別に変更できます。
+> 未指定の項目は既定値のまま動作します。
 
 | キー | 動作 |
 |---|---|
@@ -354,13 +355,39 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 | `Ctrl + Shift + O` | 横の仕切りで上下に分割 |
 | `Ctrl + Shift + H / J / K / L` | 隣のペインへフォーカス移動（左 / 下 / 上 / 右） |
 | `Ctrl + Shift + ↑ / ↓ / ← / →` | ペインの境界を矢印方向へ動かす（リサイズ） |
-| `Ctrl + Shift + Q` | 現在のペインを閉じる |
 | クリック | クリックしたペインにフォーカス |
 
 > ワークベンチ表示中の `Ctrl + Shift + 矢印` は、左右でサイドバー幅・上下でプレビュー高さを調整します。
 > ターミナルのファイルパス／URL を開くのは **`Ctrl + クリック`** です（素のクリックはカーソル移動・選択）。
 
 > 新しいペインは、元のペインのシェルが居た場所（cwd）で開きます。
+
+### キーバインド設定
+
+`config.toml` に書いた項目だけが上書きされます。キー文字列は `Ctrl+Shift+T` のように
+`+` 区切りで、修飾キー `Ctrl` / `Shift` / `Alt` / `Super` のいずれかが必須です。
+
+```toml
+[keybindings]
+focus_left = "Ctrl+Alt+H"
+toggle_sidebar = "Ctrl+Shift+Space"
+new_tab = "Ctrl+Shift+N"
+```
+
+| action名 | 既定値 |
+|---|---|
+| `new_tab` | `Ctrl+Shift+T` |
+| `close_pane` | `Ctrl+Shift+W` |
+| `next_tab` | `Ctrl+Tab` |
+| `prev_tab` | `Ctrl+Shift+Tab` |
+| `split_vertical` | `Ctrl+Shift+E` |
+| `split_horizontal` | `Ctrl+Shift+O` |
+| `toggle_sidebar` | `Ctrl+Shift+F` |
+| `focus_left` / `focus_down` / `focus_up` / `focus_right` | `Ctrl+Shift+H/J/K/L` |
+| `resize_up` / `resize_down` / `resize_left` / `resize_right` | `Ctrl+Shift+↑/↓/←/→` |
+| `increase_font` / `decrease_font` | `Ctrl+=` / `Ctrl+-` |
+| `copy` / `paste` | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| `clear_history` | `Ctrl+Shift+Delete` |
 
 ---
 

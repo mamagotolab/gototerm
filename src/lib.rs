@@ -2,6 +2,7 @@ mod cache;
 mod config;
 mod font;
 mod gt;
+mod keybindings;
 mod preview;
 mod reader;
 mod sidebar;
@@ -22,4 +23,8 @@ pub type Display = glium::Display<glutin::surface::WindowSurface>;
 
 lazy_static::lazy_static! {
     pub static ref TOYTERM_CONFIG: crate::config::Config = crate::config::build();
+}
+
+pub fn initialize_keybindings() {
+    lazy_static::initialize(&crate::keybindings::KEYBINDINGS);
 }

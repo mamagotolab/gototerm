@@ -11,6 +11,7 @@ fn main() {
 
     // Make sure that configuration errors are detected earlier
     lazy_static::initialize(&gototerm::TOYTERM_CONFIG);
+    gototerm::initialize_keybindings();
 
     // Setup env_logger
     let our_logs = concat!(module_path!(), "=debug");
@@ -62,7 +63,11 @@ fn install_crash_logger() {
             let _ = std::fs::create_dir_all(dir);
         }
         use std::io::Write as _;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
             let _ = writeln!(
                 f,
                 "\n===== gototerm v{} panic =====\n{}\n{}\n--- backtrace ---\n{}",
@@ -97,8 +102,8 @@ fn load_window_icon() -> Option<winit::window::Icon> {
 fn build_window<T>(
     event_loop: &winit::event_loop::EventLoop<T>,
 ) -> (winit::window::Window, gototerm::Display) {
-    use glutin::prelude::*;
     use glutin::display::GetGlDisplay;
+    use glutin::prelude::*;
     use raw_window_handle::HasRawWindowHandle;
     use std::num::NonZeroU32;
 
@@ -131,7 +136,9 @@ fn build_window<T>(
                     _ => 0,
                 }
             };
-            let cfg = configs.reduce(|acc, c| if score(&c) > score(&acc) { c } else { acc }).unwrap();
+            let cfg = configs
+                .reduce(|acc, c| if score(&c) > score(&acc) { c } else { acc })
+                .unwrap();
             // 透過対応 config が無い環境(Windows など)では transparency=false に
             // なるが、不透明で正常に動くだけなので警告ではなく debug ログにする。
             log::debug!(

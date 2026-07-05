@@ -42,6 +42,12 @@ preview_ratio = 0.50
 # 例: ["target"] は target/foo.o と crates/app/target/foo.o の両方を無視します。
 watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 
+# アプリ側キーバインド。書いた項目だけ既定値を上書きします。
+# [keybindings]
+# focus_left = "Ctrl+Alt+H"
+# toggle_sidebar = "Ctrl+Shift+Space"
+# new_tab = "Ctrl+Shift+N"
+
 # [編集] で使うエディタ。空なら $EDITOR → nvim の順で決まる。
 # 例: editor = ["nvim"] / ["vim"] / ["micro"] / ["helix"]
 # VSCode 等の GUI エディタ派は editor を設定せず

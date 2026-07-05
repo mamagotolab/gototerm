@@ -9,6 +9,7 @@ use winit::{
 };
 
 use crate::gt::GtMessage;
+use crate::keybindings::{self, ShortcutAction};
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
 use crate::vt::{ShellLocation, VtTerminal};
@@ -945,71 +946,85 @@ impl TerminalWindow {
         // 制御シーケンスを送る特殊キーを先に処理。handled=false なら
         // 通常文字として KeyEvent.text をそのまま PTY に流す。
         let mut handled = true;
-        match (ctrl, shift, keycode) {
-            (false, _, KeyCode::Escape) => {
-                self.mouse.pressed_pos = None;
-                self.mouse.released_pos = None;
-                self.terminal.write(b"\x1B");
+        let window_shortcut = match keybindings::lookup(self.modifiers, keycode) {
+            Some(ShortcutAction::IncreaseFont) => {
+                self.increase_font_size(1);
+                true
             }
-
-            (true, false, KeyCode::Minus) => self.increase_font_size(-1),
-            (true, false, KeyCode::Equal) => self.increase_font_size(1),
-
-            // Backspace: send DEL instead of BS
-            (false, _, KeyCode::Backspace) => self.terminal.write(b"\x7f"),
-            (false, _, KeyCode::Delete) => self.terminal.write(b"\x1b[3~"),
-
-            // Shift+Enter は ESC+CR を送る。Claude Code 等の TUI はこれを
-            // 「送信せず改行」として扱う（/terminal-setup が設定するのと同じ）。
-            (false, true, KeyCode::Enter) => self.terminal.write(b"\x1b\r"),
-            (false, false, KeyCode::Enter) => self.terminal.write(b"\r"),
-            (false, _, KeyCode::Tab) => self.terminal.write(b"\t"),
-
-            // Space は明示的に空白を送る。IME 有効時に winit が text=None で
-            // Space を渡してくることがあり、その場合 text 経由だと何も送られず、
-            // Claude Code の選択(スペースでトグル)等が効かなくなるため。
-            // ここに来る時点で preedit は空（上でガード済み）なので変換中は影響しない。
-            (false, _, KeyCode::Space) => self.terminal.write(b" "),
-
-            (false, _, KeyCode::ArrowUp) => self.terminal.write(b"\x1b[\x41"),
-            (false, _, KeyCode::ArrowDown) => self.terminal.write(b"\x1b[\x42"),
-            (false, _, KeyCode::ArrowRight) => self.terminal.write(b"\x1b[\x43"),
-            (false, _, KeyCode::ArrowLeft) => self.terminal.write(b"\x1b[\x44"),
-
-            (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
-            (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),
-
-            // Ctrl+Shift+C/V: コピー・ペースト。履歴クリアは Ctrl+Shift+Delete
-            //（Ctrl+Shift+L はペインのフォーカス移動＝右 に使うため移設した）。
-            (true, true, KeyCode::KeyC) => {
+            Some(ShortcutAction::DecreaseFont) => {
+                self.increase_font_size(-1);
+                true
+            }
+            Some(ShortcutAction::Copy) => {
                 clear = false;
                 self.copy_clipboard();
+                true
             }
-            (true, true, KeyCode::KeyV) => self.paste_clipboard(),
-            (true, true, KeyCode::Delete) => {
+            Some(ShortcutAction::Paste) => {
+                self.paste_clipboard();
+                true
+            }
+            Some(ShortcutAction::ClearHistory) => {
                 self.terminal.clear_history();
+                true
             }
+            _ => false,
+        };
+        if window_shortcut {
+            handled = true;
+        } else {
+            match (ctrl, shift, keycode) {
+                (false, _, KeyCode::Escape) => {
+                    self.mouse.pressed_pos = None;
+                    self.mouse.released_pos = None;
+                    self.terminal.write(b"\x1B");
+                }
 
-            (false, _, KeyCode::F1) => self.terminal.write(b"\x1BOP"),
-            (false, _, KeyCode::F2) => self.terminal.write(b"\x1BOQ"),
-            (false, _, KeyCode::F3) => self.terminal.write(b"\x1BOR"),
-            (false, _, KeyCode::F4) => self.terminal.write(b"\x1BOS"),
-            (false, _, KeyCode::F5) => self.terminal.write(b"\x1B[15~"),
-            (false, _, KeyCode::F6) => self.terminal.write(b"\x1B[17~"),
-            (false, _, KeyCode::F7) => self.terminal.write(b"\x1B[18~"),
-            (false, _, KeyCode::F8) => self.terminal.write(b"\x1B[19~"),
-            (false, _, KeyCode::F9) => self.terminal.write(b"\x1B[20~"),
-            (false, _, KeyCode::F10) => self.terminal.write(b"\x1B[21~"),
-            (false, _, KeyCode::F11) => self.terminal.write(b"\x1B[23~"),
-            (false, _, KeyCode::F12) => self.terminal.write(b"\x1B[24~"),
+                // Backspace: send DEL instead of BS
+                (false, _, KeyCode::Backspace) => self.terminal.write(b"\x7f"),
+                (false, _, KeyCode::Delete) => self.terminal.write(b"\x1b[3~"),
 
-            // Ctrl+英字（Shiftなし）は制御コードへ。Ctrl+C/L/V もここで処理。
-            (true, false, code) => match ctrl_letter_code(code) {
-                Some(b) => self.terminal.write(&[b]),
-                None => handled = false,
-            },
+                // Shift+Enter は ESC+CR を送る。Claude Code 等の TUI はこれを
+                // 「送信せず改行」として扱う（/terminal-setup が設定するのと同じ）。
+                (false, true, KeyCode::Enter) => self.terminal.write(b"\x1b\r"),
+                (false, false, KeyCode::Enter) => self.terminal.write(b"\r"),
+                (false, _, KeyCode::Tab) => self.terminal.write(b"\t"),
 
-            _ => handled = false,
+                // Space は明示的に空白を送る。IME 有効時に winit が text=None で
+                // Space を渡してくることがあり、その場合 text 経由だと何も送られず、
+                // Claude Code の選択(スペースでトグル)等が効かなくなるため。
+                // ここに来る時点で preedit は空（上でガード済み）なので変換中は影響しない。
+                (false, _, KeyCode::Space) => self.terminal.write(b" "),
+
+                (false, _, KeyCode::ArrowUp) => self.terminal.write(b"\x1b[\x41"),
+                (false, _, KeyCode::ArrowDown) => self.terminal.write(b"\x1b[\x42"),
+                (false, _, KeyCode::ArrowRight) => self.terminal.write(b"\x1b[\x43"),
+                (false, _, KeyCode::ArrowLeft) => self.terminal.write(b"\x1b[\x44"),
+
+                (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
+                (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),
+
+                (false, _, KeyCode::F1) => self.terminal.write(b"\x1BOP"),
+                (false, _, KeyCode::F2) => self.terminal.write(b"\x1BOQ"),
+                (false, _, KeyCode::F3) => self.terminal.write(b"\x1BOR"),
+                (false, _, KeyCode::F4) => self.terminal.write(b"\x1BOS"),
+                (false, _, KeyCode::F5) => self.terminal.write(b"\x1B[15~"),
+                (false, _, KeyCode::F6) => self.terminal.write(b"\x1B[17~"),
+                (false, _, KeyCode::F7) => self.terminal.write(b"\x1B[18~"),
+                (false, _, KeyCode::F8) => self.terminal.write(b"\x1B[19~"),
+                (false, _, KeyCode::F9) => self.terminal.write(b"\x1B[20~"),
+                (false, _, KeyCode::F10) => self.terminal.write(b"\x1B[21~"),
+                (false, _, KeyCode::F11) => self.terminal.write(b"\x1B[23~"),
+                (false, _, KeyCode::F12) => self.terminal.write(b"\x1B[24~"),
+
+                // Ctrl+英字（Shiftなし）は制御コードへ。Ctrl+C/L/V もここで処理。
+                (true, false, code) => match ctrl_letter_code(code) {
+                    Some(b) => self.terminal.write(&[b]),
+                    None => handled = false,
+                },
+
+                _ => handled = false,
+            }
         }
 
         if !handled {

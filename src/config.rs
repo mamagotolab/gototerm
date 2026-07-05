@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -24,6 +25,9 @@ pub struct Config {
     pub preview_ratio: f64,
     // ファイル監視で無視するパス構成要素。
     pub watch_ignore: Vec<String>,
+    // アプリ側ショートカットの個別上書き。
+    #[serde(default)]
+    pub keybindings: HashMap<String, String>,
 
     // RRGGBBAA
     pub color_background: u32,
@@ -91,6 +95,7 @@ impl Default for Config {
                 "dist".to_owned(),
                 "__pycache__".to_owned(),
             ],
+            keybindings: HashMap::new(),
 
             scroll_bar_width: 5,
             // 既定の配色は Tokyo Night（Night バリアント）。

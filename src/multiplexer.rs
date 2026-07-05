@@ -13,12 +13,13 @@ use winit::{
     dpi::PhysicalPosition,
     event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoopWindowTarget},
-    keyboard::{KeyCode, ModifiersState, PhysicalKey},
+    keyboard::{ModifiersState, PhysicalKey},
     window::Window,
 };
 
 use crate::config::resolve_editor;
 use crate::gt::{GtFileAssembler, GtMessage};
+use crate::keybindings::{self, ShortcutAction};
 use crate::reader::{ReaderHeaderAction, ReaderPane, ReaderRequest};
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::terminal::{Cell, Color, Line};
@@ -902,35 +903,28 @@ impl Multiplexer {
             PhysicalKey::Unidentified(_) => return None,
         };
 
-        if !self.modifiers.control_key() {
-            return None;
+        match keybindings::lookup(self.modifiers, code)? {
+            ShortcutAction::NewTab => Some(Action::NewTab),
+            ShortcutAction::ClosePane => Some(Action::CloseFocused),
+            ShortcutAction::NextTab => Some(Action::NextTab),
+            ShortcutAction::PrevTab => Some(Action::PrevTab),
+            ShortcutAction::SplitVertical => Some(Action::SplitVertical),
+            ShortcutAction::SplitHorizontal => Some(Action::SplitHorizontal),
+            ShortcutAction::ToggleSidebar => Some(Action::ToggleSidebar),
+            ShortcutAction::FocusLeft => Some(Action::Focus(Dir::Left)),
+            ShortcutAction::FocusDown => Some(Action::Focus(Dir::Down)),
+            ShortcutAction::FocusUp => Some(Action::Focus(Dir::Up)),
+            ShortcutAction::FocusRight => Some(Action::Focus(Dir::Right)),
+            ShortcutAction::ResizeUp => Some(Action::Resize(Dir::Up)),
+            ShortcutAction::ResizeDown => Some(Action::Resize(Dir::Down)),
+            ShortcutAction::ResizeLeft => Some(Action::Resize(Dir::Left)),
+            ShortcutAction::ResizeRight => Some(Action::Resize(Dir::Right)),
+            ShortcutAction::IncreaseFont
+            | ShortcutAction::DecreaseFont
+            | ShortcutAction::Copy
+            | ShortcutAction::Paste
+            | ShortcutAction::ClearHistory => None,
         }
-        let shift = self.modifiers.shift_key();
-
-        let action = match (shift, code) {
-            // タブ
-            (false, KeyCode::Tab) => Action::NextTab,
-            (true, KeyCode::Tab) => Action::PrevTab,
-            (true, KeyCode::KeyT) => Action::NewTab,
-            (true, KeyCode::KeyW) | (true, KeyCode::KeyQ) => Action::CloseFocused,
-            // 分割
-            (true, KeyCode::KeyE) => Action::SplitVertical,
-            (true, KeyCode::KeyO) => Action::SplitHorizontal,
-            (true, KeyCode::KeyF) => Action::ToggleSidebar,
-            // フォーカス移動は vim 流 H/J/K/L。Alt+矢印 は Hyprland/IME に
-            // 横取りされて届かなかったため、確実に届く Ctrl+Shift+英字にした。
-            (true, KeyCode::KeyH) => Action::Focus(Dir::Left),
-            (true, KeyCode::KeyJ) => Action::Focus(Dir::Down),
-            (true, KeyCode::KeyK) => Action::Focus(Dir::Up),
-            (true, KeyCode::KeyL) => Action::Focus(Dir::Right),
-            // ペインのリサイズ（境界を矢印方向へ動かす）
-            (true, KeyCode::ArrowUp) => Action::Resize(Dir::Up),
-            (true, KeyCode::ArrowDown) => Action::Resize(Dir::Down),
-            (true, KeyCode::ArrowLeft) => Action::Resize(Dir::Left),
-            (true, KeyCode::ArrowRight) => Action::Resize(Dir::Right),
-            _ => return None,
-        };
-        Some(action)
     }
 
     fn handle_action(&mut self, action: Action) {
