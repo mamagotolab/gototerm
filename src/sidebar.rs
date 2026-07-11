@@ -803,8 +803,9 @@ impl Sidebar {
         };
         if let Some(line) = lines.get_mut(row) {
             for cell in line.cells_mut() {
-                cell.attr.fg = Color::Black;
-                cell.attr.bg = Color::White;
+                // ランチャーと同じ Tokyo Night の青い選択バー。
+                cell.attr.fg = crate::file_style::SEL_FG;
+                cell.attr.bg = crate::file_style::SEL_BG;
             }
         }
     }
@@ -1060,12 +1061,13 @@ impl Sidebar {
         );
 
         if self.browse_dir.parent().is_some() {
+            let (icon, color) = crate::file_style::icon_and_color("..", true);
             push_line(
                 lines,
                 row_actions,
                 cols,
-                "   ../",
-                Color::Blue,
+                &format!("  {icon}  ../"),
+                color,
                 Some(RowAction::BrowseParent),
             );
         }
@@ -1076,22 +1078,18 @@ impl Sidebar {
             .skip(scroll)
             .take(visible_entries)
         {
+            let (icon, color) = crate::file_style::icon_and_color(name, *is_dir);
             let suffix = if *is_dir { "/" } else { "" };
-            let label = abbreviate_start(&format!("   {name}{suffix}"), cols);
+            // アイコン＋余白(計5列)を空けて、名前だけを幅に合わせて省略する。
+            let inner = abbreviate_start(&format!("{name}{suffix}"), cols.saturating_sub(5));
+            let label = format!("  {icon}  {inner}");
             let path = self.browse_dir.join(name);
             let action = if *is_dir {
                 RowAction::BrowseDir(path)
             } else {
                 RowAction::PreviewFile(path)
             };
-            push_line(
-                lines,
-                row_actions,
-                cols,
-                &label,
-                if *is_dir { Color::Blue } else { Color::White },
-                Some(action),
-            );
+            push_line(lines, row_actions, cols, &label, color, Some(action));
         }
 
         if self.browse_entries.is_empty() {

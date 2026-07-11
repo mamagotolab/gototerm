@@ -250,6 +250,16 @@ impl ReaderPane {
                 Color::BrightWhite,
                 action,
             );
+            if self.preview.is_diff() {
+                push_line(
+                    &mut lines,
+                    &mut row_actions,
+                    cols,
+                    " ● HEAD との差分",
+                    Color::Cyan,
+                    None,
+                );
+            }
         }
 
         if let Some(abs_path) = self.preview.target_abs() {
@@ -357,6 +367,18 @@ impl ReaderPane {
                             .collect()
                     }
                 }
+                PreviewLines::Diff(diff_lines) => {
+                    let wrap_cols = self.reader_wrap_cols();
+                    diff_lines
+                        .iter()
+                        .flat_map(|line| {
+                            let color = diff_line_color(line);
+                            wrap_line(line, wrap_cols)
+                                .into_iter()
+                                .map(move |line| styled_plain(line, color))
+                        })
+                        .collect()
+                }
                 PreviewLines::Message(message) => {
                     vec![styled_plain(message.to_owned(), Color::BrightBlack)]
                 }
@@ -378,6 +400,7 @@ impl ReaderPane {
     fn reader_body_slots(&self) -> usize {
         let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
         let header_rows = usize::from(self.preview.target().is_some())
+            + usize::from(self.preview.is_diff())
             + usize::from(self.preview.target_abs().is_some()) * 2
             + usize::from(self.reader_notice.is_some())
             + usize::from(self.preview.target().is_some());
@@ -498,6 +521,28 @@ fn styled_plain(text: String, fg: Color) -> StyledLine {
         text,
         style: TextStyle { fg, bold: false },
     }]
+}
+
+pub(crate) fn diff_line_color(line: &str) -> Color {
+    if line.starts_with("@@") {
+        Color::Cyan
+    } else if line.starts_with("+++ ") || line.starts_with("--- ") {
+        Color::BrightBlack
+    } else if line.starts_with("diff --git")
+        || line.starts_with("index ")
+        || line.starts_with("new file")
+        || line.starts_with("deleted file")
+        || line.starts_with("rename ")
+        || line.starts_with("similarity ")
+    {
+        Color::BrightBlack
+    } else if line.starts_with('+') {
+        Color::Green
+    } else if line.starts_with('-') {
+        Color::Red
+    } else {
+        Color::White
+    }
 }
 
 pub(crate) fn wrap_line(line: &str, cols: usize) -> Vec<String> {
@@ -799,7 +844,7 @@ fn reader_scroll_max(len: usize, visible: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{clamp_reader_scroll, render_markdown, wrap_line, StyledLine};
+    use super::{clamp_reader_scroll, diff_line_color, render_markdown, wrap_line, StyledLine};
 
     fn line_text(line: &StyledLine) -> String {
         line.iter().map(|segment| segment.text.as_str()).collect()
@@ -835,6 +880,38 @@ mod tests {
     #[test]
     fn wrap_line_preserves_empty_line() {
         assert_eq!(wrap_line("", 4), vec![""]);
+    }
+
+    #[test]
+    fn diff_line_color_classifies_unified_diff_lines() {
+        assert!(matches!(
+            diff_line_color("@@ -1,3 +1,4 @@"),
+            crate::terminal::Color::Cyan
+        ));
+        assert!(matches!(
+            diff_line_color("+added"),
+            crate::terminal::Color::Green
+        ));
+        assert!(matches!(
+            diff_line_color("-removed"),
+            crate::terminal::Color::Red
+        ));
+        assert!(matches!(
+            diff_line_color("+++ b/x"),
+            crate::terminal::Color::BrightBlack
+        ));
+        assert!(matches!(
+            diff_line_color("--- a/x"),
+            crate::terminal::Color::BrightBlack
+        ));
+        assert!(matches!(
+            diff_line_color("diff --git a/x b/x"),
+            crate::terminal::Color::BrightBlack
+        ));
+        assert!(matches!(
+            diff_line_color(" context"),
+            crate::terminal::Color::White
+        ));
     }
 
     #[test]

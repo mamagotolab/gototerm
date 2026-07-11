@@ -10,16 +10,8 @@ use crate::terminal::{Cell, Color, GraphicAttribute, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::Display;
 
-/// Tokyo Night のコメント色（区切り・ヒント・ファイル名の落ち着いた表示に使う）。
-const DIM: Color = Color::Rgb { rgba: 0x565F_89FF };
-/// フォルダ名の色（Tokyo Night の青）。
-const DIR_FG: Color = Color::BrightBlue;
-/// 選択バーの背景（Tokyo Night の青。白バーより洒落る）。
-const SEL_BG: Color = Color::Rgb { rgba: 0x3D59_A1FF };
-/// 選択バーの文字色。
-const SEL_FG: Color = Color::BrightWhite;
-/// パンくずの区切り記号などのアクセント（TN シアン寄りの紫）。
-const ACCENT: Color = Color::Rgb { rgba: 0x7DCF_FFFF };
+// 色・アイコンはサイドバーのファイル一覧と共通（見た目を揃える）。
+use crate::file_style::{icon_and_color, ACCENT, DIM, DIR_FG, SEL_BG, SEL_FG};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LauncherOutcome {
@@ -728,36 +720,8 @@ fn entry_fg(e: &Entry) -> Color {
     entry_icon_fg(e).1
 }
 
-/// エントリのアイコン（Nerd Font）と文字色を、種類・拡張子で出し分ける。
-/// アイコンが無いフォント環境では豆腐になるが、config で Nerd Font 指定済み前提。
 fn entry_icon_fg(e: &Entry) -> (char, Color) {
-    if e.name == ".." {
-        return ('\u{f062}', ACCENT); // arrow-up
-    }
-    if e.is_dir {
-        return ('\u{f07b}', DIR_FG); // folder
-    }
-    let ext = e
-        .name
-        .rsplit_once('.')
-        .map(|(_, ext)| ext.to_ascii_lowercase())
-        .unwrap_or_default();
-    match ext.as_str() {
-        "rs" => ('\u{e7a8}', Color::Rgb { rgba: 0xE0AF_68FF }), // rust
-        "md" | "markdown" => ('\u{f48a}', Color::BrightCyan),
-        "toml" | "yaml" | "yml" | "json" | "lock" | "ini" | "conf" => {
-            ('\u{e615}', Color::Rgb { rgba: 0xE0AF_68FF })
-        }
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "svg" | "ico" => {
-            ('\u{f1c5}', Color::BrightMagenta)
-        }
-        "sh" | "bash" | "zsh" | "fish" => ('\u{f489}', Color::Rgb { rgba: 0x9ECE_6AFF }),
-        "js" | "ts" | "py" | "go" | "c" | "cpp" | "h" | "html" | "css" => {
-            ('\u{f121}', Color::BrightCyan)
-        }
-        "txt" | "log" => ('\u{f0f6}', DIM),
-        _ => ('\u{f15b}', DIM), // generic file
-    }
+    icon_and_color(&e.name, e.is_dir)
 }
 
 fn resolve_existing_dir(path: &Path) -> Option<PathBuf> {

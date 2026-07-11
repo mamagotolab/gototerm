@@ -1,6 +1,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
@@ -9,11 +10,17 @@ const BINARY_SCAN_BYTES: usize = 8 * 1024;
 const READ_DEBOUNCE: Duration = Duration::from_millis(100);
 /// これより大きい画像ファイルはデコードしない（メモリ・時間の暴発を防ぐ）。
 const IMAGE_MAX_BYTES: u64 = 32 * 1024 * 1024;
+const DIFF_MAX_BYTES: usize = 512 * 1024;
 
 pub enum PreviewContent {
     Text(Vec<String>),
+    Diff(Vec<String>),
     /// プレビュー領域に収まるよう縮小済みの RGB 画像（3バイト/画素・行0＝上）。
-    Image { rgb: Vec<u8>, w: u32, h: u32 },
+    Image {
+        rgb: Vec<u8>,
+        w: u32,
+        h: u32,
+    },
     Binary,
     Deleted,
     Empty,
@@ -77,6 +84,10 @@ impl FilePreview {
             PreviewContent::Image { rgb, w, h } => Some((rgb, *w, *h)),
             _ => None,
         }
+    }
+
+    pub fn is_diff(&self) -> bool {
+        matches!(self.content, PreviewContent::Diff(_))
     }
 
     pub fn target(&self) -> Option<&Path> {
@@ -150,6 +161,7 @@ impl FilePreview {
     pub fn lines(&self) -> PreviewLines<'_> {
         match &self.content {
             PreviewContent::Text(lines) => PreviewLines::Text(lines.as_slice()),
+            PreviewContent::Diff(lines) => PreviewLines::Diff(lines.as_slice()),
             PreviewContent::Image { .. } => PreviewLines::Message("(画像)"),
             PreviewContent::Binary => PreviewLines::Message("(バイナリファイル)"),
             PreviewContent::Deleted => PreviewLines::Message("(削除されました)"),
@@ -177,6 +189,8 @@ impl FilePreview {
         std::thread::spawn(move || {
             let content = if is_image_path(&abs_path) {
                 read_image(&abs_path, fit.0, fit.1)
+            } else if let Some(diff) = read_diff(&abs_path) {
+                PreviewContent::Diff(diff)
             } else {
                 read_tail(&abs_path)
             };
@@ -226,7 +240,33 @@ fn read_image(path: &Path, fit_w: u32, fit_h: u32) -> PreviewContent {
 
 pub enum PreviewLines<'a> {
     Text(&'a [String]),
+    Diff(&'a [String]),
     Message(&'static str),
+}
+
+fn read_diff(abs_path: &Path) -> Option<Vec<String>> {
+    let parent = abs_path.parent()?;
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(parent)
+        .arg("diff")
+        .arg("HEAD")
+        .arg("--no-color")
+        .arg("--")
+        .arg(abs_path)
+        .output()
+        .ok()?;
+
+    if !output.status.success() || output.stdout.is_empty() {
+        return None;
+    }
+
+    // diff は先頭（ファイル見出し・最初のハンク）から見せたい。tail_lines は
+    // 末尾 max 行を返すので、全行を得てから先頭 5000 行に切る。
+    let limit = output.stdout.len().min(DIFF_MAX_BYTES);
+    let mut lines = tail_lines(&output.stdout[..limit], usize::MAX);
+    lines.truncate(5000);
+    Some(lines)
 }
 
 fn read_tail(path: &Path) -> PreviewContent {
@@ -320,6 +360,18 @@ mod tests {
     #[test]
     fn expands_tabs_to_four_spaces() {
         assert_eq!(tail_lines(b"a\tb", 10), vec!["a    b".to_owned()]);
+    }
+
+    #[test]
+    fn preview_lines_exposes_diff_content() {
+        let mut preview = FilePreview::new();
+        preview.content = PreviewContent::Diff(vec!["+added".to_owned()]);
+
+        match preview.lines() {
+            PreviewLines::Diff(lines) => assert_eq!(lines, &["+added".to_owned()]),
+            _ => panic!("expected diff preview lines"),
+        }
+        assert!(preview.is_diff());
     }
 
     #[test]

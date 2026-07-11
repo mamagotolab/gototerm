@@ -3,6 +3,7 @@ mod config;
 mod font;
 mod gt;
 mod keybindings;
+mod file_style;
 mod launcher;
 mod preview;
 mod reader;
