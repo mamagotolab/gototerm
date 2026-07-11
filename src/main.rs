@@ -9,6 +9,17 @@ fn main() {
     // パニック箇所とバックトレースを書き出す。
     install_crash_logger();
 
+    // 起動ディレクトリを引数で受け取る（例: `gototerm ~/work/foo`）。
+    // Windows のエクスプローラー右クリック「ここで gototerm を開く」から
+    // フォルダパス（%V）を渡すために使う。存在するディレクトリなら cwd にする。
+    // 以降の cwd 参照（最初のペイン・ランチャー）が全てここを起点にする。
+    if let Some(arg) = std::env::args_os().nth(1) {
+        let path = std::path::PathBuf::from(arg);
+        if path.is_dir() {
+            let _ = std::env::set_current_dir(&path);
+        }
+    }
+
     // Make sure that configuration errors are detected earlier
     lazy_static::initialize(&gototerm::TOYTERM_CONFIG);
     gototerm::initialize_keybindings();
