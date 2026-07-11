@@ -13,6 +13,7 @@ const MOD_SUPER: u8 = 1 << 3;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ShortcutAction {
     NewTab,
+    OpenLauncher,
     ClosePane,
     NextTab,
     PrevTab,
@@ -330,6 +331,11 @@ fn key_name(key: KeyCode) -> &'static str {
 fn default_bindings() -> &'static [(&'static str, &'static str, ShortcutAction)] {
     &[
         ("new_tab", "Ctrl+Shift+T", ShortcutAction::NewTab),
+        (
+            "open_launcher",
+            "Ctrl+Shift+N",
+            ShortcutAction::OpenLauncher,
+        ),
         ("close_pane", "Ctrl+Shift+W", ShortcutAction::ClosePane),
         ("next_tab", "Ctrl+Tab", ShortcutAction::NextTab),
         ("prev_tab", "Ctrl+Shift+Tab", ShortcutAction::PrevTab),

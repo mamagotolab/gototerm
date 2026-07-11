@@ -5,7 +5,7 @@
 //! ウィンドウ全体のイベント（リサイズ・再描画・終了）はここで握り、
 //! キー/マウス/IME は現在フォーカスしているペインへ振り分ける。
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,9 @@ use winit::{
 use crate::config::resolve_editor;
 use crate::gt::{GtFileAssembler, GtMessage};
 use crate::keybindings::{self, ShortcutAction};
+use crate::launcher::{Launcher, LauncherOutcome};
 use crate::reader::{ReaderHeaderAction, ReaderPane, ReaderRequest};
+use crate::recent::RecentProjects;
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::terminal::{Cell, Color, Line};
 use crate::view::{TerminalView, Viewport};
@@ -53,6 +55,7 @@ enum Dir {
 #[derive(Clone, Copy)]
 enum Action {
     NewTab,
+    OpenLauncher,
     CloseFocused,
     NextTab,
     PrevTab,
@@ -171,6 +174,36 @@ fn command_exists(command: &str) -> bool {
         }
     }
     false
+}
+
+/// エージェント起動コマンドを「実行後に対話シェルへ落ちる」形に包む。
+/// 例: fish なら `fish -c 'codex; exec fish'`。抜けてもタブが残る。
+/// `None`（＝そのまま作業＝シェル）はそのまま。Windows は従来どおり直接実行。
+fn wrap_agent_command(command: Option<Vec<String>>) -> Option<Vec<String>> {
+    let cmd = command?;
+    if cfg!(windows) || cmd.is_empty() {
+        return Some(cmd);
+    }
+    let shell = crate::TOYTERM_CONFIG
+        .shell
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "/bin/sh".to_owned());
+    let joined = cmd
+        .iter()
+        .map(|arg| sh_quote(arg))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Some(vec![
+        shell.clone(),
+        "-c".to_owned(),
+        format!("{joined}; exec {}", sh_quote(&shell)),
+    ])
+}
+
+/// POSIX/fish で安全な単一引用符クォート。
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 impl Node {
@@ -445,6 +478,28 @@ mod tests {
     use super::*;
 
     #[test]
+    fn sh_quote_wraps_and_escapes_single_quotes() {
+        assert_eq!(sh_quote("codex"), "'codex'");
+        assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn wrap_agent_command_keeps_shell_choice_as_none() {
+        assert_eq!(wrap_agent_command(None), None);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn wrap_agent_command_drops_to_shell_after_agent() {
+        let wrapped = wrap_agent_command(Some(vec!["codex".to_owned()])).unwrap();
+        // [shell, "-c", "<agent>; exec <shell>"]
+        assert_eq!(wrapped.len(), 3);
+        assert_eq!(wrapped[1], "-c");
+        assert!(wrapped[2].contains("'codex'"));
+        assert!(wrapped[2].contains("; exec "));
+    }
+
+    #[test]
     fn vertical_split_leaves_a_gap_and_fills_width() {
         let vp = Viewport {
             x: 10,
@@ -661,6 +716,10 @@ pub struct Multiplexer {
     sidebar: Sidebar,
     sidebar_focused: bool,
     preview_slot: PreviewSlot,
+    launcher: Option<Launcher>,
+    recent: RecentProjects,
+    /// 起動時に自動で開いたランチャーか（true の間に選ぶと最初の空タブを畳む）。
+    startup_launcher: bool,
     editor_focused: bool,
     gt_file_assembler: GtFileAssembler,
     tabs: Vec<Node>,
@@ -702,6 +761,9 @@ impl Multiplexer {
         let sidebar = Sidebar::new(display.clone(), viewport);
         let preview_slot = PreviewSlot::Reader(ReaderPane::new(display.clone(), viewport));
 
+        let mut recent = RecentProjects::load();
+        let initial_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+
         // 最初のタブ（1枚なのでタブバーは出ない＝全面が端末）。
         let first = Node::Leaf(Box::new(TerminalWindow::with_viewport(
             window.clone(),
@@ -709,6 +771,7 @@ impl Multiplexer {
             viewport,
             None,
         )));
+        recent.record(&initial_cwd);
 
         let mut mux = Multiplexer {
             window,
@@ -718,6 +781,9 @@ impl Multiplexer {
             sidebar,
             sidebar_focused: false,
             preview_slot,
+            launcher: None,
+            recent,
+            startup_launcher: false,
             editor_focused: false,
             gt_file_assembler: GtFileAssembler::default(),
             tabs: vec![first],
@@ -732,6 +798,15 @@ impl Multiplexer {
             preview_ratio: crate::TOYTERM_CONFIG.preview_ratio,
         };
         mux.refresh_layout();
+        // 設定で有効なら、起動直後にランチャーを重ねて出す。
+        if crate::TOYTERM_CONFIG.show_launcher_on_start {
+            mux.launcher = Some(Launcher::new(
+                mux.display.clone(),
+                mux.viewport,
+                mux.recent.entries(),
+            ));
+            mux.startup_launcher = true;
+        }
         mux
     }
 
@@ -905,6 +980,7 @@ impl Multiplexer {
 
         match keybindings::lookup(self.modifiers, code)? {
             ShortcutAction::NewTab => Some(Action::NewTab),
+            ShortcutAction::OpenLauncher => Some(Action::OpenLauncher),
             ShortcutAction::ClosePane => Some(Action::CloseFocused),
             ShortcutAction::NextTab => Some(Action::NextTab),
             ShortcutAction::PrevTab => Some(Action::PrevTab),
@@ -930,21 +1006,16 @@ impl Multiplexer {
     fn handle_action(&mut self, action: Action) {
         match action {
             Action::NewTab => {
-                self.focused_root().focused_leaf_mut().focus_changed(false);
+                self.open_tab_in(None, None);
+            }
 
-                // タブが増えるとバーが出て内容領域が縮むので、push 後に再レイアウト。
-                let cvp = self.content_viewport();
-                let pane = Node::Leaf(Box::new(TerminalWindow::with_viewport(
-                    self.window.clone(),
+            Action::OpenLauncher => {
+                self.launcher = Some(Launcher::new(
                     self.display.clone(),
-                    cvp,
-                    None,
-                )));
-                self.tabs.push(pane);
-                self.focus = self.tabs.len() - 1;
-                self.refresh_layout();
-                self.focused_root().focused_leaf_mut().focus_changed(true);
-                self.update_status_bar();
+                    self.viewport,
+                    self.recent.entries(),
+                ));
+                self.window.request_redraw();
             }
 
             Action::CloseFocused => {
@@ -1015,6 +1086,60 @@ impl Multiplexer {
                     self.release_editor_focus();
                     self.refresh_layout();
                 }
+            }
+        }
+    }
+
+    fn open_tab_in(&mut self, cwd: Option<&Path>, command: Option<&[String]>) {
+        self.focused_root().focused_leaf_mut().focus_changed(false);
+
+        // タブが増えるとバーが出て内容領域が縮むので、push 後に再レイアウト。
+        let cvp = self.content_viewport();
+        let pane = Node::Leaf(Box::new(TerminalWindow::with_viewport_command(
+            self.window.clone(),
+            self.display.clone(),
+            cvp,
+            cwd,
+            command,
+        )));
+        self.tabs.push(pane);
+        self.focus = self.tabs.len() - 1;
+        self.refresh_layout();
+        self.focused_root().focused_leaf_mut().focus_changed(true);
+        self.update_status_bar();
+        if let Some(cwd) = cwd {
+            self.recent.record(cwd);
+        }
+    }
+
+    fn handle_launcher_outcome(&mut self, outcome: LauncherOutcome) {
+        match outcome {
+            LauncherOutcome::OpenIn { dir, command } => {
+                let replace_startup = self.startup_launcher;
+                self.startup_launcher = false;
+                self.launcher = None;
+                // エージェントは「抜けたらそのフォルダのシェルへ戻る」形で起動する
+                // （直接 exec だと exit でタブごと閉じてしまう）。シェル選択は None のまま。
+                let launch = wrap_agent_command(command);
+                self.open_tab_in(Some(&dir), launch.as_deref());
+                // 起動時ランチャーで選んだ場合、自動で立った最初の空シェルタブを畳む。
+                if replace_startup && self.tabs.len() > 1 {
+                    self.tabs[0].close_focused(); // 最初のタブは単一ペイン＝PTY を閉じる
+                    self.tabs.remove(0);
+                    self.focus = self.tabs.len() - 1;
+                    self.refresh_layout();
+                    self.focused_root().focused_leaf_mut().focus_changed(true);
+                    self.update_status_bar();
+                }
+                self.window.request_redraw();
+            }
+            LauncherOutcome::Cancelled => {
+                self.startup_launcher = false;
+                self.launcher = None;
+                self.window.request_redraw();
+            }
+            LauncherOutcome::None => {
+                self.window.request_redraw();
             }
         }
     }
@@ -1269,6 +1394,9 @@ impl Multiplexer {
                         h: new_size.height,
                     };
                     self.refresh_layout();
+                    if let Some(launcher) = self.launcher.as_mut() {
+                        launcher.set_viewport(self.viewport);
+                    }
                     self.update_status_bar();
                     // リサイズが来た＝ウィンドウは見えている。モニター切替時に
                     // Occluded(true) を受けたまま解除イベントを取りこぼすと画面が
@@ -1291,6 +1419,9 @@ impl Multiplexer {
                         h: new.height,
                     };
                     self.refresh_layout();
+                    if let Some(launcher) = self.launcher.as_mut() {
+                        launcher.set_viewport(self.viewport);
+                    }
                     self.update_status_bar();
                     self.occluded = false;
                     self.window.request_redraw();
@@ -1356,6 +1487,9 @@ impl Multiplexer {
                         self.preview_slot.draw(&mut surface);
                     }
                     self.sidebar.draw(&mut surface);
+                    if let Some(launcher) = self.launcher.as_mut() {
+                        launcher.draw(&mut surface);
+                    }
 
                     surface.finish().expect("finish");
                 }
@@ -1391,6 +1525,11 @@ impl Multiplexer {
                                 .focused_leaf_mut()
                                 .set_cursor_blink(true);
                         }
+                    }
+                    if let Some(launcher) = self.launcher.as_mut() {
+                        let outcome = launcher.handle_key(key, self.modifiers);
+                        self.handle_launcher_outcome(outcome);
+                        return;
                     }
                     if let Some(action) = self.parse_shortcut(key) {
                         self.handle_action(action);
@@ -1612,7 +1751,11 @@ impl Multiplexer {
                 let need = self.tabs[self.focus].needs_redraw()
                     || (self.status_bar_height() > 0 && self.status_view.needs_redraw())
                     || self.sidebar.needs_redraw()
-                    || (self.sidebar.is_visible() && self.preview_slot.needs_redraw());
+                    || (self.sidebar.is_visible() && self.preview_slot.needs_redraw())
+                    || self
+                        .launcher
+                        .as_ref()
+                        .is_some_and(|launcher| launcher.needs_redraw());
                 if need && !self.occluded && self.drawable() {
                     self.window.request_redraw();
                 }

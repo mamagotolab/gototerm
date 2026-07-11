@@ -1,6 +1,12 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, serde::Deserialize, serde::Serialize)]
+pub struct AgentDef {
+    pub name: String,
+    pub command: Vec<String>,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Config {
     pub shell: Vec<String>,
@@ -28,6 +34,13 @@ pub struct Config {
     // アプリ側ショートカットの個別上書き。
     #[serde(default)]
     pub keybindings: HashMap<String, String>,
+
+    // 起動時にプロジェクトランチャー（Ctrl+Shift+N）を最初から開く。
+    #[serde(default)]
+    pub show_launcher_on_start: bool,
+    // ランチャーで選べるAIエージェント。
+    #[serde(default = "default_agents")]
+    pub launcher_agents: Vec<AgentDef>,
 
     // RRGGBBAA
     pub color_background: u32,
@@ -96,6 +109,8 @@ impl Default for Config {
                 "__pycache__".to_owned(),
             ],
             keybindings: HashMap::new(),
+            show_launcher_on_start: false,
+            launcher_agents: default_agents(),
 
             scroll_bar_width: 5,
             // 既定の配色は Tokyo Night（Night バリアント）。
@@ -128,6 +143,19 @@ impl Default for Config {
 
 fn default_preview_ratio() -> f64 {
     0.5
+}
+
+fn default_agents() -> Vec<AgentDef> {
+    vec![
+        AgentDef {
+            name: "Claude Code".to_owned(),
+            command: vec!["claude".to_owned()],
+        },
+        AgentDef {
+            name: "Codex".to_owned(),
+            command: vec!["codex".to_owned()],
+        },
+    ]
 }
 
 pub fn build() -> Config {
