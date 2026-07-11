@@ -182,27 +182,62 @@ fn command_exists(command: &str) -> bool {
 /// `None`（＝そのまま作業＝シェル）はそのまま。Windows は従来どおり直接実行。
 fn wrap_agent_command(command: Option<Vec<String>>) -> Option<Vec<String>> {
     let cmd = command?;
-    if cfg!(windows) || cmd.is_empty() {
+    if cmd.is_empty() {
         return Some(cmd);
     }
     let shell = crate::TOYTERM_CONFIG
         .shell
         .first()
         .cloned()
-        .unwrap_or_else(|| "/bin/sh".to_owned());
-    let joined = cmd
-        .iter()
-        .map(|arg| sh_quote(arg))
-        .collect::<Vec<_>>()
-        .join(" ");
-    Some(vec![
-        shell.clone(),
-        "-c".to_owned(),
-        format!("{joined}; exec {}", sh_quote(&shell)),
-    ])
+        .unwrap_or_else(default_shell);
+
+    #[cfg(windows)]
+    {
+        // Windows でも「実行後にプロンプトを残す」形にする。素の `claude` は
+        // .cmd シムのことが多く CreateProcess で解決できず落ちるため、必ずシェル
+        // 経由で起動する（PATHEXT 解決＋抜けてもタブが残る）。
+        let joined = cmd.join(" ");
+        let lower = shell.to_ascii_lowercase();
+        if lower.contains("powershell") || lower.contains("pwsh") {
+            return Some(vec![
+                shell,
+                "-NoExit".to_owned(),
+                "-Command".to_owned(),
+                joined,
+            ]);
+        }
+        return Some(vec![shell, "/K".to_owned(), joined]);
+    }
+
+    #[cfg(not(windows))]
+    {
+        // 実行後に対話シェルへ落ちる（抜けてもタブが残る）。例: fish -c 'codex; exec fish'。
+        let joined = cmd
+            .iter()
+            .map(|arg| sh_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Some(vec![
+            shell.clone(),
+            "-c".to_owned(),
+            format!("{joined}; exec {}", sh_quote(&shell)),
+        ])
+    }
+}
+
+fn default_shell() -> String {
+    #[cfg(windows)]
+    {
+        "cmd.exe".to_owned()
+    }
+    #[cfg(not(windows))]
+    {
+        "/bin/sh".to_owned()
+    }
 }
 
 /// POSIX/fish で安全な単一引用符クォート。
+#[cfg_attr(windows, allow(dead_code))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
@@ -487,6 +522,16 @@ mod tests {
     #[test]
     fn wrap_agent_command_keeps_shell_choice_as_none() {
         assert_eq!(wrap_agent_command(None), None);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn wrap_agent_command_keeps_pane_open_on_windows() {
+        let wrapped = wrap_agent_command(Some(vec!["claude".to_owned()])).unwrap();
+        // シェル経由で起動し、実行後もプロンプトを残す（/K か -NoExit）。
+        assert!(wrapped.len() >= 3);
+        assert!(wrapped.iter().any(|s| s == "claude"));
+        assert!(wrapped.iter().any(|s| s == "/K" || s == "-NoExit"));
     }
 
     #[test]

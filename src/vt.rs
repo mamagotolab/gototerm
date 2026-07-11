@@ -574,49 +574,69 @@ impl VtTerminal {
             .openpty(pty_size(cols, lines, cell_w, cell_h))
             .expect("openpty");
 
-        let command = command.unwrap_or(&crate::TOYTERM_CONFIG.shell);
-        // コマンド未指定時だけ既定シェルへ戻し、環境の整備は全経路で同じにする。
-        let mut cmd = CommandBuilder::new(&command[0]);
-        for arg in &command[1..] {
-            cmd.arg(arg);
+        // コマンド未指定時は既定シェル。指定が空なら安全側で既定シェルに戻す。
+        let mut requested: Vec<String> = command
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(|| crate::TOYTERM_CONFIG.shell.clone());
+        if requested.is_empty() {
+            requested = crate::TOYTERM_CONFIG.shell.clone();
         }
-        // 親の環境を引き継ぐが、「別端末の正体」を示す変数は落とす。
-        // これらが残ると yazi 等が「kitty/ghostty だから画像を出せる」と誤検出し、
-        // 画像プロトコル非対応の gototerm で preview のたびに画面が乱れる。
-        // （例：Ghostty のシェルから gototerm を起動すると TERM_PROGRAM=ghostty が漏れる）
-        const STRIP_ENV: &[&str] = &[
-            "TERM_PROGRAM",
-            "TERM_PROGRAM_VERSION",
-            "KITTY_WINDOW_ID",
-            "KITTY_PID",
-            "KITTY_INSTALLATION_DIR",
-            "GHOSTTY_RESOURCES_DIR",
-            "GHOSTTY_BIN_DIR",
-            "GHOSTTY_SHELL_FEATURES",
-            "GHOSTTY_SHELL_INTEGRATION_XDG_DIR",
-            "KONSOLE_VERSION",
-            "KONSOLE_DBUS_SESSION",
-            "KONSOLE_DBUS_SERVICE",
-            "KONSOLE_DBUS_WINDOW",
-            "VTE_VERSION",
-            "WEZTERM_EXECUTABLE",
-            "WEZTERM_PANE",
-            "WEZTERM_UNIX_SOCKET",
-            "WEZTERM_CONFIG_FILE",
-        ];
-        for (key, val) in std::env::vars() {
-            if STRIP_ENV.contains(&key.as_str()) {
-                continue;
-            }
-            cmd.env(key, val);
-        }
-        // alacritty_terminal は xterm 互換なので xterm-256color を名乗る
-        cmd.env("TERM", "xterm-256color");
-        // 自分の正体を伝える（画像対応端末と誤認させない）
-        cmd.env("TERM_PROGRAM", "gototerm");
-        cmd.cwd(cwd);
 
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn command");
+        // argv から、環境を整えた CommandBuilder を作る（成功／フォールバックで
+        // 同じ環境設定を使うためクロージャに切り出す）。
+        let build_cmd = |argv: &[String]| -> CommandBuilder {
+            let mut cmd = CommandBuilder::new(&argv[0]);
+            for arg in &argv[1..] {
+                cmd.arg(arg);
+            }
+            // 親の環境を引き継ぐが、「別端末の正体」を示す変数は落とす。
+            // これらが残ると yazi 等が「kitty/ghostty だから画像を出せる」と誤検出し、
+            // 画像プロトコル非対応の gototerm で preview のたびに画面が乱れる。
+            const STRIP_ENV: &[&str] = &[
+                "TERM_PROGRAM",
+                "TERM_PROGRAM_VERSION",
+                "KITTY_WINDOW_ID",
+                "KITTY_PID",
+                "KITTY_INSTALLATION_DIR",
+                "GHOSTTY_RESOURCES_DIR",
+                "GHOSTTY_BIN_DIR",
+                "GHOSTTY_SHELL_FEATURES",
+                "GHOSTTY_SHELL_INTEGRATION_XDG_DIR",
+                "KONSOLE_VERSION",
+                "KONSOLE_DBUS_SESSION",
+                "KONSOLE_DBUS_SERVICE",
+                "KONSOLE_DBUS_WINDOW",
+                "VTE_VERSION",
+                "WEZTERM_EXECUTABLE",
+                "WEZTERM_PANE",
+                "WEZTERM_UNIX_SOCKET",
+                "WEZTERM_CONFIG_FILE",
+            ];
+            for (key, val) in std::env::vars() {
+                if STRIP_ENV.contains(&key.as_str()) {
+                    continue;
+                }
+                cmd.env(key, val);
+            }
+            // alacritty_terminal は xterm 互換なので xterm-256color を名乗る
+            cmd.env("TERM", "xterm-256color");
+            // 自分の正体を伝える（画像対応端末と誤認させない）
+            cmd.env("TERM_PROGRAM", "gototerm");
+            cmd.cwd(cwd);
+            cmd
+        };
+
+        // 指定コマンドの起動に失敗（例: Windows で `claude` が .cmd シムのため
+        // CreateProcess が解決できない）しても、落とさず既定シェルへフォールバックする。
+        let mut child = match pair.slave.spawn_command(build_cmd(&requested)) {
+            Ok(child) => child,
+            Err(err) => {
+                log::error!("failed to spawn {requested:?}: {err}; falling back to shell");
+                pair.slave
+                    .spawn_command(build_cmd(&crate::TOYTERM_CONFIG.shell))
+                    .expect("spawn shell")
+            }
+        };
         let killer = child.clone_killer();
         // 回収スレッドに move する前に PID を控える（cwd 追従に使う）。
         let child_pid = child.process_id();
