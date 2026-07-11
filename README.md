@@ -103,7 +103,7 @@ cargo build --release
 フォルダを選ぶと「そのまま作業（シェル）／ Claude Code ／ Codex …」を選ぶポップアップが出ます。
 AIツールを選ぶと、そのフォルダで起動し、**抜けるとそのフォルダのシェルに戻ります**（タブは残ります）。
 
-- 起動した直後からランチャーを出すには、`config.toml` に `show_launcher_on_start = true`。
+- 起動時にランチャーを出す挙動は**既定で ON**（`config.toml` で `show_launcher_on_start = false` にすると、従来どおり起動直後にシェルが出ます）。
 - 選べるツールは `config.toml` の `launcher_agents` で追加・変更できます（既定は Claude Code と Codex）。
 - `gototerm <フォルダ>` のようにパスを引数で渡すと、そのフォルダを作業ディレクトリにして起動します。
 
@@ -339,7 +339,7 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 | 設定キー | 役割 | 既定値（Tokyo Night） |
 |---|---|---|
 | `color_foreground` | 文字色 | `0xC0CAF5FF` |
-| `color_background` | 背景色（＋透過） | `0x1A1B26FF` |
+| `color_background` | 背景色（＋透過） | `0x1A1B26B0`（既定で約 30% 透過） |
 | `color_selection` | 選択範囲の背景 | `0x283457FF` |
 | `color_black` 〜 `color_white` | 通常の 8 色 | Tokyo Night |
 | `color_bright_black` 〜 `color_bright_white` | 明るい 8 色 | Tokyo Night |

@@ -109,7 +109,8 @@ impl Default for Config {
                 "__pycache__".to_owned(),
             ],
             keybindings: HashMap::new(),
-            show_launcher_on_start: false,
+            // 既定で起動時にランチャーを出す（落としてすぐ「開く場所を選ぶ」体験）。
+            show_launcher_on_start: true,
             launcher_agents: default_agents(),
 
             scroll_bar_width: 5,
@@ -117,7 +118,9 @@ impl Default for Config {
             scroll_bar_fg_color: 0x414868FF,
             scroll_bar_bg_color: 0x1A1B26FF,
 
-            color_background: 0x1A1B26FF,
+            // 既定で背景を半透明に（末尾 B0 ≈ 0.69）。ターミナル・サイドバー・
+            // プレビュー・ランチャーが揃って透ける。不要なら config で FF にする。
+            color_background: 0x1A1B26B0,
             color_foreground: 0xC0CAF5FF,
             color_selection: 0x283457FF,
             color_black: 0x15161EFF,

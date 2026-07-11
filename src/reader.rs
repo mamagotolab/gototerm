@@ -330,10 +330,10 @@ impl ReaderPane {
         row_actions.truncate(rows);
         self.row_actions = row_actions;
         self.view.update_contents(|view| {
-            // パネルは不透明な Tokyo Night 背景。既定背景セルは下地に任せて
-            // 半透明の二重合成（灰色ブロック）を防ぐ。
-            view.bg_color = crate::view::panel_bg_color();
-            view.skip_default_bg = true;
+            // ターミナル／ランチャーと同じ透過（セルの Color::Background クアッドで
+            // 半透明を出す）。区切りはマネージャの黒フレームクリアが担う。
+            view.bg_color = Color::Background;
+            view.skip_default_bg = false;
             view.lines = lines;
             view.images = images;
             view.cursor = None;

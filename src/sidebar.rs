@@ -48,6 +48,9 @@ pub struct Sidebar {
     watch_failed: bool,
     remote_location: Option<(String, PathBuf)>,
     follow_target: Option<PathBuf>,
+    /// 自動追従をフリーズ中か。true の間はプレビューを最新変更へ飛ばさない
+    /// （他ターミナルの AI が同じプロジェクトを触ってもプレビューが動かない）。
+    follow_frozen: bool,
     ai_activity: Option<AiActivity>,
 }
 
@@ -81,8 +84,19 @@ impl Sidebar {
             watch_failed: false,
             remote_location: None,
             follow_target: None,
+            follow_frozen: false,
             ai_activity: None,
         }
+    }
+
+    /// 自動追従の ON/OFF を切り替える。
+    pub fn toggle_follow(&mut self) {
+        self.follow_frozen = !self.follow_frozen;
+        if self.follow_frozen {
+            // フリーズ中は保留中の追従先を捨てる（解除時に飛ばないように）。
+            self.follow_target = None;
+        }
+        self.rebuild();
     }
 
     pub fn toggle(&mut self, location: &ShellLocation) {
@@ -234,6 +248,10 @@ impl Sidebar {
         match action {
             RowAction::ToggleMode => {
                 self.toggle_mode();
+                None
+            }
+            RowAction::ToggleFollow => {
+                self.toggle_follow();
                 None
             }
             RowAction::BrowseParent => {
@@ -409,6 +427,10 @@ impl Sidebar {
     }
 
     pub fn take_follow_target(&mut self) -> Option<PathBuf> {
+        if self.follow_frozen {
+            self.follow_target = None;
+            return None;
+        }
         self.follow_target.take()
     }
 
@@ -758,6 +780,7 @@ impl Sidebar {
                 }
             }
 
+            self.push_follow_status(&mut lines, &mut row_actions, cols);
             self.push_ai_activity(&mut lines, &mut row_actions, cols);
             self.push_mode_switch(&mut lines, &mut row_actions, cols);
             push_separator(&mut lines, &mut row_actions, cols);
@@ -780,10 +803,10 @@ impl Sidebar {
         self.row_actions = row_actions;
 
         self.view.update_contents(|view| {
-            // パネルは不透明な Tokyo Night 背景。既定背景セルは下地に任せて
-            // 半透明の二重合成（灰色ブロック）を防ぐ。
-            view.bg_color = crate::view::panel_bg_color();
-            view.skip_default_bg = true;
+            // ターミナル／ランチャーと同じ透過（セルの Color::Background クアッドで
+            // 半透明を出す）。区切りはマネージャの黒フレームクリアが担う。
+            view.bg_color = Color::Background;
+            view.skip_default_bg = false;
             view.lines = lines;
             view.images = Vec::new();
             view.cursor = None;
@@ -873,6 +896,33 @@ impl Sidebar {
                 (&suffix, Color::BrightBlack),
             ],
             None,
+        );
+    }
+
+    /// 自動追従の状態を1行で見せる（クリックで切替。キーは Ctrl+Shift+P）。
+    fn push_follow_status(
+        &self,
+        lines: &mut Vec<Line>,
+        row_actions: &mut Vec<Option<RowAction>>,
+        cols: usize,
+    ) {
+        let (icon, icon_color, label) = if self.follow_frozen {
+            ("⏸", Color::BrightYellow, "追従: フリーズ中")
+        } else {
+            ("●", Color::Green, "追従: 自動")
+        };
+        push_segments(
+            lines,
+            row_actions,
+            cols,
+            &[
+                (" ", Color::White),
+                (icon, icon_color),
+                (" ", Color::White),
+                (label, Color::White),
+                ("  (Ctrl+Shift+P)", Color::Rgb { rgba: 0x565F_89FF }),
+            ],
+            Some(RowAction::ToggleFollow),
         );
     }
 
@@ -1251,6 +1301,7 @@ struct AiActivity {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RowAction {
     ToggleMode,
+    ToggleFollow,
     BrowseParent,
     BrowseDir(PathBuf),
     PreviewFile(PathBuf),

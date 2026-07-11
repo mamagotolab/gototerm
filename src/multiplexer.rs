@@ -62,6 +62,7 @@ enum Action {
     SplitVertical,
     SplitHorizontal,
     ToggleSidebar,
+    ToggleFollow,
     Focus(Dir),
     Resize(Dir),
 }
@@ -987,6 +988,7 @@ impl Multiplexer {
             ShortcutAction::SplitVertical => Some(Action::SplitVertical),
             ShortcutAction::SplitHorizontal => Some(Action::SplitHorizontal),
             ShortcutAction::ToggleSidebar => Some(Action::ToggleSidebar),
+            ShortcutAction::ToggleFollow => Some(Action::ToggleFollow),
             ShortcutAction::FocusLeft => Some(Action::Focus(Dir::Left)),
             ShortcutAction::FocusDown => Some(Action::Focus(Dir::Down)),
             ShortcutAction::FocusUp => Some(Action::Focus(Dir::Up)),
@@ -1086,6 +1088,11 @@ impl Multiplexer {
                     self.release_editor_focus();
                     self.refresh_layout();
                 }
+            }
+
+            Action::ToggleFollow => {
+                self.sidebar.toggle_follow();
+                self.window.request_redraw();
             }
         }
     }
@@ -1467,16 +1474,12 @@ impl Multiplexer {
                     }
                     let mut surface = self.display.draw();
 
-                    // まずフレーム全体を背景色でクリアする。分割の隙間や、
-                    // バー左右の余白を埋める。各ペインは自分の矩形を上書きする。
+                    // まずフレーム全体を不透明な黒でクリアする。分割の隙間（GAP）が
+                    // そのまま黒い区切り線になる（透過パネル同士を分ける）。各ペインは
+                    // 自分の矩形を上書きするので、ペイン内の透過には影響しない。
                     {
                         use glium::Surface as _;
-                        let bg = crate::TOYTERM_CONFIG.color_background;
-                        let r = ((bg >> 24) & 0xff) as f32 / 255.0;
-                        let g = ((bg >> 16) & 0xff) as f32 / 255.0;
-                        let b = ((bg >> 8) & 0xff) as f32 / 255.0;
-                        let a = (bg & 0xff) as f32 / 255.0;
-                        surface.clear_color_srgb(r, g, b, a);
+                        surface.clear_color_srgb(0.0, 0.0, 0.0, 1.0);
                     }
 
                     if self.status_bar_height() > 0 {
