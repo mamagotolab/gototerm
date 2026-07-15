@@ -5,6 +5,8 @@ use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
+use crate::highlight::{self, HighlightedLine};
+
 const TAIL_BYTES: u64 = 64 * 1024;
 const BINARY_SCAN_BYTES: usize = 8 * 1024;
 const READ_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -12,8 +14,28 @@ const READ_DEBOUNCE: Duration = Duration::from_millis(100);
 const IMAGE_MAX_BYTES: u64 = 32 * 1024 * 1024;
 const DIFF_MAX_BYTES: usize = 512 * 1024;
 
+/// プレビューするテキスト本文。ハイライトは読み込みと同じ裏スレッドで済ませておく
+/// （描画スレッドでやると、リサイズや AI の書き込みのたびに固まる）。
+pub struct TextPreview {
+    pub lines: Vec<String>,
+    /// 文法が分かったファイルだけ色つき。分からなければ None（素のテキスト表示）。
+    pub highlighted: Option<Vec<HighlightedLine>>,
+    /// 大きいファイルで末尾だけ読んだか。true のとき行番号は出せない（先頭が1行目でない）。
+    pub truncated: bool,
+}
+
+impl TextPreview {
+    fn plain(lines: Vec<String>) -> Self {
+        Self {
+            lines,
+            highlighted: None,
+            truncated: false,
+        }
+    }
+}
+
 pub enum PreviewContent {
-    Text(Vec<String>),
+    Text(TextPreview),
     Diff(Vec<String>),
     /// プレビュー領域に収まるよう縮小済みの RGB 画像（3バイト/画素・行0＝上）。
     Image {
@@ -119,7 +141,7 @@ impl FilePreview {
         self.content = if looks_binary(&bytes) {
             PreviewContent::Binary
         } else {
-            PreviewContent::Text(tail_lines(&bytes, usize::MAX))
+            PreviewContent::Text(TextPreview::plain(tail_lines(&bytes, usize::MAX)))
         };
     }
 
@@ -160,7 +182,7 @@ impl FilePreview {
 
     pub fn lines(&self) -> PreviewLines<'_> {
         match &self.content {
-            PreviewContent::Text(lines) => PreviewLines::Text(lines.as_slice()),
+            PreviewContent::Text(text) => PreviewLines::Text(text),
             PreviewContent::Diff(lines) => PreviewLines::Diff(lines.as_slice()),
             PreviewContent::Image { .. } => PreviewLines::Message("(画像)"),
             PreviewContent::Binary => PreviewLines::Message("(バイナリファイル)"),
@@ -208,7 +230,9 @@ fn read_image(path: &Path, fit_w: u32, fit_h: u32) -> PreviewContent {
         return PreviewContent::Deleted;
     };
     if meta.len() > IMAGE_MAX_BYTES {
-        return PreviewContent::Text(vec!["(画像が大きすぎるため表示しません)".to_owned()]);
+        return PreviewContent::Text(TextPreview::plain(vec![
+            "(画像が大きすぎるため表示しません)".to_owned(),
+        ]));
     }
 
     // 拡張子ではなく中身（マジックバイト）で形式を判定する。拡張子と実体が
@@ -221,10 +245,10 @@ fn read_image(path: &Path, fit_w: u32, fit_h: u32) -> PreviewContent {
         Ok(img) => img,
         Err(e) => {
             // 未対応形式・壊れたデータは理由を出す（どの形式がダメか分かるように）。
-            return PreviewContent::Text(vec![
+            return PreviewContent::Text(TextPreview::plain(vec![
                 "(この画像は表示できませんでした)".to_owned(),
                 format!("  {e}"),
-            ]);
+            ]));
         }
     };
 
@@ -239,7 +263,7 @@ fn read_image(path: &Path, fit_w: u32, fit_h: u32) -> PreviewContent {
 }
 
 pub enum PreviewLines<'a> {
-    Text(&'a [String]),
+    Text(&'a TextPreview),
     Diff(&'a [String]),
     Message(&'static str),
 }
@@ -276,7 +300,8 @@ fn read_tail(path: &Path) -> PreviewContent {
     };
 
     let len = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
-    if len > TAIL_BYTES && file.seek(SeekFrom::End(-(TAIL_BYTES as i64))).is_err() {
+    let truncated = len > TAIL_BYTES;
+    if truncated && file.seek(SeekFrom::End(-(TAIL_BYTES as i64))).is_err() {
         return PreviewContent::Deleted;
     }
 
@@ -286,10 +311,18 @@ fn read_tail(path: &Path) -> PreviewContent {
     }
 
     if looks_binary(&bytes) {
-        PreviewContent::Binary
-    } else {
-        PreviewContent::Text(tail_lines(&bytes, usize::MAX))
+        return PreviewContent::Binary;
     }
+
+    let lines = tail_lines(&bytes, usize::MAX);
+    // ここは読み込みスレッド。重いハイライトはこの場で済ませて、描画スレッドには
+    // 色のついた行だけ渡す。
+    let highlighted = highlight::highlight_source(&lines.join("\n"), path);
+    PreviewContent::Text(TextPreview {
+        lines,
+        highlighted,
+        truncated,
+    })
 }
 
 pub(crate) fn tail_lines(bytes: &[u8], max: usize) -> Vec<String> {

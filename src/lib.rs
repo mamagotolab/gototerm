@@ -1,7 +1,9 @@
+mod bookmarks;
 mod cache;
 mod config;
 mod font;
 mod gt;
+mod highlight;
 mod keybindings;
 mod file_style;
 mod launcher;

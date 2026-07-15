@@ -21,7 +21,7 @@ use crate::config::resolve_editor;
 use crate::gt::{GtFileAssembler, GtMessage};
 use crate::keybindings::{self, ShortcutAction};
 use crate::launcher::{Launcher, LauncherOutcome};
-use crate::reader::{ReaderHeaderAction, ReaderPane, ReaderRequest};
+use crate::reader::{ReaderHeaderAction, ReaderKeyResult, ReaderPane, ReaderRequest};
 use crate::recent::RecentProjects;
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::terminal::{Cell, Color, Line};
@@ -767,6 +767,7 @@ pub struct Multiplexer {
     /// 起動時に自動で開いたランチャーか（true の間に選ぶと最初の空タブを畳む）。
     startup_launcher: bool,
     editor_focused: bool,
+    reader_focused: bool,
     gt_file_assembler: GtFileAssembler,
     tabs: Vec<Node>,
     focus: usize,
@@ -831,6 +832,7 @@ impl Multiplexer {
             recent,
             startup_launcher: false,
             editor_focused: false,
+            reader_focused: false,
             gt_file_assembler: GtFileAssembler::default(),
             tabs: vec![first],
             focus: 0,
@@ -886,12 +888,23 @@ impl Multiplexer {
             }
             return;
         }
+        if self.reader_focused {
+            // ビューアから下 → ターミナル、左 → サイドバーへ。
+            match dir {
+                Dir::Down => self.release_reader_focus(),
+                Dir::Left => self.focus_sidebar(),
+                _ => {}
+            }
+            return;
+        }
         // ターミナル領域。まず分割ツリー内で移動し、端に達したら隣の領域へ。
         if self.tabs[self.focus].move_focus(dir) {
             return;
         }
-        if matches!(dir, Dir::Left) {
-            self.focus_sidebar();
+        match dir {
+            Dir::Left => self.focus_sidebar(),
+            Dir::Up => self.focus_reader(),
+            _ => {}
         }
     }
 
@@ -1131,6 +1144,7 @@ impl Multiplexer {
                     self.sidebar.toggle(&location);
                     self.release_sidebar_focus();
                     self.release_editor_focus();
+                    self.release_reader_focus();
                     self.refresh_layout();
                 }
             }
@@ -1205,6 +1219,8 @@ impl Multiplexer {
                 editor.focus_changed(false);
             }
             self.editor_focused = false;
+        } else if self.reader_focused {
+            self.unfocus_reader();
         } else {
             self.focused_root().focused_leaf_mut().focus_changed(false);
         }
@@ -1229,6 +1245,8 @@ impl Multiplexer {
         if self.sidebar_focused {
             self.sidebar_focused = false;
             self.sidebar.set_focused(false);
+        } else if self.reader_focused {
+            self.unfocus_reader();
         } else {
             self.focused_root().focused_leaf_mut().focus_changed(false);
         }
@@ -1247,6 +1265,50 @@ impl Multiplexer {
         }
         self.editor_focused = false;
         self.focused_root().focused_leaf_mut().focus_changed(true);
+    }
+
+    /// ビューア（右上）へフォーカスを移す。エディタを開いている枠は対象外。
+    fn focus_reader(&mut self) {
+        if !self.sidebar.is_visible()
+            || self.reader_focused
+            || self.preview_slot.visible_reader_mut().is_none()
+        {
+            return;
+        }
+        if self.sidebar_focused {
+            self.sidebar_focused = false;
+            self.sidebar.set_focused(false);
+        } else {
+            self.focused_root().focused_leaf_mut().focus_changed(false);
+        }
+        self.reader_focused = true;
+        if let Some(reader) = self.preview_slot.visible_reader_mut() {
+            reader.set_focused(true);
+        }
+    }
+
+    /// ビューアのフォーカス表示だけ落とす（次のフォーカス先は呼び出し側が決める）。
+    fn unfocus_reader(&mut self) {
+        self.reader_focused = false;
+        if let Some(reader) = self.preview_slot.reader_mut() {
+            reader.set_focused(false);
+        }
+    }
+
+    fn release_reader_focus(&mut self) {
+        if !self.reader_focused {
+            return;
+        }
+        self.unfocus_reader();
+        self.focused_root().focused_leaf_mut().focus_changed(true);
+    }
+
+    fn handle_reader_key_result(&mut self, result: ReaderKeyResult) {
+        match result {
+            ReaderKeyResult::Consumed => {}
+            ReaderKeyResult::ReleaseFocus => self.release_reader_focus(),
+            ReaderKeyResult::Request(request) => self.handle_reader_request(request),
+        }
     }
 
     fn handle_sidebar_key_result(&mut self, result: SidebarKeyResult) {
@@ -1337,6 +1399,9 @@ impl Multiplexer {
             PreviewSlot::Empty => self.content_viewport(),
         };
         let cwd = path.parent().map(Path::to_path_buf);
+        // 枠がエディタに変わるので、ビューアのフォーカス表示は畳んでおく
+        // （エディタを閉じて戻したときにヒント行が残らないように）。
+        self.unfocus_reader();
         let saved = match std::mem::replace(&mut self.preview_slot, PreviewSlot::Empty) {
             PreviewSlot::Reader(reader) => Box::new(reader),
             PreviewSlot::Editor { saved, .. } => saved,
@@ -1587,6 +1652,11 @@ impl Multiplexer {
                     } else if self.sidebar_focused {
                         let result = self.sidebar.on_key(key);
                         self.handle_sidebar_key_result(result);
+                    } else if self.reader_focused {
+                        if let Some(reader) = self.preview_slot.visible_reader_mut() {
+                            let result = reader.on_key(key);
+                            self.handle_reader_key_result(result);
+                        }
                     } else if self.editor_focused {
                         if let Some(editor) = self.preview_slot.editor_mut() {
                             editor.process_window_event(wev);
@@ -1622,8 +1692,13 @@ impl Multiplexer {
                             if let Some(editor) = self.preview_slot.editor_mut() {
                                 editor.process_window_event(wev);
                             }
-                        } else if let Some(reader) = self.preview_slot.visible_reader_mut() {
-                            if let Some(request) = reader.on_click(self.cursor_pos) {
+                        } else if self.preview_slot.visible_reader_mut().is_some() {
+                            self.focus_reader();
+                            let clicked = self
+                                .preview_slot
+                                .visible_reader_mut()
+                                .and_then(|reader| reader.on_click(self.cursor_pos));
+                            if let Some(request) = clicked {
                                 self.handle_reader_request(request);
                             }
                         }
@@ -1635,6 +1710,8 @@ impl Multiplexer {
                         self.release_sidebar_focus();
                     } else if self.editor_focused {
                         self.release_editor_focus();
+                    } else if self.reader_focused {
+                        self.unfocus_reader();
                     } else {
                         self.focused_root().focused_leaf_mut().focus_changed(false);
                     }
@@ -1683,7 +1760,7 @@ impl Multiplexer {
                         || (self.sidebar.is_visible()
                             && self.preview_slot.contains(self.cursor_pos)) => {}
 
-                WindowEvent::Ime(_) if self.sidebar_focused => {}
+                WindowEvent::Ime(_) if self.sidebar_focused || self.reader_focused => {}
 
                 WindowEvent::Ime(_) if self.editor_focused => {
                     if let Some(editor) = self.preview_slot.editor_mut() {

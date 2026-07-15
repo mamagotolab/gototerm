@@ -6,6 +6,7 @@ use winit::{
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
 };
 
+use crate::bookmarks::Bookmarks;
 use crate::terminal::{Cell, Color, GraphicAttribute, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::Display;
@@ -96,6 +97,7 @@ struct Entry {
 enum Mode {
     Browse,
     Recent,
+    Bookmarks,
     Agent,
 }
 
@@ -105,11 +107,17 @@ struct LauncherState {
     dir: PathBuf,
     /// dir の中身（親があれば先頭に ".."）。
     entries: Vec<Entry>,
+    /// dir を畳んだ絶対パス。★印の判定を Enter で開く対象（正規化済み）と揃えるために持つ。
+    /// 行ごとに canonicalize すると毎フレーム stat が走るので、reload のときだけ求める。
+    canonical_dir: PathBuf,
     selected: usize,
     scroll: usize,
     show_hidden: bool,
     recent: Vec<PathBuf>,
     recent_selected: usize,
+    /// よく使うフォルダ（本人が m で付けたもの）。
+    bookmarks: Bookmarks,
+    bookmark_selected: usize,
     mode: Mode,
     filter: Option<String>,
     chosen_dir: Option<PathBuf>,
@@ -121,12 +129,15 @@ impl LauncherState {
         let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut state = Self {
             entries: Vec::new(),
+            canonical_dir: dir.clone(),
             dir,
             selected: 0,
             scroll: 0,
             show_hidden: false,
             recent,
             recent_selected: 0,
+            bookmarks: Bookmarks::load(),
+            bookmark_selected: 0,
             mode: Mode::Browse,
             filter: None,
             chosen_dir: None,
@@ -140,12 +151,15 @@ impl LauncherState {
     fn with_dir(recent: Vec<PathBuf>, dir: PathBuf) -> Self {
         let mut state = Self {
             entries: Vec::new(),
+            canonical_dir: dir.clone(),
             dir,
             selected: 0,
             scroll: 0,
             show_hidden: false,
             recent,
             recent_selected: 0,
+            bookmarks: Bookmarks::empty_for_test(),
+            bookmark_selected: 0,
             mode: Mode::Browse,
             filter: None,
             chosen_dir: None,
@@ -170,6 +184,7 @@ impl LauncherState {
         match self.mode {
             Mode::Browse => self.handle_browse_key(code, text),
             Mode::Recent => self.handle_recent_key(code, text),
+            Mode::Bookmarks => self.handle_bookmark_key(code, text),
             Mode::Agent => self.handle_agent_key(code, text),
         }
     }
@@ -198,6 +213,12 @@ impl LauncherState {
                 Some("r") if !self.recent.is_empty() => {
                     self.mode = Mode::Recent;
                     self.recent_selected = 0;
+                }
+                // m でいま開こうとしているフォルダ（Enter と同じ対象）を付け外し。
+                Some("m") => self.toggle_bookmark(),
+                Some("b") if !self.bookmarks.entries().is_empty() => {
+                    self.mode = Mode::Bookmarks;
+                    self.bookmark_selected = 0;
                 }
                 _ => {}
             },
@@ -246,6 +267,89 @@ impl LauncherState {
             },
         }
         LauncherOutcome::None
+    }
+
+    fn handle_bookmark_key(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
+        match code {
+            KeyCode::Escape => self.mode = Mode::Browse,
+            // Enter=そこで開く。l/→=そこへ移動して中を見る（ブラウザと同じ流儀）。
+            KeyCode::Enter => self.open_selected_bookmark(),
+            KeyCode::ArrowRight => self.browse_selected_bookmark(),
+            KeyCode::ArrowDown => self.move_bookmark(1),
+            KeyCode::ArrowUp => self.move_bookmark(-1),
+            _ => match text {
+                Some("j") => self.move_bookmark(1),
+                Some("k") => self.move_bookmark(-1),
+                Some("l") => self.browse_selected_bookmark(),
+                Some("b") => self.mode = Mode::Browse,
+                // 一覧からそのまま外せる（消したいときに探し直さなくて済む）。
+                Some("m") | Some("d") => self.remove_selected_bookmark(),
+                _ => {}
+            },
+        }
+        LauncherOutcome::None
+    }
+
+    fn selected_bookmark(&self) -> Option<PathBuf> {
+        self.bookmarks.entries().get(self.bookmark_selected).cloned()
+    }
+
+    fn open_selected_bookmark(&mut self) {
+        if let Some(dir) = self.selected_bookmark().as_deref().and_then(resolve_existing_dir) {
+            self.enter_agent_mode(dir);
+        }
+    }
+
+    fn browse_selected_bookmark(&mut self) {
+        if let Some(dir) = self.selected_bookmark().as_deref().and_then(resolve_existing_dir) {
+            self.dir = dir;
+            self.filter = None;
+            self.mode = Mode::Browse;
+            self.reload();
+        }
+    }
+
+    fn remove_selected_bookmark(&mut self) {
+        let Some(path) = self.selected_bookmark() else {
+            return;
+        };
+        self.bookmarks.toggle(&path);
+        if self.bookmarks.entries().is_empty() {
+            self.mode = Mode::Browse;
+            return;
+        }
+        self.bookmark_selected = self
+            .bookmark_selected
+            .min(self.bookmarks.entries().len() - 1);
+    }
+
+    fn move_bookmark(&mut self, delta: isize) {
+        let len = self.bookmarks.entries().len();
+        if len == 0 {
+            return;
+        }
+        let last = (len - 1) as isize;
+        self.bookmark_selected =
+            (self.bookmark_selected as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// 一覧の行頭に出す印。ブックマーク済みのフォルダなら "★"、それ以外は同じ幅の空白。
+    fn bookmark_mark(&self, entry: &Entry) -> &'static str {
+        if entry.name == ".." || !entry.is_dir {
+            return " ";
+        }
+        if self.bookmarks.contains(&self.canonical_dir.join(&entry.name)) {
+            "★"
+        } else {
+            " "
+        }
+    }
+
+    /// Enter で開く対象と同じフォルダを付け外しする（選択中フォルダ、`..`/ファイルなら今の場所）。
+    fn toggle_bookmark(&mut self) {
+        if let Some(dir) = self.target_dir() {
+            self.bookmarks.toggle(&dir);
+        }
     }
 
     fn handle_agent_key(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
@@ -393,10 +497,10 @@ impl LauncherState {
     fn target_dir(&self) -> Option<PathBuf> {
         let entry = self.current_entry()?;
         let target = if entry.name == ".." {
-            match self.dir.parent() {
-                Some(p) => p.to_path_buf(),
-                None => self.dir.clone(),
-            }
+            // `..` は「上へ移動する行」であって開く対象ではない。フォルダへ入った直後は
+            // ここが選ばれているので、Enter では素直に「いま居るフォルダ」を開く
+            // （親を開きたいときは h で上がってから Enter）。
+            self.dir.clone()
         } else if entry.is_dir {
             self.dir.join(&entry.name)
         } else {
@@ -419,6 +523,7 @@ impl LauncherState {
 
     fn reload(&mut self) {
         self.entries = read_entries(&self.dir, self.show_hidden);
+        self.canonical_dir = resolve_existing_dir(&self.dir).unwrap_or_else(|| self.dir.clone());
         self.selected = 0;
         self.scroll = 0;
     }
@@ -448,6 +553,7 @@ impl LauncherState {
         match self.mode {
             Mode::Browse => self.render_browse(cols, rows),
             Mode::Recent => self.render_recent(cols, rows),
+            Mode::Bookmarks => self.render_bookmarks(cols, rows),
             Mode::Agent => self.render_agent(cols, rows),
         }
     }
@@ -484,7 +590,11 @@ impl LauncherState {
             let left = left_idx.and_then(|idx| self.entries.get(idx));
             let right = preview.get(i);
             let (ltext, lfg) = match left {
-                Some(e) => (entry_label(e), entry_fg(e)),
+                // 左ペインだけ、ブックマーク済みのフォルダに ★ を付ける（どれが登録済みか分かるように）。
+                Some(e) => (
+                    format!("{}{}", self.bookmark_mark(e), entry_label(e)),
+                    entry_fg(e),
+                ),
                 None => (String::new(), Color::White),
             };
             let selected = left_idx.is_some_and(|idx| idx == self.selected);
@@ -504,10 +614,39 @@ impl LauncherState {
                 query
             ),
             None => {
-                "j/k:移動  l:入る  h:上へ  Enter:ここで開く  .:隠し  r:最近  Esc:閉じる".to_owned()
+                "j/k:移動  l:入る  h:上へ  Enter:開く  m:★登録  b:★一覧  .:隠し  r:最近  Esc:閉じる"
+                    .to_owned()
             }
         };
         lines.push(text_line(cols, &footer, DIM));
+        lines.resize_with(rows, || text_line(cols, "", Color::White));
+        lines.truncate(rows);
+        lines
+    }
+
+    fn render_bookmarks(&mut self, cols: usize, rows: usize) -> Vec<Line> {
+        let mut lines = Vec::with_capacity(rows);
+        lines.push(text_line(cols, "★ ブックマーク", Color::BrightWhite));
+        lines.push(text_line(cols, "", Color::White));
+
+        let body = rows.saturating_sub(4).max(1);
+        for i in 0..body {
+            match self.bookmarks.entries().get(i) {
+                Some(path) => {
+                    let selected = i == self.bookmark_selected;
+                    let label = format!("  {}", display_path(path));
+                    lines.push(bar_line(cols, &label, DIR_FG, selected));
+                }
+                None => lines.push(text_line(cols, "", Color::White)),
+            }
+        }
+
+        lines.push(text_line(cols, &"─".repeat(cols.min(120)), DIM));
+        lines.push(text_line(
+            cols,
+            "j/k:移動  Enter:開く  l:そこへ移動  m/d:外す  b/Esc:ブラウザへ戻る",
+            DIM,
+        ));
         lines.resize_with(rows, || text_line(cols, "", Color::White));
         lines.truncate(rows);
         lines
@@ -960,6 +1099,104 @@ mod tests {
         assert_eq!(filter_entries(&entries, ""), vec![1, 2, 3]);
     }
 
+    /// m で付けた印は、Enter で開く対象と同じフォルダに付く（★も出る）。
+    #[test]
+    fn m_marks_the_folder_enter_would_open() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.selected = state
+            .entries
+            .iter()
+            .position(|e| e.name == "apple")
+            .unwrap();
+
+        state.handle_key_parts(KeyCode::KeyM, Some("m"));
+
+        let apple = std::fs::canonicalize(base.join("apple")).unwrap();
+        assert!(state.bookmarks.contains(&apple), "選択中フォルダが登録される");
+        let entry = state.entries[state.selected].clone();
+        assert_eq!(state.bookmark_mark(&entry), "★", "一覧に印が出る");
+
+        // もう一度 m で外れる。
+        state.handle_key_parts(KeyCode::KeyM, Some("m"));
+        assert!(!state.bookmarks.contains(&apple));
+        assert_eq!(state.bookmark_mark(&entry), " ");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// フォルダに入った直後（`..` が選択）の m は、いま居るフォルダを登録する。
+    #[test]
+    fn m_on_parent_row_marks_the_current_dir() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.selected = state
+            .entries
+            .iter()
+            .position(|e| e.name == "apple")
+            .unwrap();
+        state.descend();
+
+        state.handle_key_parts(KeyCode::KeyM, Some("m"));
+
+        let apple = std::fs::canonicalize(base.join("apple")).unwrap();
+        assert!(state.bookmarks.contains(&apple), "親ではなく apple が登録される");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn bookmark_list_opens_with_enter_and_jumps_with_l() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        let banana = std::fs::canonicalize(base.join("banana")).unwrap();
+        state.bookmarks.toggle(&banana);
+        state.mode = Mode::Bookmarks;
+        state.bookmark_selected = 0;
+
+        // l はそのフォルダへ移動して中を見る。
+        state.handle_key_parts(KeyCode::KeyL, Some("l"));
+        assert_eq!(state.mode, Mode::Browse);
+        assert_eq!(state.dir, banana);
+
+        // Enter はそこで開く（エージェント選択へ）。
+        state.mode = Mode::Bookmarks;
+        state.handle_key_parts(KeyCode::Enter, None);
+        assert_eq!(state.mode, Mode::Agent);
+        assert_eq!(state.chosen_dir, Some(banana.clone()));
+
+        state.bookmarks.toggle(&banana);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn removing_the_last_bookmark_returns_to_browse() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        let banana = std::fs::canonicalize(base.join("banana")).unwrap();
+        state.bookmarks.toggle(&banana);
+        state.mode = Mode::Bookmarks;
+
+        state.handle_key_parts(KeyCode::KeyD, Some("d"));
+
+        assert!(state.bookmarks.entries().is_empty());
+        assert_eq!(state.mode, Mode::Browse, "空になったら一覧に留まらない");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn b_does_nothing_when_there_are_no_bookmarks() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+
+        state.handle_key_parts(KeyCode::KeyB, Some("b"));
+
+        assert_eq!(state.mode, Mode::Browse, "空の一覧は開かない");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     #[test]
     fn browse_enter_moves_to_agent_mode_with_chosen_directory() {
         let base = temp_tree();
@@ -976,6 +1213,28 @@ mod tests {
         assert_eq!(state.mode, Mode::Agent);
         assert_eq!(state.chosen_dir, Some(expected));
         assert_eq!(state.agent_selected, 0);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// フォルダへ入った直後は選択が `..` に戻る。そこで Enter を押したときに
+    /// 開くのは「いま居るフォルダ」であって、親ではない。
+    #[test]
+    fn enter_on_parent_row_opens_the_current_dir_not_its_parent() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.selected = state
+            .entries
+            .iter()
+            .position(|e| e.name == "apple")
+            .unwrap();
+        state.descend();
+        assert_eq!(state.entries[state.selected].name, "..", "入った直後は .. が選択");
+
+        let outcome = state.handle_key_parts(KeyCode::Enter, None);
+        let expected = std::fs::canonicalize(base.join("apple")).unwrap();
+        assert_eq!(outcome, LauncherOutcome::None);
+        assert_eq!(state.chosen_dir, Some(expected), "親ではなく apple が開く");
 
         let _ = std::fs::remove_dir_all(&base);
     }

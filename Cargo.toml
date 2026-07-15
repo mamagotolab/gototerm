@@ -32,6 +32,11 @@ lazy_static = "1.4.0"
 lru = { version = "0.7.8", default-features = false }
 notify = "6"
 pulldown-cmark = "0.13.4"
+# プレビューのシンタックスハイライト。正規表現は純 Rust 実装(fancy-regex)を選ぶ。
+# 既定の onig は C ライブラリを引き込む。実測では onig の方が速い（1100行で 40ms 対
+# 181ms）が、ハイライトはファイル読み込みと同じ裏スレッドで走らせるので描画は止まらない。
+# ビルドに C コンパイラが要らない方を優先する（Windows exe のビルドを壊さないため）。
+syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 # 画像プレビューのデコード。よく使う形式だけに絞って依存を軽くする。
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 
