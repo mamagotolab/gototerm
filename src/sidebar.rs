@@ -480,6 +480,11 @@ impl Sidebar {
         self.rebuild();
     }
 
+    pub fn change_font_size(&mut self, size_diff: i32) {
+        self.view.increase_font_size(size_diff);
+        self.rebuild();
+    }
+
     pub fn draw(&mut self, surface: &mut glium::Frame) {
         if self.visible {
             self.view.draw(surface);

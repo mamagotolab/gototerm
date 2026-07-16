@@ -65,6 +65,8 @@ enum Action {
     ToggleFollow,
     Focus(Dir),
     Resize(Dir),
+    /// フォントサイズを差分だけ変える（+1 / -1）。全ペイン・全パネルへ一括で効かせる。
+    ChangeFont(i32),
 }
 
 /// タブ内のペイン木。葉が端末、節が分割。
@@ -130,6 +132,14 @@ struct WorkbenchViewports {
 }
 
 /// ワークベンチ表示中だけ、タブバー下を左一覧・右上プレビュー・右下端末に分ける。
+/// フォント差分を、既定サイズ(base)を足した実サイズが 6px〜72px に収まる範囲へ丸める。
+/// 極端な連打で行き過ぎたり、下限で「実サイズ0」になったりしないようにする。
+fn clamp_font_diff(diff: i32, base: i32) -> i32 {
+    const MIN: i32 = 6;
+    const MAX: i32 = 72;
+    diff.clamp(MIN - base, MAX - base)
+}
+
 fn workbench_viewports(vp: Viewport, sidebar_ratio: f64, preview_ratio: f64) -> WorkbenchViewports {
     let (sidebar, right) = split_viewport(Partition::Vertical, sidebar_ratio.clamp(0.0, 1.0), vp);
     let (preview, terminal) =
@@ -358,6 +368,7 @@ impl Node {
         window: &Rc<Window>,
         display: &Display,
         command: Option<&[String]>,
+        font_diff: i32,
     ) {
         match self {
             Node::Leaf(_) => {
@@ -375,13 +386,17 @@ impl Node {
                     ShellLocation::Local(path) => Some(path),
                     ShellLocation::Remote { .. } => std::env::current_dir().ok(),
                 };
-                let new_win = Box::new(TerminalWindow::with_viewport_command(
+                let mut new_win = Box::new(TerminalWindow::with_viewport_command(
                     window.clone(),
                     display.clone(),
                     vp,
                     cwd.as_deref(),
                     command,
                 ));
+                // 元ペインがズームされていれば、新ペインも同じ差分に合わせる。
+                if font_diff != 0 {
+                    new_win.change_font_size(font_diff);
+                }
 
                 let mut first = Box::new(Node::Leaf(old));
                 let mut second = Box::new(Node::Leaf(new_win));
@@ -399,9 +414,9 @@ impl Node {
             }
             Node::Split(s) => {
                 if s.focus_first {
-                    s.first.split_focused(partition, window, display, command);
+                    s.first.split_focused(partition, window, display, command, font_diff);
                 } else {
-                    s.second.split_focused(partition, window, display, command);
+                    s.second.split_focused(partition, window, display, command, font_diff);
                 }
             }
             Node::Empty => {}
@@ -517,6 +532,29 @@ mod tests {
     fn sh_quote_wraps_and_escapes_single_quotes() {
         assert_eq!(sh_quote("codex"), "'codex'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
+    }
+
+    #[test]
+    fn font_diff_moves_freely_within_range() {
+        // base=18: +3 も -5 もそのまま通る。
+        assert_eq!(clamp_font_diff(3, 18), 3);
+        assert_eq!(clamp_font_diff(-5, 18), -5);
+    }
+
+    #[test]
+    fn font_diff_stops_at_the_floor_and_ceiling() {
+        // base=18 → 実サイズ下限6px は diff -12、上限72px は diff +54。
+        assert_eq!(clamp_font_diff(-100, 18), -12, "6px より小さくしない");
+        assert_eq!(clamp_font_diff(100, 18), 54, "72px より大きくしない");
+    }
+
+    /// 下限に張り付いた状態からさらに「−」を押しても実サイズは動かない（applied=0）。
+    #[test]
+    fn font_diff_at_floor_does_not_shrink_further() {
+        let base = 18;
+        let at_floor = clamp_font_diff(-100, base); // -12
+        let next = clamp_font_diff(at_floor - 1, base);
+        assert_eq!(next, at_floor, "これ以上縮まない");
     }
 
     #[test]
@@ -724,6 +762,18 @@ impl PreviewSlot {
         }
     }
 
+    fn change_font_size(&mut self, size_diff: i32) {
+        match self {
+            PreviewSlot::Reader(reader) => reader.change_font_size(size_diff),
+            // エディタを開いている間も、裏に控えるビューア(saved)ごと揃える。
+            PreviewSlot::Editor { win, saved } => {
+                win.change_font_size(size_diff);
+                saved.change_font_size(size_diff);
+            }
+            PreviewSlot::Empty => {}
+        }
+    }
+
     fn draw(&mut self, surface: &mut glium::Frame) {
         match self {
             PreviewSlot::Reader(reader) => reader.draw(surface),
@@ -785,6 +835,9 @@ pub struct Multiplexer {
     /// Ctrl+Shift+矢印 で変えられる。初期値は config）。
     sidebar_ratio: f64,
     preview_ratio: f64,
+    /// 設定の既定サイズからのフォント差分。あとから開くペイン・タブ・ランチャーにも
+    /// この差分を適用して、画面全体の文字サイズを常に揃える。
+    font_diff: i32,
 }
 
 impl Multiplexer {
@@ -844,6 +897,7 @@ impl Multiplexer {
             cursor_blink_on: true,
             sidebar_ratio: crate::TOYTERM_CONFIG.sidebar_ratio,
             preview_ratio: crate::TOYTERM_CONFIG.preview_ratio,
+            font_diff: 0,
         };
         mux.refresh_layout();
         // 設定で有効なら、起動直後にランチャーを重ねて出す。
@@ -1055,11 +1109,9 @@ impl Multiplexer {
             ShortcutAction::ResizeDown => Some(Action::Resize(Dir::Down)),
             ShortcutAction::ResizeLeft => Some(Action::Resize(Dir::Left)),
             ShortcutAction::ResizeRight => Some(Action::Resize(Dir::Right)),
-            ShortcutAction::IncreaseFont
-            | ShortcutAction::DecreaseFont
-            | ShortcutAction::Copy
-            | ShortcutAction::Paste
-            | ShortcutAction::ClearHistory => None,
+            ShortcutAction::IncreaseFont => Some(Action::ChangeFont(1)),
+            ShortcutAction::DecreaseFont => Some(Action::ChangeFont(-1)),
+            ShortcutAction::Copy | ShortcutAction::Paste | ShortcutAction::ClearHistory => None,
         }
     }
 
@@ -1070,11 +1122,12 @@ impl Multiplexer {
             }
 
             Action::OpenLauncher => {
-                self.launcher = Some(Launcher::new(
-                    self.display.clone(),
-                    self.viewport,
-                    self.recent.entries(),
-                ));
+                let mut launcher =
+                    Launcher::new(self.display.clone(), self.viewport, self.recent.entries());
+                if self.font_diff != 0 {
+                    launcher.change_font_size(self.font_diff);
+                }
+                self.launcher = Some(launcher);
                 self.window.request_redraw();
             }
 
@@ -1117,7 +1170,8 @@ impl Multiplexer {
                 };
                 let window = self.window.clone();
                 let display = self.display.clone();
-                self.tabs[self.focus].split_focused(partition, &window, &display, None);
+                let font_diff = self.font_diff;
+                self.tabs[self.focus].split_focused(partition, &window, &display, None, font_diff);
             }
 
             Action::Focus(dir) => {
@@ -1153,6 +1207,42 @@ impl Multiplexer {
                 self.sidebar.toggle_follow();
                 self.window.request_redraw();
             }
+
+            Action::ChangeFont(size_diff) => self.change_font(size_diff),
+        }
+    }
+
+    /// フォントサイズを差分だけ変える。全タブ・全ペインの端末に加え、サイドバー・
+    /// プレビュー（ビューア／エディタ）・ランチャーにも同じ差分を配って、画面全体の
+    /// 文字を一度に揃える。ピクセル上のパネル配置は変わらない（各ビューが自分の枠内で
+    /// セルサイズだけ変えて描き直す）ので、レイアウト再計算は要らない。
+    fn change_font(&mut self, size_diff: i32) {
+        // 既定サイズを基準に範囲内へ収める。下限では「−」を押しても
+        // それ以上縮まないよう、実際に効かせる差分(applied)を計算しておく。
+        let base = crate::TOYTERM_CONFIG.font_size as i32;
+        let new_diff = clamp_font_diff(self.font_diff + size_diff, base);
+        let applied = new_diff - self.font_diff;
+        self.font_diff = new_diff;
+        if applied == 0 {
+            return;
+        }
+
+        for tab in &mut self.tabs {
+            tab.for_each_leaf(&mut |w| w.change_font_size(applied));
+        }
+        self.sidebar.change_font_size(applied);
+        self.preview_slot.change_font_size(applied);
+        if let Some(launcher) = self.launcher.as_mut() {
+            launcher.change_font_size(applied);
+        }
+        self.window.request_redraw();
+    }
+
+    /// 新しく作った端末を、いまのフォントサイズ（既定＋差分）に合わせる。
+    /// ズームしたあとに開くタブ・分割・エディタが独りだけ既定サイズに戻らないように。
+    fn apply_current_font(&self, win: &mut TerminalWindow) {
+        if self.font_diff != 0 {
+            win.change_font_size(self.font_diff);
         }
     }
 
@@ -1161,14 +1251,15 @@ impl Multiplexer {
 
         // タブが増えるとバーが出て内容領域が縮むので、push 後に再レイアウト。
         let cvp = self.content_viewport();
-        let pane = Node::Leaf(Box::new(TerminalWindow::with_viewport_command(
+        let mut win = Box::new(TerminalWindow::with_viewport_command(
             self.window.clone(),
             self.display.clone(),
             cvp,
             cwd,
             command,
-        )));
-        self.tabs.push(pane);
+        ));
+        self.apply_current_font(&mut win);
+        self.tabs.push(Node::Leaf(win));
         self.focus = self.tabs.len() - 1;
         self.refresh_layout();
         self.focused_root().focused_leaf_mut().focus_changed(true);
@@ -1414,6 +1505,7 @@ impl Multiplexer {
             cwd.as_deref(),
             Some(&command),
         ));
+        self.apply_current_font(&mut win);
         win.focus_changed(true);
         self.focused_root().focused_leaf_mut().focus_changed(false);
         self.sidebar_focused = false;
@@ -1638,6 +1730,12 @@ impl Multiplexer {
                                 .focused_leaf_mut()
                                 .set_cursor_blink(true);
                         }
+                    }
+                    // フォント変更はどのモードでも横取りして全体へ効かせる（ランチャー
+                    // 表示中でも、フォーカスがどの領域にあっても同じ大きさで揃える）。
+                    if let Some(action @ Action::ChangeFont(_)) = self.parse_shortcut(key) {
+                        self.handle_action(action);
+                        return;
                     }
                     if let Some(launcher) = self.launcher.as_mut() {
                         let outcome = launcher.handle_key(key, self.modifiers);

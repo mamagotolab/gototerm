@@ -553,7 +553,8 @@ impl TerminalWindow {
         }
     }
 
-    fn increase_font_size(&mut self, size_diff: i32) {
+    /// フォントサイズを差分だけ変える。セルが変わるので PTY のグリッドを組み直す。
+    pub fn change_font_size(&mut self, size_diff: i32) {
         self.view.increase_font_size(size_diff);
         self.resize_buffer();
     }
@@ -947,14 +948,7 @@ impl TerminalWindow {
         // 通常文字として KeyEvent.text をそのまま PTY に流す。
         let mut handled = true;
         let window_shortcut = match keybindings::lookup(self.modifiers, keycode) {
-            Some(ShortcutAction::IncreaseFont) => {
-                self.increase_font_size(1);
-                true
-            }
-            Some(ShortcutAction::DecreaseFont) => {
-                self.increase_font_size(-1);
-                true
-            }
+            // フォント変更はマルチプレクサが全ペイン一括で処理する（ここでは扱わない）。
             Some(ShortcutAction::Copy) => {
                 clear = false;
                 self.copy_clipboard();

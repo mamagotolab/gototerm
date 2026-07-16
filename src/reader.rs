@@ -122,6 +122,16 @@ impl ReaderPane {
         self.rebuild();
     }
 
+    pub fn change_font_size(&mut self, size_diff: i32) {
+        self.view.increase_font_size(size_diff);
+        // 折り返し幅（列数）と画像の収まりが変わるので、本文を作り直す。
+        if self.update_fit() && self.preview.image().is_some() {
+            self.preview.refresh_current();
+        }
+        self.refresh_reader_document();
+        self.rebuild();
+    }
+
     pub fn on_scroll(&mut self, delta: i32) {
         if delta != 0 {
             self.scroll_by(-(delta as isize));
