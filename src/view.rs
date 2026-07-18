@@ -724,31 +724,19 @@ impl TerminalView {
     }
 }
 
-// フォントファイルのバイト列をプロセス内で1つだけ持つためのキャッシュ。
+// 埋め込みフォント（include_bytes）のバイト列を、プロセス内で1つだけ持つキャッシュ。
 // ビュー（端末ペイン・ステータスバー・サイドバー・ビューア・ランチャー）ごとに
-// FontSet を組み直すが、NotoCJK(約20MB)等をその度に読み直す＆コピーすると
-// ビュー数×フォントサイズ分メモリが膨らむ（Linux実測で1窓450MB）。
+// FontSet を組み直すが、埋め込みフォントの to_vec コピーは全ビューで1回に抑える。
+// ディスク上のフォント（NotoCJK 等）は Font::from_file で FreeType に直接ストリーム
+// させ、こちらのヒープには載せない（必要なグリフだけ遅延読み）。
 // 全ビューは main スレッドで作られるので thread_local で足りる。
 thread_local! {
-    static FONT_DATA_CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, Rc<Vec<u8>>>> =
+    static EMBEDDED_FONT_CACHE: std::cell::RefCell<std::collections::HashMap<PathBuf, Rc<Vec<u8>>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
-fn load_font_data(path: &std::path::Path) -> std::io::Result<Rc<Vec<u8>>> {
-    FONT_DATA_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        if let Some(data) = cache.get(path) {
-            return Ok(data.clone());
-        }
-        let data = Rc::new(std::fs::read(path)?);
-        cache.insert(path.to_path_buf(), data.clone());
-        Ok(data)
-    })
-}
-
-// 埋め込みフォントも to_vec のコピーを1回だけにする。
 fn embedded_font_data(bytes: &'static [u8]) -> Rc<Vec<u8>> {
-    FONT_DATA_CACHE.with(|cache| {
+    EMBEDDED_FONT_CACHE.with(|cache| {
         // include_bytes のアドレスをキーにできないので、埋め込み用の擬似パスで引く。
         let key = PathBuf::from(format!("<embedded:{:p}>", bytes.as_ptr()));
         let mut cache = cache.borrow_mut();
@@ -779,35 +767,28 @@ fn build_font_set(font_size: u32) -> FontSet {
 
         log::debug!("add {:?} font: {:?}", style, path.display());
 
-        match load_font_data(path) {
-            Ok(data) => {
-                // TODO: add config
-                let face_idx = 0;
-                let font = Font::new(data, face_idx);
-                fonts.add(style, font);
-            }
-
-            Err(e) => {
-                log::warn!("ignore {:?} (reason: {:?})", path.display(), e);
-            }
+        // TODO: add config for face index
+        match Font::from_file(path, 0) {
+            Ok(font) => fonts.add(style, font),
+            Err(e) => log::warn!("ignore {:?} (reason: {})", path.display(), e),
         }
     }
 
     // Add embedded fonts
     {
-        let regular_font = Font::new(
+        let regular_font = Font::from_memory(
             embedded_font_data(include_bytes!("fonts/Mplus1Code-Regular.ttf")),
             0,
         );
         fonts.add(FontStyle::Regular, regular_font);
 
-        let bold_font = Font::new(
+        let bold_font = Font::from_memory(
             embedded_font_data(include_bytes!("fonts/Mplus1Code-SemiBold.ttf")),
             0,
         );
         fonts.add(FontStyle::Bold, bold_font);
 
-        let faint_font = Font::new(
+        let faint_font = Font::from_memory(
             embedded_font_data(include_bytes!("fonts/Mplus1Code-Thin.ttf")),
             0,
         );
@@ -1037,29 +1018,12 @@ fn image_vertices(gl_rect: GlRect) -> [ImageVertex; 6] {
 
 #[cfg(test)]
 mod tests {
-    use super::{embedded_font_data, load_font_data};
-    use std::io::Write;
+    use super::embedded_font_data;
     use std::rc::Rc;
 
     #[test]
-    fn font_data_is_loaded_once_and_shared() {
-        let mut tmp = std::env::temp_dir();
-        tmp.push(format!("gototerm_font_cache_test_{}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp).unwrap();
-            f.write_all(b"dummy font bytes").unwrap();
-        }
-
-        let a = load_font_data(&tmp).unwrap();
-        let b = load_font_data(&tmp).unwrap();
-        // 同じ Rc（=同じバッファ）が返ること。コピーが増えないことの確認。
-        assert!(Rc::ptr_eq(&a, &b));
-
-        std::fs::remove_file(&tmp).ok();
-    }
-
-    #[test]
     fn embedded_font_data_is_shared() {
+        // 埋め込みフォントの to_vec コピーが1回だけになること（全ビューで同じ Rc）。
         static BYTES: &[u8] = b"embedded dummy";
         let a = embedded_font_data(BYTES);
         let b = embedded_font_data(BYTES);

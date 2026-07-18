@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::rc::Rc;
 
 use freetype::{
@@ -7,22 +8,33 @@ use freetype::{
 };
 use glium::texture::RawImage2d;
 
+thread_local! {
+    // FreeType の Library はプロセス（メインスレッド）で1つだけ。フォントの数だけ
+    // Library::init していた（ビュー×フォント×スタイルで数十個）のを1つに集約する。
+    // フォント操作は全てメインスレッドなので thread_local で足りる。
+    static FT_LIBRARY: Library = freetype::Library::init().expect("FreeType init");
+}
+
 pub struct Font {
-    _freetype: Library,
     face: Face,
 }
 
 impl Font {
-    // フォントデータは Rc で受け取り、FreeType にもそのまま渡す（FT_New_Memory_Face
-    // はバッファをコピーしない）。ビュー（端末ペイン・サイドバー・ランチャー等）は
-    // それぞれ FontSet を持つが、巨大な TTF/TTC バイト列は全ビューで1つを共有する。
-    pub fn new(ttf_data: Rc<Vec<u8>>, index: isize) -> Self {
-        let freetype = freetype::Library::init().expect("FreeType init");
-        let face = freetype.new_memory_face(ttf_data, index).unwrap();
-        Self {
-            _freetype: freetype,
-            face,
-        }
+    // 埋め込みフォント等、メモリ上のバイト列から作る。データは Rc で共有され、
+    // FreeType にもそのまま渡す（FT_New_Memory_Face はバッファをコピーしない）。
+    pub fn from_memory(ttf_data: Rc<Vec<u8>>, index: isize) -> Self {
+        let face = FT_LIBRARY.with(|lib| lib.new_memory_face(ttf_data, index).unwrap());
+        Self { face }
+    }
+
+    // ディスク上のフォントファイルから作る。FreeType が必要なテーブル・グリフだけを
+    // 遅延読みするので、巨大な CJK フォント（NotoCJK は約 19MB）を丸ごとメモリに
+    // 載せずに済む。ASCII 中心のセッションでは CJK グリフはほとんど読まれない。
+    pub fn from_file(path: &Path, index: isize) -> Result<Self, String> {
+        let face = FT_LIBRARY
+            .with(|lib| lib.new_face(path, index))
+            .map_err(|e| e.to_string())?;
+        Ok(Self { face })
     }
 
     fn set_fontsize(&mut self, size: u32) {
@@ -125,5 +137,36 @@ impl FontSet {
                 f.set_fontsize(new_size);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ディスク上の実フォントを FreeType にストリームさせても（from_file）、
+    // ASCII と CJK の両方のグリフが引けることを確認する。file-based にしても
+    // グリフ解決のパスは new_memory_face と同一なので、これが通れば描画は不変。
+    // フォントが無い環境（CI 等）ではスキップする。
+    #[test]
+    fn from_file_resolves_ascii_and_cjk_glyphs() {
+        let candidates = [
+            "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+        ];
+        let Some(path) = candidates.iter().map(Path::new).find(|p| p.exists()) else {
+            eprintln!("skip: NotoSansCJK が見つからないためスキップ");
+            return;
+        };
+
+        let mut font = Font::from_file(path, 0).expect("load CJK font from file");
+        font.set_fontsize(16);
+
+        assert!(font.metrics('A').is_some(), "ASCII 'A' が引けること");
+        assert!(font.metrics('日').is_some(), "漢字 '日' が引けること");
+        assert!(
+            font.render('語').is_some(),
+            "漢字 '語' がラスタライズできること"
+        );
     }
 }
