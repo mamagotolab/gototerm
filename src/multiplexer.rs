@@ -17,7 +17,7 @@ use winit::{
     window::Window,
 };
 
-use crate::config::resolve_editor;
+use crate::config::{resolve_editor, resolve_file_open, OpenMethod};
 use crate::gt::{GtFileAssembler, GtMessage};
 use crate::keybindings::{self, ShortcutAction};
 use crate::launcher::{Launcher, LauncherOutcome};
@@ -1279,17 +1279,30 @@ impl Multiplexer {
             }
             LauncherOutcome::OpenFile { file, dir } => {
                 let env_editor = std::env::var("EDITOR").ok();
-                let mut editor = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
-                if !command_exists(&editor[0]) {
-                    // エディタが見つからなければ OS の既定アプリに任せる（何も起きないより良い）。
-                    crate::window::open_url(&file.to_string_lossy());
-                    self.window.request_redraw();
-                    return;
+                match resolve_file_open(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref()) {
+                    // Windows の既定 notepad は GUI アプリ。タブに入れると空の cmd タブが
+                    // 残るので、OS の既定アプリで開く（タブは作らない・ランチャーは畳む）。
+                    OpenMethod::SystemDefault => {
+                        self.startup_launcher = false;
+                        self.launcher = None;
+                        crate::window::open_url(&file.to_string_lossy());
+                        self.window.request_redraw();
+                    }
+                    OpenMethod::InTerminal(mut editor) => {
+                        if command_exists(&editor[0]) {
+                            editor.push(file.to_string_lossy().into_owned());
+                            // エディタを抜けたらそのフォルダのシェルに落ちる（エージェントと同じ流儀）。
+                            let launch = wrap_agent_command(Some(editor));
+                            self.open_tab_from_launcher(&dir, launch.as_deref());
+                        } else {
+                            // 設定されたエディタが見つからなければ OS の既定アプリに任せる。
+                            self.startup_launcher = false;
+                            self.launcher = None;
+                            crate::window::open_url(&file.to_string_lossy());
+                            self.window.request_redraw();
+                        }
+                    }
                 }
-                editor.push(file.to_string_lossy().into_owned());
-                // エディタを抜けたらそのフォルダのシェルに落ちる（エージェントと同じ流儀）。
-                let launch = wrap_agent_command(Some(editor));
-                self.open_tab_from_launcher(&dir, launch.as_deref());
             }
             LauncherOutcome::OpenExternal { file } => {
                 // ランチャーは開いたまま（画像を続けて見る等）。

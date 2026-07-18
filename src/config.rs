@@ -218,29 +218,62 @@ pub(crate) const FALLBACK_EDITOR: &str = "notepad";
 #[cfg(not(windows))]
 pub(crate) const FALLBACK_EDITOR: &str = "nvim";
 
+/// ユーザーが明示設定したエディタ（config.editor → $EDITOR）。どちらも空なら None。
+fn configured_editor(config_editor: &[String], env_editor: Option<&str>) -> Option<Vec<String>> {
+    if !config_editor.is_empty() {
+        return Some(config_editor.to_vec());
+    }
+
+    let parts: Vec<String> = env_editor?
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned)
+        .collect();
+    (!parts.is_empty()).then_some(parts)
+}
+
 /// 使うエディタを決める。優先順: config.editor（空でなければ）→ $EDITOR → FALLBACK_EDITOR
 pub(crate) fn resolve_editor(config_editor: &[String], env_editor: Option<&str>) -> Vec<String> {
-    if !config_editor.is_empty() {
-        return config_editor.to_vec();
-    }
+    configured_editor(config_editor, env_editor).unwrap_or_else(|| vec![FALLBACK_EDITOR.to_owned()])
+}
 
-    if let Some(editor) = env_editor {
-        let parts: Vec<String> = editor
-            .split_whitespace()
-            .filter(|part| !part.is_empty())
-            .map(str::to_owned)
-            .collect();
-        if !parts.is_empty() {
-            return parts;
+/// テキストファイルの開き方。
+pub(crate) enum OpenMethod {
+    /// ターミナルのタブでエディタを起動する（nvim 等の TUI エディタ向け）。
+    InTerminal(Vec<String>),
+    /// OS の既定アプリに任せる（タブを作らない）。
+    /// 構築されるのは Windows のフォールバック時のみ（非 Windows では未構築でも
+    /// match 側で使うため、誤検知の dead_code 警告だけ抑える）。
+    #[cfg_attr(not(windows), allow(dead_code))]
+    SystemDefault,
+}
+
+/// ランチャーでテキストファイルを開くときの方法を決める。
+///
+/// ユーザーがエディタを明示設定していれば、それをタブで起動する（TUI 前提）。
+/// 未設定のときのフォールバックは OS で分かれる:
+/// - Linux: nvim（TUI）なのでタブで開いて問題ない。
+/// - Windows: notepad は GUI アプリ。タブの中で起動すると「別窓のメモ帳＋
+///   空の cmd タブ」が残ってしまうので、OS の既定アプリに任せてタブを作らない。
+pub(crate) fn resolve_file_open(config_editor: &[String], env_editor: Option<&str>) -> OpenMethod {
+    match configured_editor(config_editor, env_editor) {
+        Some(editor) => OpenMethod::InTerminal(editor),
+        None => {
+            #[cfg(windows)]
+            {
+                OpenMethod::SystemDefault
+            }
+            #[cfg(not(windows))]
+            {
+                OpenMethod::InTerminal(vec![FALLBACK_EDITOR.to_owned()])
+            }
         }
     }
-
-    vec![FALLBACK_EDITOR.to_owned()]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{resolve_editor, FALLBACK_EDITOR};
+    use super::{resolve_editor, resolve_file_open, OpenMethod, FALLBACK_EDITOR};
 
     #[test]
     fn resolve_editor_prefers_config() {
@@ -267,5 +300,40 @@ mod tests {
             resolve_editor(&[], Some("  ")),
             vec![FALLBACK_EDITOR.to_owned()]
         );
+    }
+
+    #[test]
+    fn resolve_file_open_uses_terminal_for_configured_editor() {
+        // 明示設定されたエディタは OS を問わずタブで開く（TUI 前提）。
+        let config = vec!["nvim".to_owned()];
+        match resolve_file_open(&config, None) {
+            OpenMethod::InTerminal(cmd) => assert_eq!(cmd, vec!["nvim".to_owned()]),
+            OpenMethod::SystemDefault => panic!("configured editor should open in a terminal tab"),
+        }
+        // $EDITOR も同様。
+        match resolve_file_open(&[], Some("vim")) {
+            OpenMethod::InTerminal(cmd) => assert_eq!(cmd, vec!["vim".to_owned()]),
+            OpenMethod::SystemDefault => panic!("$EDITOR should open in a terminal tab"),
+        }
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn resolve_file_open_falls_back_to_terminal_nvim_on_unix() {
+        // 未設定のフォールバックは nvim（TUI）なのでタブで開く。
+        match resolve_file_open(&[], None) {
+            OpenMethod::InTerminal(cmd) => assert_eq!(cmd, vec![FALLBACK_EDITOR.to_owned()]),
+            OpenMethod::SystemDefault => panic!("unix fallback should open nvim in a tab"),
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn resolve_file_open_uses_system_default_on_windows_fallback() {
+        // Windows で未設定のときは notepad(GUI) をタブに入れず OS 既定アプリへ。
+        assert!(matches!(
+            resolve_file_open(&[], None),
+            OpenMethod::SystemDefault
+        ));
     }
 }
