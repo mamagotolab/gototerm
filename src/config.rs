@@ -35,6 +35,11 @@ pub struct Config {
     #[serde(default)]
     pub keybindings: HashMap<String, String>,
 
+    // スクロールバックの保持行数（ペイン毎）。大きいほどメモリを食う。
+    // alacritty の既定は10000行だが、軽さ優先で3000行に絞る。
+    #[serde(default = "default_scrollback_lines")]
+    pub scrollback_lines: usize,
+
     // 起動時にプロジェクトランチャー（Ctrl+Shift+N）を最初から開く。
     #[serde(default)]
     pub show_launcher_on_start: bool,
@@ -109,6 +114,7 @@ impl Default for Config {
                 "__pycache__".to_owned(),
             ],
             keybindings: HashMap::new(),
+            scrollback_lines: default_scrollback_lines(),
             // 既定で起動時にランチャーを出す（落としてすぐ「開く場所を選ぶ」体験）。
             show_launcher_on_start: true,
             launcher_agents: default_agents(),
@@ -146,6 +152,10 @@ impl Default for Config {
 
 fn default_preview_ratio() -> f64 {
     0.5
+}
+
+fn default_scrollback_lines() -> usize {
+    3000
 }
 
 fn default_agents() -> Vec<AgentDef> {

@@ -21,10 +21,41 @@ pub enum LauncherOutcome {
         dir: PathBuf,
         command: Option<Vec<String>>,
     },
+    /// このファイルをエディタで開く（新タブ、cwd=親フォルダ）。
+    OpenFile { file: PathBuf, dir: PathBuf },
+    /// OS の既定アプリで開く。ランチャーは開いたまま（続けて選べる）。
+    OpenExternal { file: PathBuf },
     /// 何もせず閉じる。
     Cancelled,
     /// まだ操作中。
     None,
+}
+
+/// エディタでなく OS の既定アプリで開くべき拡張子か（画像・PDF・音楽・圧縮など）。
+/// ここに無いものは「テキスト」とみなしてエディタで開く。
+fn opens_externally(name: &str) -> bool {
+    let ext = match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext.to_ascii_lowercase(),
+        _ => return false,
+    };
+    matches!(
+        ext.as_str(),
+        // 画像（svg はテキストなのでエディタ側）
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "tif" | "tiff" | "heic"
+            | "avif"
+            // 文書
+            | "pdf" | "doc" | "docx" | "xls" | "xlsx" | "ppt" | "pptx" | "odt" | "ods" | "odp"
+            // 音声・動画
+            | "mp3" | "wav" | "flac" | "ogg" | "m4a" | "opus" | "mp4" | "mkv" | "mov" | "avi"
+            | "webm"
+            // 圧縮・イメージ
+            | "zip" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "7z" | "rar" | "jar"
+            | "iso" | "img" | "deb" | "rpm" | "apk" | "msi"
+            // バイナリ
+            | "exe" | "dll" | "so" | "dylib" | "bin" | "o" | "a" | "class"
+            // フォント
+            | "ttf" | "otf" | "ttc" | "woff" | "woff2"
+    )
 }
 
 pub struct Launcher {
@@ -200,7 +231,7 @@ impl LauncherState {
         }
         match code {
             KeyCode::Escape => return LauncherOutcome::Cancelled,
-            KeyCode::Enter => self.choose_target(),
+            KeyCode::Enter => return self.choose_target(),
             KeyCode::ArrowDown => self.move_sel(1),
             KeyCode::ArrowUp => self.move_sel(-1),
             KeyCode::ArrowRight => self.descend(),
@@ -210,6 +241,7 @@ impl LauncherState {
                 Some("k") => self.move_sel(-1),
                 Some("l") => self.descend(),
                 Some("h") => self.ascend(),
+                Some("o") => return self.open_selected_external(),
                 Some("/") => self.start_filter(),
                 Some(".") => {
                     self.show_hidden = !self.show_hidden;
@@ -237,7 +269,7 @@ impl LauncherState {
                 self.filter = None;
                 return LauncherOutcome::None;
             }
-            KeyCode::Enter => self.choose_target(),
+            KeyCode::Enter => return self.choose_target(),
             KeyCode::ArrowDown => self.move_sel(1),
             KeyCode::ArrowUp => self.move_sel(-1),
             KeyCode::ArrowRight => self.descend(),
@@ -514,10 +546,50 @@ impl LauncherState {
         resolve_existing_dir(&target)
     }
 
-    fn choose_target(&mut self) {
+    fn choose_target(&mut self) -> LauncherOutcome {
+        // ファイル上の Enter は「そのファイルを開く」。フォルダ（と ".."）は従来どおり
+        // エージェント選択へ。人の期待（ファイルを選んで Enter＝開く）に合わせる。
+        if let Some(entry) = self.current_entry().cloned() {
+            if entry.name != ".." && !entry.is_dir {
+                return self.open_file_outcome(&entry.name);
+            }
+        }
         if let Some(dir) = self.target_dir() {
             self.enter_agent_mode(dir);
         }
+        LauncherOutcome::None
+    }
+
+    /// 選択中ファイルを開く Outcome を作る。画像・PDF 等は OS の既定アプリ、
+    /// それ以外（テキスト）はエディタで開く。
+    fn open_file_outcome(&self, name: &str) -> LauncherOutcome {
+        let file = self.canonical_dir.join(name);
+        if !file.is_file() {
+            return LauncherOutcome::None;
+        }
+        if opens_externally(name) {
+            return LauncherOutcome::OpenExternal { file };
+        }
+        let dir = file
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.canonical_dir.clone());
+        LauncherOutcome::OpenFile { file, dir }
+    }
+
+    /// o キー：選択中ファイルを OS の既定アプリで開く（テキストでも強制的に）。
+    fn open_selected_external(&self) -> LauncherOutcome {
+        let Some(entry) = self.current_entry() else {
+            return LauncherOutcome::None;
+        };
+        if entry.name == ".." || entry.is_dir {
+            return LauncherOutcome::None;
+        }
+        let file = self.canonical_dir.join(&entry.name);
+        if !file.is_file() {
+            return LauncherOutcome::None;
+        }
+        LauncherOutcome::OpenExternal { file }
     }
 
     fn enter_agent_mode(&mut self, dir: PathBuf) {
@@ -619,7 +691,7 @@ impl LauncherState {
                 query
             ),
             None => {
-                "j/k:移動  l:入る  h:上へ  Enter:開く  m:★登録  b:★一覧  .:隠し  r:最近  Esc:閉じる"
+                "j/k:移動  l:入る  h:上へ  Enter:開く  o:既定アプリ  m:★登録  b:★一覧  .:隠し  r:最近  Esc:閉じる"
                     .to_owned()
             }
         };
@@ -1037,6 +1109,115 @@ mod tests {
     }
 
     #[test]
+    fn opens_externally_by_extension() {
+        // 画像・PDF・圧縮は既定アプリ、テキスト系はエディタ。
+        assert!(opens_externally("photo.PNG"));
+        assert!(opens_externally("report.pdf"));
+        assert!(opens_externally("archive.tar.gz"));
+        assert!(!opens_externally("README.md"));
+        assert!(!opens_externally("main.rs"));
+        assert!(!opens_externally("diagram.svg"));
+        // 拡張子なし・ドットファイルはエディタ側。
+        assert!(!opens_externally("Makefile"));
+        assert!(!opens_externally(".gitignore"));
+    }
+
+    #[test]
+    fn enter_on_text_file_opens_editor() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        let idx = state
+            .entries
+            .iter()
+            .position(|e| e.name == "readme.txt")
+            .unwrap();
+        state.selected = idx;
+
+        let outcome = state.choose_target();
+        let canonical = base.canonicalize().unwrap();
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenFile {
+                file: canonical.join("readme.txt"),
+                dir: canonical,
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn enter_on_image_file_opens_external() {
+        let base = temp_tree();
+        std::fs::write(base.join("shot.png"), b"png").unwrap();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        let idx = state
+            .entries
+            .iter()
+            .position(|e| e.name == "shot.png")
+            .unwrap();
+        state.selected = idx;
+
+        let outcome = state.choose_target();
+        let canonical = base.canonicalize().unwrap();
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenExternal {
+                file: canonical.join("shot.png"),
+            }
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn enter_on_dir_still_enters_agent_mode() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        let idx = state
+            .entries
+            .iter()
+            .position(|e| e.name == "apple")
+            .unwrap();
+        state.selected = idx;
+
+        let outcome = state.choose_target();
+        assert_eq!(outcome, LauncherOutcome::None);
+        assert_eq!(state.mode, Mode::Agent);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn o_key_forces_external_for_any_file() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        let idx = state
+            .entries
+            .iter()
+            .position(|e| e.name == "readme.txt")
+            .unwrap();
+        state.selected = idx;
+
+        // テキストでも o なら既定アプリ。
+        let outcome = state.open_selected_external();
+        let canonical = base.canonicalize().unwrap();
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenExternal {
+                file: canonical.join("readme.txt"),
+            }
+        );
+
+        // フォルダでは何もしない。
+        let idx = state.entries.iter().position(|e| e.name == "apple").unwrap();
+        state.selected = idx;
+        assert_eq!(state.open_selected_external(), LauncherOutcome::None);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn read_entries_dirs_first_and_hides_dotfiles() {
         let base = temp_tree();
         let entries = read_entries(&base, false);
@@ -1245,7 +1426,9 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_file_chooses_containing_dir_for_agent_mode() {
+    fn enter_on_file_opens_it_not_agent_mode() {
+        // v0.6.0 で仕様変更：ファイル上の Enter は「そのファイルを開く」。
+        // （以前は「今のフォルダでエージェント選択」だった）
         let base = temp_tree();
         let mut state = LauncherState::with_dir(Vec::new(), base.clone());
         state.selected = state
@@ -1255,10 +1438,15 @@ mod tests {
             .unwrap();
 
         let outcome = state.handle_key_parts(KeyCode::Enter, None);
-        let expected = std::fs::canonicalize(&base).unwrap();
-        assert_eq!(outcome, LauncherOutcome::None);
-        assert_eq!(state.mode, Mode::Agent);
-        assert_eq!(state.chosen_dir, Some(expected));
+        let canonical = std::fs::canonicalize(&base).unwrap();
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenFile {
+                file: canonical.join("readme.txt"),
+                dir: canonical,
+            }
+        );
+        assert_eq!(state.mode, Mode::Browse);
 
         let _ = std::fs::remove_dir_all(&base);
     }

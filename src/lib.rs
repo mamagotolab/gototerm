@@ -13,6 +13,7 @@ mod recent;
 mod sidebar;
 mod sixel;
 mod terminal;
+mod timeline;
 mod utils;
 mod view;
 mod vt;

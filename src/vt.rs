@@ -652,7 +652,11 @@ impl VtTerminal {
             winsize: winsize.clone(),
         };
         let size = GridSize { cols, lines };
-        let term = Arc::new(Mutex::new(Term::new(Config::default(), &size, proxy)));
+        let term_config = Config {
+            scrolling_history: crate::TOYTERM_CONFIG.scrollback_lines,
+            ..Config::default()
+        };
+        let term = Arc::new(Mutex::new(Term::new(term_config, &size, proxy)));
 
         let exited = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(true));

@@ -1272,22 +1272,28 @@ impl Multiplexer {
     fn handle_launcher_outcome(&mut self, outcome: LauncherOutcome) {
         match outcome {
             LauncherOutcome::OpenIn { dir, command } => {
-                let replace_startup = self.startup_launcher;
-                self.startup_launcher = false;
-                self.launcher = None;
                 // エージェントは「抜けたらそのフォルダのシェルへ戻る」形で起動する
                 // （直接 exec だと exit でタブごと閉じてしまう）。シェル選択は None のまま。
                 let launch = wrap_agent_command(command);
-                self.open_tab_in(Some(&dir), launch.as_deref());
-                // 起動時ランチャーで選んだ場合、自動で立った最初の空シェルタブを畳む。
-                if replace_startup && self.tabs.len() > 1 {
-                    self.tabs[0].close_focused(); // 最初のタブは単一ペイン＝PTY を閉じる
-                    self.tabs.remove(0);
-                    self.focus = self.tabs.len() - 1;
-                    self.refresh_layout();
-                    self.focused_root().focused_leaf_mut().focus_changed(true);
-                    self.update_status_bar();
+                self.open_tab_from_launcher(&dir, launch.as_deref());
+            }
+            LauncherOutcome::OpenFile { file, dir } => {
+                let env_editor = std::env::var("EDITOR").ok();
+                let mut editor = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
+                if !command_exists(&editor[0]) {
+                    // エディタが見つからなければ OS の既定アプリに任せる（何も起きないより良い）。
+                    crate::window::open_url(&file.to_string_lossy());
+                    self.window.request_redraw();
+                    return;
                 }
+                editor.push(file.to_string_lossy().into_owned());
+                // エディタを抜けたらそのフォルダのシェルに落ちる（エージェントと同じ流儀）。
+                let launch = wrap_agent_command(Some(editor));
+                self.open_tab_from_launcher(&dir, launch.as_deref());
+            }
+            LauncherOutcome::OpenExternal { file } => {
+                // ランチャーは開いたまま（画像を続けて見る等）。
+                crate::window::open_url(&file.to_string_lossy());
                 self.window.request_redraw();
             }
             LauncherOutcome::Cancelled => {
@@ -1299,6 +1305,24 @@ impl Multiplexer {
                 self.window.request_redraw();
             }
         }
+    }
+
+    /// ランチャーを畳んで、選んだ場所で新しいタブを開く共通処理。
+    fn open_tab_from_launcher(&mut self, dir: &Path, command: Option<&[String]>) {
+        let replace_startup = self.startup_launcher;
+        self.startup_launcher = false;
+        self.launcher = None;
+        self.open_tab_in(Some(dir), command);
+        // 起動時ランチャーで選んだ場合、自動で立った最初の空シェルタブを畳む。
+        if replace_startup && self.tabs.len() > 1 {
+            self.tabs[0].close_focused(); // 最初のタブは単一ペイン＝PTY を閉じる
+            self.tabs.remove(0);
+            self.focus = self.tabs.len() - 1;
+            self.refresh_layout();
+            self.focused_root().focused_leaf_mut().focus_changed(true);
+            self.update_status_bar();
+        }
+        self.window.request_redraw();
     }
 
     fn focus_sidebar(&mut self) {

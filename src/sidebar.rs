@@ -10,6 +10,7 @@ use winit::{
 };
 
 use crate::terminal::{Cell, Color, GraphicAttribute, Line};
+use crate::timeline::{format_age, Timeline};
 use crate::view::{TerminalView, Viewport};
 use crate::vt::ShellLocation;
 use crate::watcher::{merge_kind, ChangeKind, FileChange, WorkspaceWatcher};
@@ -52,6 +53,9 @@ pub struct Sidebar {
     /// （他ターミナルの AI が同じプロジェクトを触ってもプレビューが動かない）。
     follow_frozen: bool,
     ai_activity: Option<AiActivity>,
+    /// AI 作業タイムライン（[log] モードで表示）。hooks とファイル監視から溜める。
+    timeline: Timeline,
+    log_scroll: usize,
 }
 
 impl Sidebar {
@@ -86,6 +90,8 @@ impl Sidebar {
             follow_target: None,
             follow_frozen: false,
             ai_activity: None,
+            timeline: Timeline::default(),
+            log_scroll: 0,
         }
     }
 
@@ -239,6 +245,18 @@ impl Sidebar {
                     return;
                 }
             }
+            SidebarMode::Log => {
+                if let Some(i) = self.timeline.entries().iter().position(|e| {
+                    e.path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|n| n.to_lowercase().starts_with(&q))
+                        .unwrap_or(false)
+                }) {
+                    self.set_list_selection(i);
+                    return;
+                }
+            }
         }
         // 一致なし：クエリ表示を更新するため再描画だけする。
         self.rebuild();
@@ -265,6 +283,14 @@ impl Sidebar {
                 None
             }
             RowAction::PreviewFile(path) => Some(SidebarRequest::PreviewFile(path)),
+            RowAction::TimelineRow(index) => {
+                let entry = self.timeline.entries().get(index)?;
+                if entry.kind == ChangeKind::Deleted {
+                    return None; // 消えたファイルはプレビューできない。
+                }
+                let root = self.watcher_root.as_deref().unwrap_or_else(|| Path::new(""));
+                Some(SidebarRequest::PreviewFile(root.join(&entry.path)))
+            }
         }
     }
 
@@ -323,22 +349,36 @@ impl Sidebar {
             return;
         }
 
-        if self.mode != SidebarMode::Files {
-            return;
-        }
-
-        let visible = self.browse_entry_slots();
-        let max = browse_scroll_max(self.browse_entries.len(), visible);
-        let next = if delta > 0 {
-            self.browse_scroll.saturating_sub(delta as usize)
-        } else {
-            self.browse_scroll
-                .saturating_add(delta.unsigned_abs() as usize)
-        };
-        let clamped = clamp_browse_scroll(next, self.browse_entries.len(), visible);
-        if clamped != self.browse_scroll {
-            self.browse_scroll = clamped.min(max);
-            self.rebuild();
+        match self.mode {
+            SidebarMode::Changes => {}
+            SidebarMode::Files => {
+                let visible = self.browse_entry_slots();
+                let max = browse_scroll_max(self.browse_entries.len(), visible);
+                let next = if delta > 0 {
+                    self.browse_scroll.saturating_sub(delta as usize)
+                } else {
+                    self.browse_scroll
+                        .saturating_add(delta.unsigned_abs() as usize)
+                };
+                let clamped = clamp_browse_scroll(next, self.browse_entries.len(), visible);
+                if clamped != self.browse_scroll {
+                    self.browse_scroll = clamped.min(max);
+                    self.rebuild();
+                }
+            }
+            SidebarMode::Log => {
+                let visible = self.log_entry_slots();
+                let next = if delta > 0 {
+                    self.log_scroll.saturating_sub(delta as usize)
+                } else {
+                    self.log_scroll.saturating_add(delta.unsigned_abs() as usize)
+                };
+                let clamped = clamp_browse_scroll(next, self.timeline.len(), visible);
+                if clamped != self.log_scroll {
+                    self.log_scroll = clamped;
+                    self.rebuild();
+                }
+            }
         }
     }
 
@@ -346,6 +386,7 @@ impl Sidebar {
         match self.mode {
             SidebarMode::Changes => 5,
             SidebarMode::Files => self.browse_entry_slots().max(1),
+            SidebarMode::Log => self.log_entry_slots().max(1),
         }
     }
 
@@ -355,6 +396,7 @@ impl Sidebar {
             SidebarMode::Files => {
                 self.browse_entries.len() + usize::from(self.browse_dir.parent().is_some())
             }
+            SidebarMode::Log => self.timeline.len(),
         }
     }
 
@@ -392,11 +434,27 @@ impl Sidebar {
                 );
             }
         }
+        if self.mode == SidebarMode::Log {
+            self.log_scroll = keep_selection_visible(
+                self.log_scroll,
+                self.browse_selected,
+                self.timeline.len(),
+                self.log_entry_slots(),
+            );
+        }
         self.rebuild();
     }
 
     fn selected_row_action(&self) -> Option<RowAction> {
         match self.mode {
+            SidebarMode::Log => {
+                if self.timeline.is_empty() {
+                    return None;
+                }
+                Some(RowAction::TimelineRow(
+                    self.browse_selected.min(self.timeline.len() - 1),
+                ))
+            }
             SidebarMode::Changes => {
                 if self.remote_location.is_some() {
                     return None;
@@ -452,6 +510,8 @@ impl Sidebar {
             },
         );
         self.changes.truncate(100);
+
+        self.timeline.push(kind, path.clone(), tool.clone());
 
         self.ai_activity = Some(AiActivity {
             kind: merged,
@@ -590,6 +650,8 @@ impl Sidebar {
         self.browse_selected = 0;
         self.follow_target = None;
         self.ai_activity = None;
+        self.timeline.clear();
+        self.log_scroll = 0;
     }
 
     fn refresh(&mut self, cwd: &Path) {
@@ -614,6 +676,9 @@ impl Sidebar {
         // 失敗した root では再試行しない（毎tickの再試行はフリーズの元）。
         if self.watcher_root.as_deref() != Some(cwd) {
             self.changes.clear();
+            // パスは root 相対なので、プロジェクトが変わったらログも仕切り直す。
+            self.timeline.clear();
+            self.log_scroll = 0;
             self.watcher = None;
             self.watch_failed = false;
             self.watcher_root = Some(cwd.to_path_buf());
@@ -672,6 +737,8 @@ impl Sidebar {
                     kind,
                 },
             );
+
+            self.timeline.push(change.kind, change.path.clone(), None);
 
             match kind {
                 ChangeKind::New | ChangeKind::Modified => {
@@ -796,6 +863,9 @@ impl Sidebar {
                 SidebarMode::Files => {
                     self.push_file_browser(&mut lines, &mut row_actions, cols);
                 }
+                SidebarMode::Log => {
+                    self.push_timeline(&mut lines, &mut row_actions, cols);
+                }
             }
         }
 
@@ -852,7 +922,7 @@ impl Sidebar {
         }
         // ソリッド背景では BrightBlack(#414868) だと暗くて沈むので、Tokyo Night の
         // コメント色(#565F89)で読める明るさにする。
-        let hint = " j/k:選択 l:開く h:上へ /:検索 Esc:端末";
+        let hint = " j/k:選択 l:開く h:上へ /:検索 Tab:切替 Esc:端末";
         push_line(
             lines,
             row_actions,
@@ -947,6 +1017,11 @@ impl Sidebar {
         } else {
             " files "
         };
+        let log = if self.mode == SidebarMode::Log {
+            "[log]"
+        } else {
+            " log "
+        };
         push_segments(
             lines,
             row_actions,
@@ -956,6 +1031,8 @@ impl Sidebar {
                 (changes, Color::BrightWhite),
                 ("  ", Color::White),
                 (files, Color::BrightWhite),
+                ("  ", Color::White),
+                (log, Color::BrightWhite),
             ],
             Some(RowAction::ToggleMode),
         );
@@ -1063,6 +1140,132 @@ impl Sidebar {
                 Color::BrightBlack,
                 None,
             );
+        }
+    }
+
+    /// AI 作業タイムライン。「相対時刻 種別 パス [要確認ラベル]」を新しい順に。
+    fn push_timeline(
+        &self,
+        lines: &mut Vec<Line>,
+        row_actions: &mut Vec<Option<RowAction>>,
+        cols: usize,
+    ) {
+        let risk_count = self.timeline.risk_count();
+        if risk_count > 0 {
+            push_segments(
+                lines,
+                row_actions,
+                cols,
+                &[
+                    (" 作業ログ  ", Color::BrightWhite),
+                    ("▲ 要確認 ", Color::BrightYellow),
+                    (&format!("{risk_count}件"), Color::BrightYellow),
+                ],
+                None,
+            );
+        } else {
+            push_line(lines, row_actions, cols, " 作業ログ", Color::BrightWhite, None);
+        }
+
+        if self.timeline.is_empty() {
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                "   (まだ変更がありません)",
+                Color::BrightBlack,
+                None,
+            );
+            push_line(lines, row_actions, cols, "", Color::White, None);
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                " AIの変更をツール名つきで記録するには:",
+                Color::BrightBlack,
+                None,
+            );
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                "   gt init-hooks  (Claude Code)",
+                Color::BrightWhite,
+                None,
+            );
+            return;
+        }
+
+        let slots = self.log_entry_slots();
+        let start = self.log_scroll.min(self.timeline.len().saturating_sub(1));
+        let end = (start + slots).min(self.timeline.len());
+
+        for (index, entry) in self
+            .timeline
+            .entries()
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(end - start)
+        {
+            let age = format_age(entry.at.elapsed());
+            let (label, color) = change_label(entry.kind);
+            let tool = entry
+                .tool
+                .as_ref()
+                .map(|tool| format!(" ({tool})"))
+                .unwrap_or_default();
+            let risk = entry
+                .risk
+                .map(|risk| format!(" ▲{risk}"))
+                .unwrap_or_default();
+            // 幅の内訳: 先頭空白1 + 時刻5 + 空白1 + 種別 + 空白1 + パス + tool + risk
+            let fixed = 1 + 5 + 1 + display_width(label) + 1;
+            let available = cols
+                .saturating_sub(fixed)
+                .saturating_sub(display_width(&tool))
+                .saturating_sub(display_width(&risk));
+            let path = abbreviate_start(&entry.path.display().to_string(), available);
+            // 時刻列は表示幅5桁で揃える（全角混じりなので display_width で数える）。
+            let pad = 5_usize.saturating_sub(display_width(&age));
+            let age_padded = format!("{age}{}", " ".repeat(pad));
+            push_segments(
+                lines,
+                row_actions,
+                cols,
+                &[
+                    (" ", Color::White),
+                    (&age_padded, Color::BrightBlack),
+                    (" ", Color::White),
+                    (label, color),
+                    (" ", Color::White),
+                    (&path, Color::White),
+                    (&tool, Color::BrightBlack),
+                    (&risk, Color::BrightYellow),
+                ],
+                Some(RowAction::TimelineRow(index)),
+            );
+        }
+
+        if end < self.timeline.len() {
+            let rest = self.timeline.len() - end;
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                &format!("   … ほか {rest} 件"),
+                Color::BrightBlack,
+                None,
+            );
+        }
+    }
+
+    fn log_entry_slots(&self) -> usize {
+        if self.timeline.len() > FILE_BROWSER_VISIBLE_ROWS {
+            // 「ほか N 件」行の分を1行確保する（files と同じ流儀）。
+            FILE_BROWSER_VISIBLE_ROWS.saturating_sub(1)
+        } else {
+            FILE_BROWSER_VISIBLE_ROWS
         }
     }
 
@@ -1182,11 +1385,13 @@ impl Sidebar {
     fn toggle_mode(&mut self) {
         self.mode = match self.mode {
             SidebarMode::Changes => SidebarMode::Files,
-            SidebarMode::Files => SidebarMode::Changes,
+            SidebarMode::Files => SidebarMode::Log,
+            SidebarMode::Log => SidebarMode::Changes,
         };
         self.search = None;
         self.browse_selected = 0;
         self.browse_scroll = 0;
+        self.log_scroll = 0;
         if self.mode == SidebarMode::Files && self.browse_entries.is_empty() {
             self.request_browse_dir();
         }
@@ -1294,6 +1499,8 @@ pub enum SidebarKeyResult {
 enum SidebarMode {
     Changes,
     Files,
+    /// AI 作業タイムライン（いつ・何が・どのツールで変わったか＋要確認ラベル）。
+    Log,
 }
 
 struct AiActivity {
@@ -1310,6 +1517,9 @@ enum RowAction {
     BrowseParent,
     BrowseDir(PathBuf),
     PreviewFile(PathBuf),
+    /// タイムラインの i 番目の行。同じファイルが複数回並び得るので
+    /// パスでなく添字で行を特定する（選択ハイライトのため）。
+    TimelineRow(usize),
 }
 
 /// watcher の生成をバックグラウンドで行う（生成＝ディレクトリ登録は

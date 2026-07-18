@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use freetype::{
     face::{Face, LoadFlag},
@@ -12,9 +13,12 @@ pub struct Font {
 }
 
 impl Font {
-    pub fn new(ttf_data: &[u8], index: isize) -> Self {
+    // フォントデータは Rc で受け取り、FreeType にもそのまま渡す（FT_New_Memory_Face
+    // はバッファをコピーしない）。ビュー（端末ペイン・サイドバー・ランチャー等）は
+    // それぞれ FontSet を持つが、巨大な TTF/TTC バイト列は全ビューで1つを共有する。
+    pub fn new(ttf_data: Rc<Vec<u8>>, index: isize) -> Self {
         let freetype = freetype::Library::init().expect("FreeType init");
-        let face = freetype.new_memory_face(ttf_data.to_vec(), index).unwrap();
+        let face = freetype.new_memory_face(ttf_data, index).unwrap();
         Self {
             _freetype: freetype,
             face,
