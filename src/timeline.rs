@@ -31,6 +31,9 @@ pub struct TimelineEntry {
 #[derive(Default)]
 pub struct Timeline {
     entries: Vec<TimelineEntry>,
+    /// 直近の SessionStart（hooks）の時刻。表示側はこれより新しいエントリと
+    /// 古いエントリの境目に区切り線を出す（「今のセッションで何が変わったか」）。
+    session_start: Option<Instant>,
 }
 
 impl Timeline {
@@ -79,6 +82,15 @@ impl Timeline {
         self.entries.is_empty()
     }
 
+    /// SessionStart hook を受けたときに呼ぶ。以後の描画で区切り線の基準になる。
+    pub fn mark_session_start(&mut self) {
+        self.session_start = Some(Instant::now());
+    }
+
+    pub fn session_start(&self) -> Option<Instant> {
+        self.session_start
+    }
+
     /// 要確認ラベルつきの件数。
     pub fn risk_count(&self) -> usize {
         self.entries.iter().filter(|e| e.risk.is_some()).count()
@@ -86,6 +98,7 @@ impl Timeline {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.session_start = None;
     }
 }
 
@@ -210,6 +223,16 @@ mod tests {
         // New→Modified の併合は New のまま（merge_kind の規則）。
         assert_eq!(entry.kind, ChangeKind::New);
         assert_eq!(entry.tool.as_deref(), Some("Edit"));
+    }
+
+    #[test]
+    fn mark_session_start_records_a_time_and_clear_resets_it() {
+        let mut timeline = Timeline::default();
+        assert_eq!(timeline.session_start(), None);
+        timeline.mark_session_start();
+        assert!(timeline.session_start().is_some());
+        timeline.clear();
+        assert_eq!(timeline.session_start(), None);
     }
 
     #[test]

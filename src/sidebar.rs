@@ -9,6 +9,7 @@ use winit::{
     keyboard::{KeyCode, PhysicalKey},
 };
 
+use crate::gt::AgentSignal;
 use crate::terminal::{Cell, Color, GraphicAttribute, Line};
 use crate::timeline::{format_age, Timeline};
 use crate::view::{TerminalView, Viewport};
@@ -514,9 +515,13 @@ impl Sidebar {
         self.timeline.push(kind, path.clone(), tool.clone());
 
         self.ai_activity = Some(AiActivity {
-            kind: merged,
-            path: path.clone(),
-            tool,
+            // event メッセージは現状 Claude Code の hooks（gt hook）由来のみ。
+            agent: "claude".to_owned(),
+            state: AgentState::Working {
+                kind: merged,
+                path: path.clone(),
+                tool,
+            },
             at: Instant::now(),
         });
 
@@ -526,6 +531,35 @@ impl Sidebar {
             }
         }
 
+        self.rebuild();
+    }
+
+    /// Claude Code hooks（Notification/Stop/SessionStart/SessionEnd）由来の
+    /// 意味的な状態信号を反映する。ファイル変更を伴わないので watcher とは別経路。
+    pub fn apply_gt_state(&mut self, agent: String, signal: AgentSignal, detail: Option<String>) {
+        match signal {
+            AgentSignal::Blocked => {
+                self.ai_activity = Some(AiActivity {
+                    agent,
+                    state: AgentState::Blocked { detail },
+                    at: Instant::now(),
+                });
+            }
+            AgentSignal::Done => {
+                self.ai_activity = Some(AiActivity {
+                    agent,
+                    state: AgentState::Done,
+                    at: Instant::now(),
+                });
+            }
+            AgentSignal::SessionStart => {
+                self.timeline.mark_session_start();
+            }
+            AgentSignal::SessionEnd => {
+                // セッションが終わったら、古い状態表示が居座らないよう消す。
+                self.ai_activity = None;
+            }
+        }
         self.rebuild();
     }
 
@@ -942,36 +976,74 @@ impl Sidebar {
         let Some(activity) = &self.ai_activity else {
             return;
         };
-        if activity.at.elapsed() > Duration::from_secs(60) {
+        // 許可待ちは自然に消さない（本当に長時間止まっていても見えているべき情報のため）。
+        // Working/Done は一定時間で退場させ、隣の追従状態等の表示を圧迫しない。
+        let expires = !matches!(activity.state, AgentState::Blocked { .. });
+        if expires && activity.at.elapsed() > Duration::from_secs(60) {
             return;
         }
 
-        let (label, _) = change_label(activity.kind);
-        let suffix = activity
-            .tool
-            .as_ref()
-            .map(|tool| format!(" ({tool})"))
-            .unwrap_or_default();
-        let fixed = display_width(" ● claude  ") + display_width(label) + 1;
-        let available = cols
-            .saturating_sub(fixed)
-            .saturating_sub(display_width(&suffix));
-        let path = abbreviate_start(&activity.path.display().to_string(), available);
-        push_segments(
-            lines,
-            row_actions,
-            cols,
-            &[
-                (" ", Color::White),
-                ("●", Color::Green),
-                (" claude  ", Color::White),
-                (label, Color::BrightWhite),
-                (" ", Color::White),
-                (&path, Color::White),
-                (&suffix, Color::BrightBlack),
-            ],
-            None,
-        );
+        match &activity.state {
+            AgentState::Working { kind, path, tool } => {
+                let (label, _) = change_label(*kind);
+                let suffix = tool
+                    .as_ref()
+                    .map(|tool| format!(" ({tool})"))
+                    .unwrap_or_default();
+                let agent_seg = format!(" {}  ", activity.agent);
+                let fixed = 1 + display_width(&agent_seg) + display_width(label) + 1;
+                let available = cols
+                    .saturating_sub(fixed)
+                    .saturating_sub(display_width(&suffix));
+                let path_s = abbreviate_start(&path.display().to_string(), available);
+                push_segments(
+                    lines,
+                    row_actions,
+                    cols,
+                    &[
+                        (" ", Color::White),
+                        ("●", Color::Green),
+                        (&agent_seg, Color::White),
+                        (label, Color::BrightWhite),
+                        (" ", Color::White),
+                        (&path_s, Color::White),
+                        (&suffix, Color::BrightBlack),
+                    ],
+                    None,
+                );
+            }
+            AgentState::Blocked { detail } => {
+                let prefix = format!(" {}  許可待ち  ", activity.agent);
+                let fixed = 1 + display_width(&prefix);
+                let available = cols.saturating_sub(fixed);
+                let detail_s = abbreviate_end(detail.as_deref().unwrap_or(""), available);
+                push_segments(
+                    lines,
+                    row_actions,
+                    cols,
+                    &[
+                        (" ", Color::White),
+                        ("⏸", Color::BrightYellow),
+                        (&prefix, Color::BrightYellow),
+                        (&detail_s, Color::White),
+                    ],
+                    None,
+                );
+            }
+            AgentState::Done => {
+                push_segments(
+                    lines,
+                    row_actions,
+                    cols,
+                    &[
+                        (" ", Color::White),
+                        ("✓", Color::Rgb { rgba: 0x565F_89FF }),
+                        (&format!(" {}  完了", activity.agent), Color::BrightBlack),
+                    ],
+                    None,
+                );
+            }
+        }
     }
 
     /// 自動追従の状態を1行で見せる（クリックで切替。キーは Ctrl+Shift+P）。
@@ -1199,6 +1271,8 @@ impl Sidebar {
         let slots = self.log_entry_slots();
         let start = self.log_scroll.min(self.timeline.len().saturating_sub(1));
         let end = (start + slots).min(self.timeline.len());
+        let session_start = self.timeline.session_start();
+        let mut divider_shown = false;
 
         for (index, entry) in self
             .timeline
@@ -1208,6 +1282,24 @@ impl Sidebar {
             .skip(start)
             .take(end - start)
         {
+            // 今のセッションより前のエントリに差し掛かったところに区切り線を1本出す。
+            // 装飾行なので RowAction は None（選択・クリック対象外、行番号もずれない）。
+            if !divider_shown {
+                if let Some(session_start) = session_start {
+                    if entry.at <= session_start {
+                        divider_shown = true;
+                        push_line(
+                            lines,
+                            row_actions,
+                            cols,
+                            &"─ セッション開始 ─".to_owned(),
+                            Color::Rgb { rgba: 0x565F_89FF },
+                            None,
+                        );
+                    }
+                }
+            }
+
             let age = format_age(entry.at.elapsed());
             let (label, color) = change_label(entry.kind);
             let tool = entry
@@ -1503,10 +1595,26 @@ enum SidebarMode {
     Log,
 }
 
+/// AI の「今どうしているか」。ファイル監視／hooks の event メッセージからは
+/// Working しか分からない。Blocked/Done は Claude Code hooks（Notification/Stop）
+/// から届く、画面を見ずに取れる意味的な状態。
+enum AgentState {
+    Working {
+        kind: ChangeKind,
+        path: PathBuf,
+        tool: Option<String>,
+    },
+    /// 許可・入力待ち（Notification hook）。detail はそのメッセージ本文。
+    Blocked { detail: Option<String> },
+    /// 応答が終わった（Stop hook）。
+    Done,
+}
+
 struct AiActivity {
-    kind: ChangeKind,
-    path: PathBuf,
-    tool: Option<String>,
+    /// 表示名。hooks 側が送ってくる文字列をそのまま使う（現状は "claude" 固定だが、
+    /// 将来 Codex 等を繋いでもここは変更不要）。
+    agent: String,
+    state: AgentState,
     at: Instant,
 }
 
@@ -1726,6 +1834,32 @@ fn abbreviate_start(text: &str, max_width: usize) -> String {
         used += width;
     }
     format!("\u{2026}{out}")
+}
+
+/// `abbreviate_start` の逆。先頭を残して末尾を省略する（自由文のメッセージ向け。
+/// パスと違って「末尾が一番大事」とは限らないため、こちらは先頭から読める形にする）。
+fn abbreviate_end(text: &str, max_width: usize) -> String {
+    if display_width(text) <= max_width {
+        return text.to_owned();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    if max_width == 1 {
+        return "\u{2026}".to_owned();
+    }
+
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in text.chars() {
+        let width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if width == 0 || used + width > max_width - 1 {
+            break;
+        }
+        out.push(ch);
+        used += width;
+    }
+    format!("{out}\u{2026}")
 }
 
 fn display_width(text: &str) -> usize {

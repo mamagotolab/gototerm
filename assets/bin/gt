@@ -44,6 +44,25 @@ send_event() {
     emit "$msg"
 }
 
+send_state() {
+    agent=$1
+    state=$2
+    detail=$3
+
+    case "$state" in
+        blocked|done|session_start|session_end) ;;
+        *) return 0 ;;
+    esac
+
+    agent_b64=$(b64_arg "$agent")
+    msg="state;agent=$agent_b64;state=$state"
+    if [ -n "$detail" ]; then
+        detail_b64=$(b64_arg "$detail")
+        msg="$msg;detail=$detail_b64"
+    fi
+    emit "$msg"
+}
+
 send_view() {
     file=$1
     [ -r "$file" ] || return 0
@@ -77,25 +96,54 @@ send_view() {
     done
 }
 
-json_string_jq() {
-    key=$1
-    jq -r "$key // empty" 2>/dev/null
-}
-
 json_string_fallback() {
     key=$1
     sed -n "s/.*\"$key\"[[:space:]]*:[[:space:]]*\"\\([^\"]*\\)\".*/\\1/p" | head -n 1
 }
 
+# hooks の JSON からフィールドを1つ取り出す。
+# $1=input(JSON文字列)  $2=jq用フィルタ(先頭.付き、例 .tool_input.file_path)
+# $3=フォールバック用の素のキー名(ネストは無視して素朴に探す、例 file_path)
+hook_field() {
+    input=$1
+    jq_filter=$2
+    fallback_key=$3
+    if command -v jq >/dev/null 2>&1; then
+        printf '%s' "$input" | jq -r "$jq_filter // empty" 2>/dev/null
+    else
+        printf '%s' "$input" | json_string_fallback "$fallback_key"
+    fi
+}
+
 run_hook() {
     input=$(cat)
-    if command -v jq >/dev/null 2>&1; then
-        tool=$(printf '%s' "$input" | json_string_jq '.tool_name')
-        path=$(printf '%s' "$input" | json_string_jq '.tool_input.file_path')
-    else
-        tool=$(printf '%s' "$input" | json_string_fallback 'tool_name')
-        path=$(printf '%s' "$input" | json_string_fallback 'file_path')
-    fi
+    event=$(hook_field "$input" '.hook_event_name' 'hook_event_name')
+
+    case "$event" in
+        Notification)
+            message=$(hook_field "$input" '.message' 'message')
+            send_state claude blocked "$message"
+            ;;
+        Stop)
+            send_state claude done ""
+            ;;
+        SessionStart)
+            send_state claude session_start ""
+            ;;
+        SessionEnd)
+            send_state claude session_end ""
+            ;;
+        *)
+            # PostToolUse、または hook_event_name が来ない古い呼び出し。
+            run_post_tool_use_hook "$input"
+            ;;
+    esac
+}
+
+run_post_tool_use_hook() {
+    input=$1
+    tool=$(hook_field "$input" '.tool_name' 'tool_name')
+    path=$(hook_field "$input" '.tool_input.file_path' 'file_path')
 
     [ -n "$path" ] || return 0
 
@@ -116,6 +164,46 @@ hook_snippet() {
     "PostToolUse": [
       {
         "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gt hook"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gt hook"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gt hook"
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gt hook"
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
         "hooks": [
           {
             "type": "command",

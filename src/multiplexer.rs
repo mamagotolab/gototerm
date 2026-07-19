@@ -18,7 +18,7 @@ use winit::{
 };
 
 use crate::config::{resolve_editor, resolve_file_open, OpenMethod};
-use crate::gt::{GtFileAssembler, GtMessage};
+use crate::gt::{AgentSignal, GtFileAssembler, GtMessage};
 use crate::keybindings::{self, ShortcutAction};
 use crate::launcher::{Launcher, LauncherOutcome};
 use crate::reader::{ReaderHeaderAction, ReaderKeyResult, ReaderPane, ReaderRequest};
@@ -828,6 +828,9 @@ pub struct Multiplexer {
     /// 止まり、vsync 付きの描画がブロックして無応答になるため、隠れている間は
     /// 描画しない。`WindowEvent::Occluded` で更新する。
     occluded: bool,
+    /// ウィンドウがフォーカスされているか。AI の完了通知（Stop hook）は
+    /// 画面を見ていないとき（非フォーカス）だけ出す判定に使う。
+    window_focused: bool,
     /// カーソル点滅の起点と現在の表示フェーズ。
     blink_start: Instant,
     cursor_blink_on: bool,
@@ -893,6 +896,7 @@ impl Multiplexer {
             cursor_pos: PhysicalPosition::default(),
             exited: false,
             occluded: false,
+            window_focused: true,
             blink_start: Instant::now(),
             cursor_blink_on: true,
             sidebar_ratio: crate::TOYTERM_CONFIG.sidebar_ratio,
@@ -1552,12 +1556,11 @@ impl Multiplexer {
     }
 
     fn handle_gt_messages(&mut self) {
-        // ワークベンチを閉じている間は汲まない。毎 tick 全ペインのミューテックスを
-        // ロックするのを避ける（分割数が多いほど効く。表示していなければ捨てるだけ）。
-        if !self.sidebar.is_visible() {
-            return;
-        }
-
+        // 以前はワークベンチ非表示中は汲まずに捨てていたが、State（Blocked/Done/
+        // SessionStart/SessionEnd）はワークベンチを閉じていても・ウィンドウが
+        // 非フォーカスでも拾えないと「離席中に完了通知」という主目的が果たせない。
+        // 中身は Mutex::lock+mem::take（毎フレーム無条件で呼ぶ take_dirty と同等の
+        // 軽さ）なので、常時ドレインしても分割数が多少あっても問題にならない。
         let mut messages = Vec::new();
         for tab in &mut self.tabs {
             tab.take_gt_messages(&mut messages);
@@ -1587,6 +1590,18 @@ impl Multiplexer {
                             reader.show_remote_content(path, bytes);
                         }
                     }
+                }
+                GtMessage::State {
+                    agent,
+                    signal,
+                    detail,
+                } => {
+                    // 画面を見ていない（非フォーカス）ときだけ通知する。見ているなら
+                    // サイドバーの表示で十分で、通知はむしろ邪魔になる。
+                    if signal == AgentSignal::Done && !self.window_focused {
+                        crate::window::notify_completion();
+                    }
+                    self.sidebar.apply_gt_state(agent, signal, detail);
                 }
             }
         }
@@ -1678,6 +1693,7 @@ impl Multiplexer {
                     // フォーカスが戻った＝必ず可視なので、遮蔽フラグを下ろして
                     // 描き直す。これが無いと別ワークスペースから戻ったとき画面が
                     // 固まったまま（待機）になる。
+                    self.window_focused = focused;
                     if focused {
                         self.occluded = false;
                         self.window.request_redraw();

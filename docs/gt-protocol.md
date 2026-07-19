@@ -36,6 +36,12 @@ ESC ] 7717 ; <type> ; <key>=<value> ; ... [; data=<base64>] (BEL | ESC \)
 |---|---|---|
 | `event` | ファイル変更イベント | `kind=new\|mod\|del`、`path=<base64のパス>`、任意で `tool=<base64のツール名>` |
 | `file` | ファイル内容のチャンク | `path=<base64>`、`seq=<0始まり>`、`last=0\|1`、`data=<base64>` |
+| `state` | エージェントの意味的な状態信号 | `agent=<base64のエージェント名>`、`state=blocked\|done\|session_start\|session_end`、任意で `detail=<base64のメッセージ>` |
+
+`state` は Claude Code hooks の Notification/Stop/SessionStart/SessionEnd から送る（Phase 11・2026-07-19）。
+`event`（ファイル変更）と違い、画面の見た目を判定しない——hooks が「今どういう状態か」を
+直接教えてくれるので、許可待ち（blocked）を screen scraping なしで検知できる。
+`blocked` の `detail` はNotification hookの`message`本文（許可待ちの内容）。他は`detail`省略可。
 
 - パスと `tool` は base64（`;` や非ASCIIを含み得るため）。内容チャンクは **生データ8KBまで**を base64 化。
 - `seq=0` が新しい転送の開始（前の未完了転送は破棄）。`last=1` で完結し表示に反映。

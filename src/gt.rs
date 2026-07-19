@@ -4,6 +4,21 @@ use crate::watcher::ChangeKind;
 
 pub const GT_FILE_MAX_BYTES: usize = 64 * 1024;
 
+/// Claude Code の hooks から届く、ファイル変更を伴わないエージェントの状態信号。
+/// `Working`（ファイルを触った）は既存の `Event` メッセージで表現されるため、
+/// ここには「見た目のスクレイピングでは取れない」意味的な状態だけを持たせる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentSignal {
+    /// Notification hook。許可待ち・入力待ちで発火する。
+    Blocked,
+    /// Stop hook。エージェントの応答が終わった。
+    Done,
+    /// SessionStart hook。タイムラインに区切り線を出す起点になる。
+    SessionStart,
+    /// SessionEnd hook。表示中の状態インジケータを消す。
+    SessionEnd,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum GtMessage {
     Event {
@@ -17,6 +32,11 @@ pub enum GtMessage {
         last: bool,
         data: Vec<u8>,
     },
+    State {
+        agent: String,
+        signal: AgentSignal,
+        detail: Option<String>,
+    },
 }
 
 pub fn parse_gt_message(payload: &str) -> Option<GtMessage> {
@@ -28,13 +48,16 @@ pub fn parse_gt_message(payload: &str) -> Option<GtMessage> {
     let mut seq = None;
     let mut last = None;
     let mut data = None;
+    let mut agent = None;
+    let mut signal = None;
+    let mut detail = None;
 
     for field in fields {
         let (key, value) = field.split_once('=')?;
         match key {
             "kind" => kind = Some(parse_kind(value)?),
             "path" => path = Some(path_from_b64(value)?),
-            "tool" => tool = Some(String::from_utf8(decode_base64(value)?).ok()?),
+            "tool" => tool = Some(string_from_b64(value)?),
             "seq" => seq = Some(value.parse::<u32>().ok()?),
             "last" => {
                 last = Some(match value {
@@ -44,6 +67,9 @@ pub fn parse_gt_message(payload: &str) -> Option<GtMessage> {
                 });
             }
             "data" => data = Some(decode_base64(value)?),
+            "agent" => agent = Some(string_from_b64(value)?),
+            "state" => signal = Some(parse_agent_signal(value)?),
+            "detail" => detail = Some(string_from_b64(value)?),
             _ => {}
         }
     }
@@ -60,6 +86,21 @@ pub fn parse_gt_message(payload: &str) -> Option<GtMessage> {
             last: last?,
             data: data?,
         }),
+        "state" => Some(GtMessage::State {
+            agent: agent?,
+            signal: signal?,
+            detail,
+        }),
+        _ => None,
+    }
+}
+
+fn parse_agent_signal(value: &str) -> Option<AgentSignal> {
+    match value {
+        "blocked" => Some(AgentSignal::Blocked),
+        "done" => Some(AgentSignal::Done),
+        "session_start" => Some(AgentSignal::SessionStart),
+        "session_end" => Some(AgentSignal::SessionEnd),
         _ => None,
     }
 }
@@ -74,9 +115,11 @@ fn parse_kind(value: &str) -> Option<ChangeKind> {
 }
 
 fn path_from_b64(value: &str) -> Option<PathBuf> {
-    String::from_utf8(decode_base64(value)?)
-        .ok()
-        .map(PathBuf::from)
+    string_from_b64(value).map(PathBuf::from)
+}
+
+fn string_from_b64(value: &str) -> Option<String> {
+    String::from_utf8(decode_base64(value)?).ok()
 }
 
 pub fn decode_base64(input: &str) -> Option<Vec<u8>> {
@@ -240,6 +283,58 @@ mod tests {
             parse_gt_message("file;path=YQ==;seq=4294967296;last=1;data=Yg=="),
             None
         );
+    }
+
+    #[test]
+    fn parses_state_blocked_with_detail() {
+        assert_eq!(
+            parse_gt_message(
+                "state;agent=Y2xhdWRl;state=blocked;detail=bmVlZHMgcGVybWlzc2lvbjogcm0gLXJmIC90bXAveA=="
+            ),
+            Some(GtMessage::State {
+                agent: "claude".to_owned(),
+                signal: AgentSignal::Blocked,
+                detail: Some("needs permission: rm -rf /tmp/x".to_owned()),
+            })
+        );
+    }
+
+    #[test]
+    fn parses_state_done_without_detail() {
+        assert_eq!(
+            parse_gt_message("state;agent=Y2xhdWRl;state=done"),
+            Some(GtMessage::State {
+                agent: "claude".to_owned(),
+                signal: AgentSignal::Done,
+                detail: None,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_state_session_boundaries() {
+        assert_eq!(
+            parse_gt_message("state;agent=Y2xhdWRl;state=session_start"),
+            Some(GtMessage::State {
+                agent: "claude".to_owned(),
+                signal: AgentSignal::SessionStart,
+                detail: None,
+            })
+        );
+        assert_eq!(
+            parse_gt_message("state;agent=Y2xhdWRl;state=session_end"),
+            Some(GtMessage::State {
+                agent: "claude".to_owned(),
+                signal: AgentSignal::SessionEnd,
+                detail: None,
+            })
+        );
+    }
+
+    #[test]
+    fn state_rejects_missing_agent_and_unknown_signal() {
+        assert_eq!(parse_gt_message("state;state=done"), None);
+        assert_eq!(parse_gt_message("state;agent=Y2xhdWRl;state=wat"), None);
     }
 
     #[test]

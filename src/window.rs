@@ -20,6 +20,47 @@ type CursorPosition = PhysicalPosition<f64>;
 /// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
 /// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
 /// 引数をパスと誤解してフォルダを開くことがあるため使わない。
+/// AI（Claude Code）の Stop hook 受信時、ウィンドウが非フォーカスなら呼ぶ想定の
+/// OS 通知。中身は固定文言のみ（動的な文字列を組み込まない）。Windows 側は
+/// PowerShell 経由で文字列をコード片として解釈させるため、任意テキストを渡すと
+/// インジェクションの余地になる——ここでは既知の日本語文字列だけを埋め込む。
+pub(crate) fn notify_completion() {
+    const TITLE: &str = "gototerm";
+    const BODY: &str = "AIの応答が完了しました";
+
+    #[cfg(not(windows))]
+    let result = std::process::Command::new("notify-send")
+        .args([TITLE, BODY])
+        .spawn();
+
+    #[cfg(windows)]
+    let result = {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // 追加インストール無しでトースト通知を出す定番の手（WinRT の
+        // ToastNotificationManager を PowerShell から直接叩く）。AppId は
+        // Explorer のものを借用する一般的な回避策。
+        // 未検証（実機なし）: 将来 Windows 実機で確認が必要。
+        let script = format!(
+            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;\
+             [Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]>$null;\
+             $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
+             $x=$t.GetElementsByTagName('text');\
+             $x.Item(0).AppendChild($t.CreateTextNode('{TITLE}'))>$null;\
+             $x.Item(1).AppendChild($t.CreateTextNode('{BODY}'))>$null;\
+             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Microsoft.Windows.Explorer').Show([Windows.UI.Notifications.ToastNotification]::new($t))"
+        );
+        std::process::Command::new("powershell")
+            .args(["-NoProfile", "-Command", &script])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+    };
+
+    if let Err(e) = result {
+        log::debug!("OS 通知をスキップしました: {}", e);
+    }
+}
+
 pub(crate) fn open_url(url: &str) {
     use std::process::Command;
     #[cfg(not(windows))]
