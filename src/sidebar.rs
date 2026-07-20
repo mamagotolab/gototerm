@@ -569,6 +569,11 @@ impl Sidebar {
             .or_else(|| self.info.as_ref().map(|info| info.cwd.as_path()))
     }
 
+    /// セッションレビュー用の要約（変更ファイル数・要確認リスト）。
+    pub fn session_file_summary(&self) -> crate::timeline::SessionFileSummary {
+        self.timeline.session_summary()
+    }
+
     pub fn set_viewport(&mut self, viewport: Viewport) {
         self.view.set_viewport(viewport);
         self.rebuild();

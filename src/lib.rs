@@ -10,6 +10,7 @@ mod launcher;
 mod preview;
 mod reader;
 mod recent;
+mod session_review;
 mod sidebar;
 mod sixel;
 mod terminal;

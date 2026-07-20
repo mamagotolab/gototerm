@@ -21,6 +21,7 @@ use crate::config::{resolve_editor, resolve_file_open, OpenMethod};
 use crate::gt::{AgentSignal, GtFileAssembler, GtMessage};
 use crate::keybindings::{self, ShortcutAction};
 use crate::launcher::{Launcher, LauncherOutcome};
+use crate::session_review::{SessionReview, SessionReviewOutcome, SessionSummary};
 use crate::reader::{ReaderHeaderAction, ReaderKeyResult, ReaderPane, ReaderRequest};
 use crate::recent::RecentProjects;
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
@@ -151,7 +152,7 @@ fn workbench_viewports(vp: Viewport, sidebar_ratio: f64, preview_ratio: f64) -> 
     }
 }
 
-fn command_exists(command: &str) -> bool {
+pub(crate) fn command_exists(command: &str) -> bool {
     let path = Path::new(command);
     if path.components().count() > 1 {
         return path.is_file();
@@ -813,6 +814,8 @@ pub struct Multiplexer {
     sidebar_focused: bool,
     preview_slot: PreviewSlot,
     launcher: Option<Launcher>,
+    /// Stop hook（AI 応答完了）受信時に出す変更点の要約ポップアップ。
+    session_review: Option<SessionReview>,
     recent: RecentProjects,
     /// 起動時に自動で開いたランチャーか（true の間に選ぶと最初の空タブを畳む）。
     startup_launcher: bool,
@@ -885,6 +888,7 @@ impl Multiplexer {
             sidebar_focused: false,
             preview_slot,
             launcher: None,
+            session_review: None,
             recent,
             startup_launcher: false,
             editor_focused: false,
@@ -1239,6 +1243,9 @@ impl Multiplexer {
         if let Some(launcher) = self.launcher.as_mut() {
             launcher.change_font_size(applied);
         }
+        if let Some(review) = self.session_review.as_mut() {
+            review.change_font_size(applied);
+        }
         self.window.request_redraw();
     }
 
@@ -1271,6 +1278,40 @@ impl Multiplexer {
         if let Some(cwd) = cwd {
             self.recent.record(cwd);
         }
+    }
+
+    fn handle_session_review_outcome(&mut self, outcome: SessionReviewOutcome) {
+        if let SessionReviewOutcome::Dismissed = outcome {
+            self.session_review = None;
+        }
+        self.window.request_redraw();
+    }
+
+    /// Stop hook（AI 応答完了）を受けたときに呼ぶ。ランチャー表示中や、
+    /// このセッションで何も変わっていないときは出さない（ノイズを増やさない）。
+    fn open_session_review(&mut self) {
+        if self.launcher.is_some() {
+            return;
+        }
+        // ワークベンチ（サイドバー）を一度も開いていなくても Stop は来るので、
+        // sidebar.root()（サイドバーの watcher/git 情報由来）ではなく、
+        // フォーカス中ペインの実際の cwd を直接見る。
+        let ShellLocation::Local(root) = self.focused_location() else {
+            return;
+        };
+        let files = self.sidebar.session_file_summary();
+        if files.changed_files == 0 {
+            return;
+        }
+        let diff = crate::workspace::diff_stat(&root);
+        let summary = SessionSummary { files, diff };
+        // ランチャーと同じくウィンドウ全体を使う（画面全体を覆う一時的なポップアップ）。
+        self.session_review = Some(SessionReview::new(
+            self.display.clone(),
+            self.viewport,
+            summary,
+        ));
+        self.window.request_redraw();
     }
 
     fn handle_launcher_outcome(&mut self, outcome: LauncherOutcome) {
@@ -1601,7 +1642,11 @@ impl Multiplexer {
                     if signal == AgentSignal::Done && !self.window_focused {
                         crate::window::notify_completion();
                     }
+                    let show_review = signal == AgentSignal::Done;
                     self.sidebar.apply_gt_state(agent, signal, detail);
+                    if show_review {
+                        self.open_session_review();
+                    }
                 }
             }
         }
@@ -1658,6 +1703,9 @@ impl Multiplexer {
                     if let Some(launcher) = self.launcher.as_mut() {
                         launcher.set_viewport(self.viewport);
                     }
+                    if let Some(review) = self.session_review.as_mut() {
+                        review.set_viewport(self.viewport);
+                    }
                     self.update_status_bar();
                     // リサイズが来た＝ウィンドウは見えている。モニター切替時に
                     // Occluded(true) を受けたまま解除イベントを取りこぼすと画面が
@@ -1682,6 +1730,9 @@ impl Multiplexer {
                     self.refresh_layout();
                     if let Some(launcher) = self.launcher.as_mut() {
                         launcher.set_viewport(self.viewport);
+                    }
+                    if let Some(review) = self.session_review.as_mut() {
+                        review.set_viewport(self.viewport);
                     }
                     self.update_status_bar();
                     self.occluded = false;
@@ -1748,6 +1799,9 @@ impl Multiplexer {
                     if let Some(launcher) = self.launcher.as_mut() {
                         launcher.draw(&mut surface);
                     }
+                    if let Some(review) = self.session_review.as_mut() {
+                        review.draw(&mut surface);
+                    }
 
                     surface.finish().expect("finish");
                 }
@@ -1788,6 +1842,11 @@ impl Multiplexer {
                     // 表示中でも、フォーカスがどの領域にあっても同じ大きさで揃える）。
                     if let Some(action @ Action::ChangeFont(_)) = self.parse_shortcut(key) {
                         self.handle_action(action);
+                        return;
+                    }
+                    if let Some(review) = self.session_review.as_mut() {
+                        let outcome = review.handle_key(key);
+                        self.handle_session_review_outcome(outcome);
                         return;
                     }
                     if let Some(launcher) = self.launcher.as_mut() {
@@ -2031,7 +2090,11 @@ impl Multiplexer {
                     || self
                         .launcher
                         .as_ref()
-                        .is_some_and(|launcher| launcher.needs_redraw());
+                        .is_some_and(|launcher| launcher.needs_redraw())
+                    || self
+                        .session_review
+                        .as_ref()
+                        .is_some_and(|review| review.needs_redraw());
                 if need && !self.occluded && self.drawable() {
                     self.window.request_redraw();
                 }

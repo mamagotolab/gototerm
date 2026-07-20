@@ -135,6 +135,8 @@ enum Mode {
     Recent,
     Bookmarks,
     Agent,
+    /// フォルダ確定直後、gt hooks が未設定なら一度だけ挟む確認画面。
+    HooksNudge,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +160,7 @@ struct LauncherState {
     filter: Option<String>,
     chosen_dir: Option<PathBuf>,
     agent_selected: usize,
+    nudge_selected: usize,
 }
 
 impl LauncherState {
@@ -178,6 +181,7 @@ impl LauncherState {
             filter: None,
             chosen_dir: None,
             agent_selected: 0,
+            nudge_selected: 0,
         };
         state.reload();
         state
@@ -200,6 +204,7 @@ impl LauncherState {
             filter: None,
             chosen_dir: None,
             agent_selected: 0,
+            nudge_selected: 0,
         };
         state.reload();
         state
@@ -222,6 +227,7 @@ impl LauncherState {
             Mode::Recent => self.handle_recent_key(code, text),
             Mode::Bookmarks => self.handle_bookmark_key(code, text),
             Mode::Agent => self.handle_agent_key(code, text),
+            Mode::HooksNudge => self.handle_hooks_nudge_key(code, text),
         }
     }
 
@@ -290,7 +296,7 @@ impl LauncherState {
             KeyCode::Enter => {
                 if let Some(path) = self.recent.get(self.recent_selected) {
                     if let Some(dir) = resolve_existing_dir(path) {
-                        self.enter_agent_mode(dir);
+                        self.confirm_dir(dir);
                     }
                 }
             }
@@ -333,7 +339,7 @@ impl LauncherState {
 
     fn open_selected_bookmark(&mut self) {
         if let Some(dir) = self.selected_bookmark().as_deref().and_then(resolve_existing_dir) {
-            self.enter_agent_mode(dir);
+            self.confirm_dir(dir);
         }
     }
 
@@ -555,7 +561,7 @@ impl LauncherState {
             }
         }
         if let Some(dir) = self.target_dir() {
-            self.enter_agent_mode(dir);
+            self.confirm_dir(dir);
         }
         LauncherOutcome::None
     }
@@ -598,6 +604,55 @@ impl LauncherState {
         self.mode = Mode::Agent;
     }
 
+    /// フォルダを確定させた全経路（ブラウズ／最近使った／ブックマーク）が通る入口。
+    /// Claude Code 連携が未設定なら一度だけ確認画面を挟み、そうでなければ
+    /// 従来どおりそのままエージェント選択へ進む。
+    fn confirm_dir(&mut self, dir: PathBuf) {
+        if hooks_nudge_applicable(&dir) {
+            self.chosen_dir = Some(dir);
+            self.nudge_selected = 0;
+            self.mode = Mode::HooksNudge;
+        } else {
+            self.enter_agent_mode(dir);
+        }
+    }
+
+    fn handle_hooks_nudge_key(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
+        match code {
+            KeyCode::Escape => self.resolve_hooks_nudge(false),
+            KeyCode::Enter => {
+                let accept = self.nudge_selected == 0;
+                self.resolve_hooks_nudge(accept);
+            }
+            KeyCode::ArrowDown => self.move_nudge_selection(1),
+            KeyCode::ArrowUp => self.move_nudge_selection(-1),
+            _ => match text {
+                Some("j") => self.move_nudge_selection(1),
+                Some("k") => self.move_nudge_selection(-1),
+                _ => {}
+            },
+        }
+        LauncherOutcome::None
+    }
+
+    fn move_nudge_selection(&mut self, delta: isize) {
+        self.nudge_selected = (self.nudge_selected as isize + delta).clamp(0, 1) as usize;
+    }
+
+    fn resolve_hooks_nudge(&mut self, accept: bool) {
+        let Some(dir) = self.chosen_dir.clone() else {
+            self.mode = Mode::Browse;
+            return;
+        };
+        if accept {
+            // 書き込みに失敗しても（権限等）致命的ではないので、致命的扱いにせず進む。
+            // gt init-hooks 同様、既存ファイルがあれば上書きしない判定は
+            // hooks_nudge_applicable 側で既に済ませてある。
+            let _ = write_hooks_config(&dir);
+        }
+        self.enter_agent_mode(dir);
+    }
+
     fn reload(&mut self) {
         self.entries = read_entries(&self.dir, self.show_hidden);
         self.canonical_dir = resolve_existing_dir(&self.dir).unwrap_or_else(|| self.dir.clone());
@@ -632,6 +687,7 @@ impl LauncherState {
             Mode::Recent => self.render_recent(cols, rows),
             Mode::Bookmarks => self.render_bookmarks(cols, rows),
             Mode::Agent => self.render_agent(cols, rows),
+            Mode::HooksNudge => self.render_hooks_nudge(cols, rows),
         }
     }
 
@@ -796,44 +852,80 @@ impl LauncherState {
         content.push((String::new(), Color::White, false));
         content.push(("j/k:選択  Enter:起動  Esc:戻る".to_owned(), DIM, false));
 
-        // 幅・高さと中央位置。
-        let inner_w = content
-            .iter()
-            .map(|(t, _, _)| display_width(t))
-            .max()
-            .unwrap_or(10)
-            .clamp(10, cols.saturating_sub(6).max(10));
-        let interior_w = inner_w + 2; // 左右パディング1ずつ
-        let box_w = (interior_w + 2).min(cols); // 左右のボーダー
-        let box_h = (content.len() + 2).min(rows);
-        let x0 = cols.saturating_sub(box_w) / 2;
-        let y0 = rows.saturating_sub(box_h) / 2;
-
-        let dash = interior_w.min(box_w.saturating_sub(2));
-        // 上ボーダー
-        stamp(lines, y0, x0, border_row('╭', '╮', dash));
-        // 中身
-        for (i, (text, fg, selected)) in content.iter().enumerate() {
-            let y = y0 + 1 + i;
-            if y >= y0 + box_h - 1 {
-                break;
-            }
-            // ポップアップは不透明（透過を消す）＝不透明パネル色を敷く。選択行は青バー。
-            let (fg, bg) = if *selected {
-                (SEL_FG, SEL_BG)
-            } else {
-                (*fg, crate::view::panel_bg_color())
-            };
-            let interior = column_cells(&format!(" {text}"), fg, bg, interior_w);
-            let mut row = Vec::with_capacity(box_w);
-            row.push(border_cell('│'));
-            row.extend(interior);
-            row.push(border_cell('│'));
-            stamp(lines, y, x0, row);
-        }
-        // 下ボーダー
-        stamp(lines, y0 + box_h - 1, x0, border_row('╰', '╯', dash));
+        overlay_list_popup(lines, cols, rows, &content);
     }
+
+    fn render_hooks_nudge(&mut self, cols: usize, rows: usize) -> Vec<Line> {
+        let mut lines = self.render_browse(cols, rows);
+        self.overlay_hooks_nudge_popup(&mut lines, cols, rows);
+        lines
+    }
+
+    fn overlay_hooks_nudge_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+        let mut content: Vec<(String, Color, bool)> = Vec::new();
+        content.push(("Claude Code 連携を設定しますか？".to_owned(), ACCENT, false));
+        content.push((
+            "変更ファイル・許可待ち・完了通知が使えるようになります".to_owned(),
+            DIM,
+            false,
+        ));
+        content.push((String::new(), Color::White, false));
+        content.push((
+            "設定する（.claude/settings.local.json に書き込み）".to_owned(),
+            Color::BrightWhite,
+            self.nudge_selected == 0,
+        ));
+        content.push((
+            "今回はしない".to_owned(),
+            Color::BrightWhite,
+            self.nudge_selected == 1,
+        ));
+        content.push((String::new(), Color::White, false));
+        content.push(("j/k:選択  Enter:決定  Esc:今回はしない".to_owned(), DIM, false));
+
+        overlay_list_popup(lines, cols, rows, &content);
+    }
+}
+
+/// 中央寄せの罫線ボックスとして、選択可能な項目リストを stamp する。
+/// エージェント選択・hooks 連携確認など、複数のポップアップで共通の描画。
+fn overlay_list_popup(lines: &mut [Line], cols: usize, rows: usize, content: &[(String, Color, bool)]) {
+    let inner_w = content
+        .iter()
+        .map(|(t, _, _)| display_width(t))
+        .max()
+        .unwrap_or(10)
+        .clamp(10, cols.saturating_sub(6).max(10));
+    let interior_w = inner_w + 2; // 左右パディング1ずつ
+    let box_w = (interior_w + 2).min(cols); // 左右のボーダー
+    let box_h = (content.len() + 2).min(rows);
+    let x0 = cols.saturating_sub(box_w) / 2;
+    let y0 = rows.saturating_sub(box_h) / 2;
+
+    let dash = interior_w.min(box_w.saturating_sub(2));
+    // 上ボーダー
+    stamp(lines, y0, x0, border_row('╭', '╮', dash));
+    // 中身
+    for (i, (text, fg, selected)) in content.iter().enumerate() {
+        let y = y0 + 1 + i;
+        if y >= y0 + box_h - 1 {
+            break;
+        }
+        // ポップアップは不透明（透過を消す）＝不透明パネル色を敷く。選択行は青バー。
+        let (fg, bg) = if *selected {
+            (SEL_FG, SEL_BG)
+        } else {
+            (*fg, crate::view::panel_bg_color())
+        };
+        let interior = column_cells(&format!(" {text}"), fg, bg, interior_w);
+        let mut row = Vec::with_capacity(box_w);
+        row.push(border_cell('│'));
+        row.extend(interior);
+        row.push(border_cell('│'));
+        stamp(lines, y, x0, row);
+    }
+    // 下ボーダー
+    stamp(lines, y0 + box_h - 1, x0, border_row('╰', '╯', dash));
 }
 
 fn display_width(s: &str) -> usize {
@@ -843,14 +935,14 @@ fn display_width(s: &str) -> usize {
 }
 
 /// ポップアップのボーダーセル（青のアクセント・不透明背景）。
-fn border_cell(ch: char) -> Cell {
+pub(crate) fn border_cell(ch: char) -> Cell {
     let mut attr = GraphicAttribute::default();
     attr.fg = DIR_FG;
     attr.bg = crate::view::panel_bg_color();
     Cell::head(ch, 1, attr)
 }
 
-fn border_row(left: char, right: char, dash: usize) -> Vec<Cell> {
+pub(crate) fn border_row(left: char, right: char, dash: usize) -> Vec<Cell> {
     let mut cells = Vec::with_capacity(dash + 2);
     cells.push(border_cell(left));
     for _ in 0..dash {
@@ -861,7 +953,7 @@ fn border_row(left: char, right: char, dash: usize) -> Vec<Cell> {
 }
 
 /// base 行の列 x0 から、popup のセル列を上書きする。
-fn stamp(lines: &mut [Line], y: usize, x0: usize, cells: Vec<Cell>) {
+pub(crate) fn stamp(lines: &mut [Line], y: usize, x0: usize, cells: Vec<Cell>) {
     let Some(line) = lines.get_mut(y) else {
         return;
     };
@@ -938,6 +1030,50 @@ fn entry_fg(e: &Entry) -> Color {
 
 fn entry_icon_fg(e: &Entry) -> (char, Color) {
     icon_and_color(&e.name, e.is_dir)
+}
+
+/// gt hooks 連携を提案してよいか。Claude Code が入っていない環境では無意味な
+/// 提案になるので出さない。既に `.claude/settings.local.json` があるなら
+/// （gt hooks 済みでも、他の設定でも）触れない＝提案自体を出さない。
+fn hooks_nudge_applicable(dir: &Path) -> bool {
+    crate::multiplexer::command_exists("claude") && !dir.join(".claude/settings.local.json").exists()
+}
+
+/// `assets/bin/gt` の `hook_snippet()` と同じ内容。gt が未導入の環境でも
+/// 導線が成立するよう、シェルアウトせず直接書き込む（keep in sync with gt script）。
+const HOOK_SNIPPET: &str = r#"{
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "gt hook"
+          }
+        ]
+      }
+    ],
+    "Notification": [
+      { "hooks": [ { "type": "command", "command": "gt hook" } ] }
+    ],
+    "Stop": [
+      { "hooks": [ { "type": "command", "command": "gt hook" } ] }
+    ],
+    "SessionStart": [
+      { "hooks": [ { "type": "command", "command": "gt hook" } ] }
+    ],
+    "SessionEnd": [
+      { "hooks": [ { "type": "command", "command": "gt hook" } ] }
+    ]
+  }
+}
+"#;
+
+fn write_hooks_config(dir: &Path) -> std::io::Result<()> {
+    let claude_dir = dir.join(".claude");
+    std::fs::create_dir_all(&claude_dir)?;
+    std::fs::write(claude_dir.join("settings.local.json"), HOOK_SNIPPET)
 }
 
 fn resolve_existing_dir(path: &Path) -> Option<PathBuf> {
@@ -1057,7 +1193,7 @@ fn two_pane_row(
 }
 
 /// 指定 fg/bg で、ちょうど width セル分（足りなければ空白で埋める）を作る。
-fn column_cells(text: &str, fg: Color, bg: Color, width: usize) -> Vec<Cell> {
+pub(crate) fn column_cells(text: &str, fg: Color, bg: Color, width: usize) -> Vec<Cell> {
     let mut cells = Vec::new();
     let mut used = 0usize;
     for ch in text.chars() {
@@ -1105,6 +1241,13 @@ mod tests {
         std::fs::create_dir_all(base.join("banana")).unwrap();
         std::fs::create_dir_all(base.join(".hidden")).unwrap();
         std::fs::write(base.join("readme.txt"), "hi").unwrap();
+        // hooks 連携確認ポップアップは agent モード遷移のテストと無関係なので、
+        // 設定済み扱いにして確実にスキップさせる（claude バイナリの有無という
+        // 実行環境依存の条件でテストが揺れないように）。
+        for dir in [&base, &base.join("apple"), &base.join("banana")] {
+            std::fs::create_dir_all(dir.join(".claude")).unwrap();
+            std::fs::write(dir.join(".claude").join("settings.local.json"), "{}").unwrap();
+        }
         base
     }
 
@@ -1475,6 +1618,95 @@ mod tests {
         assert_eq!(outcome, LauncherOutcome::None);
         assert_eq!(state.mode, Mode::Agent);
         assert_eq!(state.chosen_dir, Some(expected));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hooks_nudge_not_applicable_when_settings_already_exist() {
+        let base = temp_tree();
+        // temp_tree() は既に .claude/settings.local.json を用意している
+        // （claude バイナリの有無に関わらずスキップされるべき、が本題）。
+        assert!(!hooks_nudge_applicable(&base));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hooks_nudge_accept_writes_settings_and_enters_agent_mode() {
+        let base = temp_tree();
+        // このテストの主題は「未設定のフォルダ」なので、temp_tree() が用意した
+        // settings.local.json を消してから、hooks 連携確認が出た体で駆動する
+        // （routing 条件=claude バイナリの有無はここでは検証対象にしない）。
+        let settings = base.join(".claude").join("settings.local.json");
+        std::fs::remove_file(&settings).unwrap();
+
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.chosen_dir = Some(base.clone());
+        state.mode = Mode::HooksNudge;
+        state.nudge_selected = 0; // 「設定する」
+
+        state.handle_key_parts(KeyCode::Enter, None);
+
+        assert_eq!(state.mode, Mode::Agent);
+        assert_eq!(state.chosen_dir, Some(base.clone()));
+        let written = std::fs::read_to_string(&settings).unwrap();
+        assert!(written.contains("PostToolUse"));
+        assert!(written.contains("Notification"));
+        assert!(written.contains("Stop"));
+        assert!(written.contains("SessionStart"));
+        assert!(written.contains("SessionEnd"));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hooks_nudge_decline_does_not_write_but_still_enters_agent_mode() {
+        let base = temp_tree();
+        let settings = base.join(".claude").join("settings.local.json");
+        std::fs::remove_file(&settings).unwrap();
+
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.chosen_dir = Some(base.clone());
+        state.mode = Mode::HooksNudge;
+        state.nudge_selected = 1; // 「今回はしない」
+
+        state.handle_key_parts(KeyCode::Enter, None);
+
+        assert_eq!(state.mode, Mode::Agent);
+        assert!(!settings.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn hooks_nudge_escape_also_declines() {
+        let base = temp_tree();
+        let settings = base.join(".claude").join("settings.local.json");
+        std::fs::remove_file(&settings).unwrap();
+
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.chosen_dir = Some(base.clone());
+        state.mode = Mode::HooksNudge;
+        state.nudge_selected = 0; // 選択が「設定する」でも Esc は今回はしない扱い
+
+        state.handle_key_parts(KeyCode::Escape, None);
+
+        assert_eq!(state.mode, Mode::Agent);
+        assert!(!settings.exists());
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn move_nudge_selection_clamps_to_two_options() {
+        let base = temp_tree();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.nudge_selected = 0;
+        state.move_nudge_selection(-1);
+        assert_eq!(state.nudge_selected, 0);
+        state.move_nudge_selection(1);
+        assert_eq!(state.nudge_selected, 1);
+        state.move_nudge_selection(1);
+        assert_eq!(state.nudge_selected, 1);
         let _ = std::fs::remove_dir_all(&base);
     }
 

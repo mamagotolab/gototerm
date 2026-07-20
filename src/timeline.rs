@@ -28,6 +28,13 @@ pub struct TimelineEntry {
     pub risk: Option<&'static str>,
 }
 
+/// セッションレビュー（Stop hook 受信時）で見せる、ファイル面の要約。
+pub struct SessionFileSummary {
+    pub changed_files: usize,
+    /// 要確認ラベル付きの変更（新しい順）。
+    pub risks: Vec<(PathBuf, &'static str)>,
+}
+
 #[derive(Default)]
 pub struct Timeline {
     entries: Vec<TimelineEntry>,
@@ -89,6 +96,36 @@ impl Timeline {
 
     pub fn session_start(&self) -> Option<Instant> {
         self.session_start
+    }
+
+    /// 今のセッション（SessionStart 以降）に該当するエントリだけ。
+    /// SessionStart を受けていなければ、記録されている全エントリを対象にする
+    /// （hooks 未設定でもセッションレビューが空にならないように）。
+    fn session_entries(&self) -> impl Iterator<Item = &TimelineEntry> {
+        let boundary = self.session_start;
+        self.entries
+            .iter()
+            .filter(move |e| boundary.is_none_or(|start| e.at >= start))
+    }
+
+    /// セッションレビュー用の要約。ファイルはパスで重複排除する
+    /// （併合窓を超えて同じファイルが複数回記録され得るため）。
+    pub fn session_summary(&self) -> SessionFileSummary {
+        let mut seen = std::collections::HashSet::new();
+        let mut risks = Vec::new();
+        let mut changed_files = 0usize;
+        for entry in self.session_entries() {
+            if seen.insert(&entry.path) {
+                changed_files += 1;
+                if let Some(risk) = entry.risk {
+                    risks.push((entry.path.clone(), risk));
+                }
+            }
+        }
+        SessionFileSummary {
+            changed_files,
+            risks,
+        }
     }
 
     /// 要確認ラベルつきの件数。
@@ -223,6 +260,54 @@ mod tests {
         // New→Modified の併合は New のまま（merge_kind の規則）。
         assert_eq!(entry.kind, ChangeKind::New);
         assert_eq!(entry.tool.as_deref(), Some("Edit"));
+    }
+
+    #[test]
+    fn session_summary_counts_only_entries_after_session_start() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        // セッション開始前の変更。
+        timeline.push_at(ChangeKind::Modified, PathBuf::from("before.rs"), None, t0);
+        timeline.session_start = Some(t0 + Duration::from_secs(5));
+        // セッション開始後の変更(依存ファイル=要確認)。
+        timeline.push_at(
+            ChangeKind::Modified,
+            PathBuf::from("Cargo.toml"),
+            None,
+            t0 + Duration::from_secs(10),
+        );
+
+        let summary = timeline.session_summary();
+        assert_eq!(summary.changed_files, 1);
+        assert_eq!(summary.risks, vec![(PathBuf::from("Cargo.toml"), "依存")]);
+    }
+
+    #[test]
+    fn session_summary_without_session_start_counts_everything() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        timeline.push_at(ChangeKind::Modified, PathBuf::from("a.rs"), None, t0);
+        timeline.push_at(ChangeKind::New, PathBuf::from("b.rs"), None, t0);
+
+        let summary = timeline.session_summary();
+        assert_eq!(summary.changed_files, 2);
+    }
+
+    #[test]
+    fn session_summary_dedupes_by_path() {
+        let mut timeline = Timeline::default();
+        let t0 = Instant::now();
+        // 併合窓(3秒)を超えて同じファイルが2回記録されるケース。
+        timeline.push_at(ChangeKind::Modified, PathBuf::from("a.rs"), None, t0);
+        timeline.push_at(
+            ChangeKind::Modified,
+            PathBuf::from("a.rs"),
+            None,
+            t0 + Duration::from_secs(10),
+        );
+
+        let summary = timeline.session_summary();
+        assert_eq!(summary.changed_files, 1);
     }
 
     #[test]

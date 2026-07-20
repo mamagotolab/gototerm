@@ -41,6 +41,44 @@ pub fn collect(cwd: &Path) -> WorkspaceInfo {
     }
 }
 
+/// セッションレビュー用の追加・削除行数。
+pub struct DiffStat {
+    pub added: usize,
+    pub removed: usize,
+}
+
+/// `git diff HEAD` の追加・削除行数を取る（作業ツリーの未コミット変更全体）。
+/// git が無い・リポジトリでない・HEAD が無い（コミット0件）等は None にする。
+pub fn diff_stat(cwd: &Path) -> Option<DiffStat> {
+    let mut cmd = Command::new("git");
+    cmd.args(["diff", "HEAD", "--numstat"]).current_dir(cwd);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let output = cmd.output().ok().filter(|output| output.status.success())?;
+    let text = String::from_utf8(output.stdout).ok()?;
+    Some(parse_numstat(&text))
+}
+
+/// `--numstat` の各行は `<追加>\t<削除>\t<パス>`。バイナリファイルは追加/削除が
+/// `-` になるので、行数には数えずファイルの存在だけ無視して素通りする。
+fn parse_numstat(text: &str) -> DiffStat {
+    let mut added = 0usize;
+    let mut removed = 0usize;
+    for line in text.lines() {
+        let mut fields = line.splitn(3, '\t');
+        let a = fields.next().unwrap_or("");
+        let r = fields.next().unwrap_or("");
+        added += a.parse::<usize>().unwrap_or(0);
+        removed += r.parse::<usize>().unwrap_or(0);
+    }
+    DiffStat { added, removed }
+}
+
 fn parse_porcelain_v2(text: &str) -> GitSummary {
     let mut summary = GitSummary {
         branch: String::new(),
@@ -89,6 +127,28 @@ fn parse_porcelain_v2(text: &str) -> GitSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_numstat_lines() {
+        let stat = parse_numstat("12\t3\tsrc/main.rs\n0\t5\told.rs\n");
+        assert_eq!(stat.added, 12);
+        assert_eq!(stat.removed, 8);
+    }
+
+    #[test]
+    fn parses_numstat_ignores_binary_dash_lines() {
+        // バイナリファイルは "-\t-\tpath" 形式。行数には数えない（0扱い）。
+        let stat = parse_numstat("4\t1\ta.rs\n-\t-\timage.png\n");
+        assert_eq!(stat.added, 4);
+        assert_eq!(stat.removed, 1);
+    }
+
+    #[test]
+    fn parses_numstat_empty_diff() {
+        let stat = parse_numstat("");
+        assert_eq!(stat.added, 0);
+        assert_eq!(stat.removed, 0);
+    }
 
     #[test]
     fn parses_clean_status() {
