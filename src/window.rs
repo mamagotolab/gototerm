@@ -9,6 +9,7 @@ use winit::{
 };
 
 use crate::gt::GtMessage;
+use crate::input::{cursor_key_sequence, CursorKey};
 use crate::keybindings::{self, ShortcutAction};
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
@@ -891,21 +892,22 @@ impl TerminalWindow {
                         }
                     }
                 } else if self.terminal.alt_screen() {
-                    let vk: &[u8] = if vertical > 0 {
-                        b"\x1b[\x41"
+                    let application = self.terminal.application_cursor_mode();
+                    let vk = if vertical > 0 {
+                        CursorKey::Up
                     } else {
-                        b"\x1b[\x42"
+                        CursorKey::Down
                     };
                     for _ in 0..vertical.abs() {
-                        self.terminal.write(vk);
+                        self.terminal.write(cursor_key_sequence(vk, application));
                     }
-                    let hk: &[u8] = if horizontal > 0 {
-                        b"\x1b[\x43"
+                    let hk = if horizontal > 0 {
+                        CursorKey::Right
                     } else {
-                        b"\x1b[\x44"
+                        CursorKey::Left
                     };
                     for _ in 0..horizontal.abs() {
-                        self.terminal.write(hk);
+                        self.terminal.write(cursor_key_sequence(hk, application));
                     }
                 } else {
                     self.terminal.scroll(vertical as i32);
@@ -1031,10 +1033,22 @@ impl TerminalWindow {
                 // ここに来る時点で preedit は空（上でガード済み）なので変換中は影響しない。
                 (false, _, KeyCode::Space) => self.terminal.write(b" "),
 
-                (false, _, KeyCode::ArrowUp) => self.terminal.write(b"\x1b[\x41"),
-                (false, _, KeyCode::ArrowDown) => self.terminal.write(b"\x1b[\x42"),
-                (false, _, KeyCode::ArrowRight) => self.terminal.write(b"\x1b[\x43"),
-                (false, _, KeyCode::ArrowLeft) => self.terminal.write(b"\x1b[\x44"),
+                (false, _, KeyCode::ArrowUp) => self.terminal.write(cursor_key_sequence(
+                    CursorKey::Up,
+                    self.terminal.application_cursor_mode(),
+                )),
+                (false, _, KeyCode::ArrowDown) => self.terminal.write(cursor_key_sequence(
+                    CursorKey::Down,
+                    self.terminal.application_cursor_mode(),
+                )),
+                (false, _, KeyCode::ArrowRight) => self.terminal.write(cursor_key_sequence(
+                    CursorKey::Right,
+                    self.terminal.application_cursor_mode(),
+                )),
+                (false, _, KeyCode::ArrowLeft) => self.terminal.write(cursor_key_sequence(
+                    CursorKey::Left,
+                    self.terminal.application_cursor_mode(),
+                )),
 
                 (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
                 (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),

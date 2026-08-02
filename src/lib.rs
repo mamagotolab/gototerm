@@ -4,6 +4,7 @@ mod config;
 mod font;
 mod gt;
 mod highlight;
+mod input;
 mod keybindings;
 mod file_style;
 mod launcher;

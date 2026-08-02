@@ -814,6 +814,15 @@ impl VtTerminal {
             .contains(TermMode::ALT_SCREEN)
     }
 
+    pub fn application_cursor_mode(&self) -> bool {
+        use alacritty_terminal::term::TermMode;
+        self.term
+            .lock()
+            .unwrap()
+            .mode()
+            .contains(TermMode::APP_CURSOR)
+    }
+
     pub fn sgr_mouse(&self) -> bool {
         use alacritty_terminal::term::TermMode;
         self.term
@@ -1142,6 +1151,27 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(VecWriter(buf.clone()))));
         (writer, buf)
+    }
+
+    #[test]
+    fn app_cursor_mode_tracks_decset() {
+        use alacritty_terminal::term::{Config, Term, TermMode};
+
+        let (writer, _buf) = dummy_writer();
+        let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
+        let proxy = EventProxy { writer, winsize };
+        let size = GridSize {
+            cols: 80,
+            lines: 24,
+        };
+        let mut term = Term::new(Config::default(), &size, proxy);
+        let mut processor: Processor = Processor::new();
+
+        processor.advance(&mut term, b"\x1b[?1h");
+        assert!(term.mode().contains(TermMode::APP_CURSOR));
+
+        processor.advance(&mut term, b"\x1b[?1l");
+        assert!(!term.mode().contains(TermMode::APP_CURSOR));
     }
 
     #[test]
