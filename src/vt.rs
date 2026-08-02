@@ -1134,6 +1134,7 @@ fn pty_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> PtySize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     /// 共有 Vec に書き出すテスト用 Writer。
     struct VecWriter(Arc<Mutex<Vec<u8>>>);
@@ -1155,23 +1156,15 @@ mod tests {
 
     #[test]
     fn app_cursor_mode_tracks_decset() {
-        use alacritty_terminal::term::{Config, Term, TermMode};
-
-        let (writer, _buf) = dummy_writer();
-        let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
-        let proxy = EventProxy { writer, winsize };
-        let size = GridSize {
-            cols: 80,
-            lines: 24,
-        };
-        let mut term = Term::new(Config::default(), &size, proxy);
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(80, 24, 9, 18, Path::new("."), Some(&command));
         let mut processor: Processor = Processor::new();
 
-        processor.advance(&mut term, b"\x1b[?1h");
-        assert!(term.mode().contains(TermMode::APP_CURSOR));
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"\x1b[?1h");
+        assert!(terminal.application_cursor_mode());
 
-        processor.advance(&mut term, b"\x1b[?1l");
-        assert!(!term.mode().contains(TermMode::APP_CURSOR));
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"\x1b[?1l");
+        assert!(!terminal.application_cursor_mode());
     }
 
     #[test]
