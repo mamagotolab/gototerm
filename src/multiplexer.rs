@@ -983,7 +983,7 @@ mod tests {
 
     #[test]
     fn switching_tabs_restores_each_workbench_visibility() {
-        let mut tabs = vec![Tab::new(()), Tab::new(())];
+        let mut tabs = [Tab::new(()), Tab::new(())];
         tabs[0].workbench_visible = true;
         assert!(tabs[0].workbench_visible);
         assert!(!tabs[1].workbench_visible);
