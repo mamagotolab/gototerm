@@ -11,11 +11,10 @@ use winit::{
 use crate::gt::GtMessage;
 use crate::input::{cursor_key_sequence, CursorKey};
 use crate::keybindings::{self, ShortcutAction};
-use crate::terminal::{CellSize, TerminalSize};
+use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
 use crate::vt::{GridSelection, ShellLocation, VtTerminal};
 use crate::Display;
-use alacritty_terminal::index::{Column, Line, Point, Side};
 use alacritty_terminal::selection::SelectionType;
 
 type CursorPosition = PhysicalPosition<f64>;
@@ -89,34 +88,6 @@ pub(crate) fn visible_selection(
             right: end_row * cols + end_col,
         })
     }
-}
-
-fn cursor_to_selection_point(
-    position: CursorPosition,
-    cell_size: CellSize,
-    rows: usize,
-    cols: usize,
-    display_offset: usize,
-) -> (Point, Side) {
-    let rows = rows.max(1);
-    let cols = cols.max(1);
-    let width = cell_size.w.max(1) as f64;
-    let height = cell_size.h.max(1) as f64;
-    let x_max = width * cols as f64;
-    let x = position.x.clamp(0.0, x_max - 0.1);
-    let screen_line = ((position.y / height).floor() as i32).clamp(0, rows as i32 - 1);
-    let cell_x = x / width;
-    let column = (cell_x.floor() as usize).min(cols - 1);
-    let side = if cell_x.fract() < 0.5 {
-        Side::Left
-    } else {
-        Side::Right
-    };
-
-    (
-        Point::new(Line(screen_line - display_offset as i32), Column(column)),
-        side,
-    )
 }
 
 fn selection_type_for_click(click_count: usize, block: bool) -> SelectionType {
@@ -474,16 +445,10 @@ impl TerminalWindow {
     }
 
     fn update_mouse_selection(&mut self) {
-        let (cols, rows) = self.terminal.size();
-        let display_offset = self.terminal.display_offset();
-        let (point, side) = cursor_to_selection_point(
-            self.mouse.cursor_pos,
-            self.view.cell_size(),
-            rows,
-            cols,
-            display_offset,
-        );
-        self.terminal.update_selection(point, side);
+        let CursorPosition { x, y } = self.mouse.cursor_pos;
+        let cell_size = self.view.cell_size();
+        self.terminal
+            .update_selection_at_pixel(x, y, cell_size.w, cell_size.h);
     }
 
     fn clear_mouse_selection(&mut self) {
@@ -797,18 +762,14 @@ impl TerminalWindow {
                             self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
                             // Ctrl を押しながらの開始は矩形選択。
                             let block = self.modifiers.control_key();
-                            let (cols, rows) = self.terminal.size();
-                            let (point, side) = cursor_to_selection_point(
-                                self.mouse.cursor_pos,
-                                self.view.cell_size(),
-                                rows,
-                                cols,
-                                self.terminal.display_offset(),
-                            );
-                            self.terminal.start_selection(
+                            let CursorPosition { x, y } = self.mouse.cursor_pos;
+                            let cell_size = self.view.cell_size();
+                            self.terminal.start_selection_at_pixel(
                                 selection_type_for_click(self.mouse.click_count, block),
-                                point,
-                                side,
+                                x,
+                                y,
+                                cell_size.w,
+                                cell_size.h,
                             );
                             // このドラッグはローカル選択。離すまで継続する。
                             self.mouse.selecting = true;
@@ -1215,13 +1176,12 @@ fn dedent_common_indent(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_to_selection_point, dedent_common_indent, resolve_existing_file_token,
-        resolve_path_token, selection_type_for_click, visible_selection, CursorPosition,
+        dedent_common_indent, resolve_existing_file_token, resolve_path_token,
+        selection_type_for_click, visible_selection,
     };
-    use crate::terminal::CellSize;
     use crate::view::Selection;
     use crate::vt::GridSelection;
-    use alacritty_terminal::index::{Column, Line, Point, Side};
+    use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::selection::SelectionType;
     use std::path::{Path, PathBuf};
 
@@ -1263,20 +1223,6 @@ mod tests {
                 left: 2,
                 right: 7,
             })
-        );
-    }
-
-    #[test]
-    fn cursor_position_maps_to_scrollback_cell_and_side() {
-        assert_eq!(
-            cursor_to_selection_point(
-                CursorPosition::new(25.0, 45.0),
-                CellSize { w: 10, h: 20 },
-                4,
-                10,
-                3,
-            ),
-            (Point::new(Line(-1), Column(2)), Side::Right)
         );
     }
 

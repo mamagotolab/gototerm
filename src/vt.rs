@@ -48,17 +48,63 @@ struct ExpandedSelection {
     forward: Option<bool>,
 }
 
+fn selection_point_is_valid<T>(term: &Term<T>, point: Point) -> bool {
+    point.line >= term.topmost_line()
+        && point.line <= term.bottommost_line()
+        && point.column.0 < term.columns()
+}
+
+fn pixel_selection_point<T>(
+    term: &Term<T>,
+    x: f64,
+    y: f64,
+    cell_width: u32,
+    cell_height: u32,
+) -> Option<(Point, Side)> {
+    if !x.is_finite() || !y.is_finite() {
+        return None;
+    }
+
+    let rows = term.screen_lines();
+    let columns = term.columns();
+    if rows == 0 || columns == 0 {
+        return None;
+    }
+
+    let width = cell_width.max(1) as f64;
+    let height = cell_height.max(1) as f64;
+    let x = x.clamp(0.0, width * columns as f64 - 0.1);
+    let screen_line = (y / height).floor().clamp(0.0, (rows - 1) as f64) as usize;
+    let cell_x = x / width;
+    let column = (cell_x.floor() as usize).min(columns - 1);
+    let side = if cell_x.fract() < 0.5 {
+        Side::Left
+    } else {
+        Side::Right
+    };
+    let line = i32::try_from(screen_line)
+        .ok()?
+        .checked_sub(i32::try_from(term.grid().display_offset()).ok()?)?;
+    let point = Point::new(Line(line), Column(column));
+
+    selection_point_is_valid(term, point).then_some((point, side))
+}
+
 fn physical_selection_bounds<T>(
     term: &Term<T>,
     selection_type: SelectionType,
     point: Point,
-) -> (Point, Point) {
+) -> Option<(Point, Point)> {
+    if !selection_point_is_valid(term, point) {
+        return None;
+    }
+
     let last_column = term.last_column();
     if selection_type == SelectionType::Lines {
-        return (
+        return Some((
             Point::new(point.line, Column(0)),
             Point::new(point.line, last_column),
-        );
+        ));
     }
 
     let row = &term.grid()[point.line];
@@ -67,7 +113,7 @@ fn physical_selection_bounds<T>(
         ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
     };
     if delimiter(point.column) {
-        return (point, point);
+        return Some((point, point));
     }
 
     let mut left = point.column;
@@ -80,7 +126,111 @@ fn physical_selection_bounds<T>(
         right += 1;
     }
 
-    (Point::new(point.line, left), Point::new(point.line, right))
+    Some((Point::new(point.line, left), Point::new(point.line, right)))
+}
+
+fn start_selection_locked<T>(
+    term: &mut Term<T>,
+    drag: &mut Option<ExpandedSelection>,
+    selection_type: SelectionType,
+    point: Point,
+    side: Side,
+) -> bool {
+    if !selection_point_is_valid(term, point) {
+        term.selection = None;
+        *drag = None;
+        return false;
+    }
+
+    if matches!(
+        selection_type,
+        SelectionType::Semantic | SelectionType::Lines
+    ) {
+        let Some((start, end)) = physical_selection_bounds(term, selection_type, point) else {
+            term.selection = None;
+            *drag = None;
+            return false;
+        };
+        let mut selection = AlacSelection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        term.selection = Some(selection);
+        *drag = Some(ExpandedSelection {
+            selection_type,
+            anchor_left: start.column,
+            anchor_right: end.column,
+            forward: None,
+        });
+    } else {
+        term.selection = Some(AlacSelection::new(selection_type, point, side));
+        *drag = None;
+    }
+
+    true
+}
+
+fn update_selection_locked<T>(
+    term: &mut Term<T>,
+    drag: &mut Option<ExpandedSelection>,
+    point: Point,
+    side: Side,
+) -> bool {
+    if !selection_point_is_valid(term, point) {
+        *drag = None;
+        return false;
+    }
+
+    let Some(mut expanded) = *drag else {
+        if let Some(selection) = term.selection.as_mut() {
+            selection.update(point, side);
+            return true;
+        }
+        return false;
+    };
+    let Some(range) = term
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.to_range(term))
+    else {
+        *drag = None;
+        return false;
+    };
+
+    let anchor_line = match expanded.forward {
+        Some(false) => range.end.line,
+        Some(true) | None => range.start.line,
+    };
+    let Some((current_start, current_end)) =
+        physical_selection_bounds(term, expanded.selection_type, point)
+    else {
+        *drag = None;
+        return false;
+    };
+    let forward = current_start.line > anchor_line
+        || (current_start.line == anchor_line && current_start.column >= expanded.anchor_left);
+
+    let mut selection = if forward {
+        AlacSelection::new(
+            SelectionType::Simple,
+            Point::new(anchor_line, expanded.anchor_left),
+            Side::Left,
+        )
+    } else {
+        AlacSelection::new(
+            SelectionType::Simple,
+            Point::new(anchor_line, expanded.anchor_right),
+            Side::Right,
+        )
+    };
+    if forward {
+        selection.update(current_end, Side::Right);
+    } else {
+        selection.update(current_start, Side::Left);
+    }
+    term.selection = Some(selection);
+    expanded.forward = Some(forward);
+    *drag = Some(expanded);
+
+    true
 }
 
 fn selection_text_from_term<T>(term: &Term<T>, selection: GridSelection) -> String {
@@ -967,78 +1117,61 @@ impl VtTerminal {
         self.term.lock().unwrap().grid().display_offset()
     }
 
-    pub(crate) fn start_selection(&self, selection_type: SelectionType, point: Point, side: Side) {
+    #[cfg(test)]
+    pub(crate) fn start_selection(
+        &self,
+        selection_type: SelectionType,
+        point: Point,
+        side: Side,
+    ) -> bool {
         let mut term = self.term.lock().unwrap();
         let mut drag = self.selection_drag.lock().unwrap();
-
-        if matches!(
-            selection_type,
-            SelectionType::Semantic | SelectionType::Lines
-        ) {
-            let (start, end) = physical_selection_bounds(&term, selection_type, point);
-            let mut selection = AlacSelection::new(SelectionType::Simple, start, Side::Left);
-            selection.update(end, Side::Right);
-            term.selection = Some(selection);
-            *drag = Some(ExpandedSelection {
-                selection_type,
-                anchor_left: start.column,
-                anchor_right: end.column,
-                forward: None,
-            });
-        } else {
-            term.selection = Some(AlacSelection::new(selection_type, point, side));
-            *drag = None;
-        }
+        start_selection_locked(&mut term, &mut drag, selection_type, point, side)
     }
 
-    pub(crate) fn update_selection(&self, point: Point, side: Side) {
+    pub(crate) fn start_selection_at_pixel(
+        &self,
+        selection_type: SelectionType,
+        x: f64,
+        y: f64,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> bool {
         let mut term = self.term.lock().unwrap();
         let mut drag = self.selection_drag.lock().unwrap();
-        let Some(mut expanded) = *drag else {
-            if let Some(selection) = term.selection.as_mut() {
-                selection.update(point, side);
-            }
-            return;
+        let Some((point, side)) = pixel_selection_point(&term, x, y, cell_width, cell_height)
+        else {
+            term.selection = None;
+            *drag = None;
+            return false;
         };
-        let Some(range) = term
-            .selection
-            .as_ref()
-            .and_then(|selection| selection.to_range(&term))
+
+        start_selection_locked(&mut term, &mut drag, selection_type, point, side)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn update_selection(&self, point: Point, side: Side) -> bool {
+        let mut term = self.term.lock().unwrap();
+        let mut drag = self.selection_drag.lock().unwrap();
+        update_selection_locked(&mut term, &mut drag, point, side)
+    }
+
+    pub(crate) fn update_selection_at_pixel(
+        &self,
+        x: f64,
+        y: f64,
+        cell_width: u32,
+        cell_height: u32,
+    ) -> bool {
+        let mut term = self.term.lock().unwrap();
+        let mut drag = self.selection_drag.lock().unwrap();
+        let Some((point, side)) = pixel_selection_point(&term, x, y, cell_width, cell_height)
         else {
             *drag = None;
-            return;
+            return false;
         };
 
-        let anchor_line = match expanded.forward {
-            Some(false) => range.end.line,
-            Some(true) | None => range.start.line,
-        };
-        let (current_start, current_end) =
-            physical_selection_bounds(&term, expanded.selection_type, point);
-        let forward = current_start.line > anchor_line
-            || (current_start.line == anchor_line && current_start.column >= expanded.anchor_left);
-
-        let mut selection = if forward {
-            AlacSelection::new(
-                SelectionType::Simple,
-                Point::new(anchor_line, expanded.anchor_left),
-                Side::Left,
-            )
-        } else {
-            AlacSelection::new(
-                SelectionType::Simple,
-                Point::new(anchor_line, expanded.anchor_right),
-                Side::Right,
-            )
-        };
-        if forward {
-            selection.update(current_end, Side::Right);
-        } else {
-            selection.update(current_start, Side::Left);
-        }
-        term.selection = Some(selection);
-        expanded.forward = Some(forward);
-        *drag = Some(expanded);
+        update_selection_locked(&mut term, &mut drag, point, side)
     }
 
     pub(crate) fn grid_selection(&self) -> Option<GridSelection> {
@@ -1502,6 +1635,118 @@ mod tests {
         terminal.clear_history();
 
         assert!(terminal.term.lock().unwrap().selection.is_none());
+    }
+
+    #[test]
+    fn stale_semantic_start_after_history_clear_is_ignored() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("word{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+        terminal.clear_history();
+
+        terminal.start_selection(
+            SelectionType::Semantic,
+            Point::new(Line(-1), Column(2)),
+            Side::Left,
+        );
+
+        assert!(terminal.term.lock().unwrap().selection.is_none());
+        assert!(terminal.selection_drag.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_line_start_after_history_clear_is_ignored() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("word{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+        terminal.clear_history();
+
+        terminal.start_selection(
+            SelectionType::Lines,
+            Point::new(Line(-1), Column(2)),
+            Side::Left,
+        );
+
+        assert!(terminal.term.lock().unwrap().selection.is_none());
+        assert!(terminal.selection_drag.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_semantic_update_after_history_clear_is_ignored() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        terminal.clear_history();
+        let anchor = Point::new(Line(0), Column(2));
+        terminal.start_selection(SelectionType::Semantic, anchor, Side::Left);
+        let before = terminal.grid_selection();
+
+        terminal.update_selection(Point::new(Line(-1), Column(2)), Side::Right);
+
+        assert_eq!(terminal.grid_selection(), before);
+        assert!(terminal.selection_drag.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn stale_line_update_after_history_clear_is_ignored() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        terminal.clear_history();
+        let anchor = Point::new(Line(0), Column(2));
+        terminal.start_selection(SelectionType::Lines, anchor, Side::Left);
+        let before = terminal.grid_selection();
+
+        terminal.update_selection(Point::new(Line(-1), Column(2)), Side::Right);
+
+        assert_eq!(terminal.grid_selection(), before);
+        assert!(terminal.selection_drag.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn pixel_selection_resolves_against_the_current_grid_generation() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("word{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+        terminal.scroll(2);
+        terminal.clear_history();
+
+        assert!(terminal.start_selection_at_pixel(SelectionType::Semantic, 19.0, 1.0, 9, 18,));
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "word5");
+
+        assert!(terminal.update_selection_at_pixel(19.0, 19.0, 9, 18));
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "word5\nword6");
+    }
+
+    #[test]
+    fn pixel_selection_maps_to_scrollback_cell_and_side() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("word{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+        terminal.scroll(3);
+
+        assert_eq!(
+            pixel_selection_point(&terminal.term.lock().unwrap(), 25.0, 45.0, 10, 20),
+            Some((Point::new(Line(-1), Column(2)), Side::Right))
+        );
     }
 
     #[test]
