@@ -194,7 +194,8 @@ fn shell_open(target: &str) -> windows::core::Result<()> {
     if result.0 as isize > 32 {
         Ok(())
     } else {
-        Err(windows::core::Error::from_win32())
+        // from_thread は GetLastError を読む（旧 from_win32 の後継）。
+        Err(windows::core::Error::from_thread())
     }
 }
 
