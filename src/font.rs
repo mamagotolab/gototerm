@@ -15,12 +15,15 @@ thread_local! {
     static FT_LIBRARY: Library = freetype::Library::init().expect("FreeType init");
 }
 
-pub(crate) fn font_render_flags(is_windows: bool) -> LoadFlag {
-    if is_windows {
-        LoadFlag::RENDER
-    } else {
-        LoadFlag::RENDER | LoadFlag::TARGET_LIGHT
-    }
+/// グリフのラスタライズ方法。全プラットフォームでライトヒンティングを使う。
+///
+/// 一度 Windows だけフルヒンティング（TARGET_LIGHT なし）にしたが、実機で
+/// PowerLine の区切り記号の継ぎ目が汚くなった。フルヒンティングは輪郭を
+/// ピクセル格子に横方向まで吸着させるため、タイル状に連結する前提の記号では
+/// 隣のセルとの境界がズレる。ライトヒンティングは縦方向だけ吸着させるので
+/// 送り幅が保たれ、記号が隙間なく繋がる。
+fn glyph_load_flags() -> LoadFlag {
+    LoadFlag::RENDER | LoadFlag::TARGET_LIGHT
 }
 
 pub struct Font {
@@ -60,7 +63,7 @@ impl Font {
 
     fn render(&self, ch: char) -> Option<(RawImage2d<'_, u8>, GlyphMetrics)> {
         if let idx @ 1.. = self.face.get_char_index(ch as usize) {
-            let flags = font_render_flags(cfg!(windows));
+            let flags = glyph_load_flags();
             self.face.load_glyph(idx, flags).expect("render");
             let glyph = self.face.glyph();
 
@@ -148,10 +151,12 @@ impl FontSet {
 mod tests {
     use super::*;
 
+    // PowerLine の記号が隣のセルと隙間なく繋がるかは送り幅が保たれるかで決まる。
+    // ライトヒンティングを外すと実機で継ぎ目が崩れたので、外れていないことを見る。
     #[test]
-    fn windows_uses_standard_hinting_and_unix_keeps_light_hinting() {
-        assert!(!font_render_flags(true).contains(LoadFlag::TARGET_LIGHT));
-        assert!(font_render_flags(false).contains(LoadFlag::TARGET_LIGHT));
+    fn glyphs_keep_light_hinting_on_every_platform() {
+        assert!(glyph_load_flags().contains(LoadFlag::TARGET_LIGHT));
+        assert!(glyph_load_flags().contains(LoadFlag::RENDER));
     }
 
     // ディスク上の実フォントを FreeType にストリームさせても（from_file）、
