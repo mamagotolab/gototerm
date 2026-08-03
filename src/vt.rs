@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Rgb;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -27,6 +28,15 @@ pub type SharedWriter = Arc<Mutex<Box<dyn std::io::Write + Send>>>;
 pub enum ShellLocation {
     Local(PathBuf),
     Remote { host: String, path: PathBuf },
+}
+
+/// Scrollback-grid selection endpoints. Lines are absolute grid coordinates:
+/// history is negative and the live screen starts at line zero.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct GridSelection {
+    pub(crate) start: Point,
+    pub(crate) end: Point,
+    pub(crate) block: bool,
 }
 
 /// alacritty の Term が応答シーケンスを送るときに呼ばれるリスナー。
@@ -863,6 +873,37 @@ impl VtTerminal {
         self.term.lock().unwrap().grid().display_offset()
     }
 
+    /// Copy the logical grid range without consulting the current viewport.
+    pub(crate) fn selection_text(&self, selection: GridSelection) -> String {
+        let term = self.term.lock().unwrap();
+
+        if selection.block {
+            let top = selection.start.line.0.min(selection.end.line.0);
+            let bottom = selection.start.line.0.max(selection.end.line.0);
+            let left = selection.start.column.0.min(selection.end.column.0);
+            let right = selection.start.column.0.max(selection.end.column.0);
+
+            (top..=bottom)
+                .map(|line| {
+                    term.bounds_to_string(
+                        Point::new(Line(line), Column(left)),
+                        Point::new(Line(line), Column(right)),
+                    )
+                    .trim_end_matches([' ', '\t'])
+                    .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        } else {
+            let (start, end) = if selection.start <= selection.end {
+                (selection.start, selection.end)
+            } else {
+                (selection.end, selection.start)
+            };
+            term.bounds_to_string(start, end)
+        }
+    }
+
     /// スクロールバックを最下部（現在）に戻す。キー入力時に呼ぶ。
     pub fn scroll_to_bottom(&self) {
         use alacritty_terminal::grid::Scroll;
@@ -1134,6 +1175,7 @@ fn pty_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> PtySize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::index::{Column, Line};
     use std::path::Path;
 
     /// 共有 Vec に書き出すテスト用 Writer。
@@ -1165,6 +1207,51 @@ mod tests {
 
         processor.advance(&mut *terminal.term.lock().unwrap(), b"\x1b[?1l");
         assert!(!terminal.application_cursor_mode());
+    }
+
+    #[test]
+    fn selection_text_does_not_depend_on_display_offset() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("L{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        let selection = GridSelection {
+            start: Point::new(Line(0), Column(0)),
+            end: Point::new(Line(0), Column(1)),
+            block: false,
+        };
+        let before = terminal.selection_text(selection);
+        assert_eq!(before, "L5");
+
+        terminal.scroll(3);
+        let after = terminal.selection_text(selection);
+        assert_eq!(after, before);
+    }
+
+    #[test]
+    fn block_selection_text_keeps_columns_per_line() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("R{line}abcd\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        let selection = GridSelection {
+            start: Point::new(Line(1), Column(4)),
+            end: Point::new(Line(0), Column(2)),
+            block: true,
+        };
+        assert_eq!(terminal.selection_text(selection), "abc\nabc");
     }
 
     #[test]

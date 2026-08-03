@@ -11,12 +11,194 @@ use winit::{
 use crate::gt::GtMessage;
 use crate::input::{cursor_key_sequence, CursorKey};
 use crate::keybindings::{self, ShortcutAction};
-use crate::terminal::TerminalSize;
+use crate::terminal::{CellSize, TerminalSize};
 use crate::view::{Selection, TerminalView, Viewport};
-use crate::vt::{ShellLocation, VtTerminal};
+use crate::vt::{GridSelection, ShellLocation, VtTerminal};
 use crate::Display;
+use alacritty_terminal::index::{Column, Line, Point};
 
 type CursorPosition = PhysicalPosition<f64>;
+
+pub(crate) fn visible_selection(
+    selection: GridSelection,
+    display_offset: usize,
+    rows: usize,
+    cols: usize,
+) -> Option<Selection> {
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+
+    let viewport_top = -(display_offset as i32);
+    let viewport_bottom = viewport_top + rows as i32 - 1;
+
+    if selection.block {
+        let top = selection.start.line.0.min(selection.end.line.0);
+        let bottom = selection.start.line.0.max(selection.end.line.0);
+        if bottom < viewport_top || top > viewport_bottom {
+            return None;
+        }
+
+        let left = selection.start.column.0.min(selection.end.column.0);
+        let right = selection
+            .start
+            .column
+            .0
+            .max(selection.end.column.0)
+            .min(cols - 1);
+        if left >= cols {
+            return None;
+        }
+
+        Some(Selection::Block {
+            top: (top.max(viewport_top) - viewport_top) as usize,
+            bottom: (bottom.min(viewport_bottom) - viewport_top) as usize,
+            left,
+            right,
+        })
+    } else {
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        if end.line.0 < viewport_top || start.line.0 > viewport_bottom {
+            return None;
+        }
+
+        let (start_row, start_col) = if start.line.0 < viewport_top {
+            (0, 0)
+        } else {
+            (
+                (start.line.0 - viewport_top) as usize,
+                start.column.0.min(cols - 1),
+            )
+        };
+        let (end_row, end_col) = if end.line.0 > viewport_bottom {
+            (rows - 1, cols - 1)
+        } else {
+            (
+                (end.line.0 - viewport_top) as usize,
+                end.column.0.min(cols - 1),
+            )
+        };
+
+        Some(Selection::Linear {
+            left: start_row * cols + start_col,
+            right: end_row * cols + end_col,
+        })
+    }
+}
+
+fn cursor_to_grid_point(
+    position: CursorPosition,
+    cell_size: CellSize,
+    rows: usize,
+    cols: usize,
+    display_offset: usize,
+) -> Point {
+    let rows = rows.max(1);
+    let cols = cols.max(1);
+    let width = cell_size.w.max(1) as f64;
+    let height = cell_size.h.max(1) as f64;
+    let x_max = width * cols as f64;
+    let x = position.x.clamp(0.0, x_max - 0.1);
+    let screen_line = ((position.y / height).floor() as i32).clamp(0, rows as i32 - 1);
+    let column = ((x / width).round() as usize).min(cols);
+
+    Point::new(Line(screen_line - display_offset as i32), Column(column))
+}
+
+fn selection_from_grid_points(
+    start: Point,
+    end: Point,
+    block: bool,
+    click_count: usize,
+    lines: &[crate::terminal::Line],
+    display_offset: usize,
+    cols: usize,
+) -> Option<GridSelection> {
+    if cols == 0 {
+        return None;
+    }
+
+    if block {
+        let top = start.line.0.min(end.line.0);
+        let bottom = start.line.0.max(end.line.0);
+        let left = start.column.0.min(end.column.0);
+        let right = start
+            .column
+            .0
+            .max(end.column.0)
+            .saturating_sub(1)
+            .min(cols - 1);
+        return (left <= right).then_some(GridSelection {
+            start: Point::new(Line(top), Column(left)),
+            end: Point::new(Line(bottom), Column(right)),
+            block: true,
+        });
+    }
+
+    let (mut start, mut end) = if start <= end {
+        (start, end)
+    } else {
+        (end, start)
+    };
+    start.column.0 = start.column.0.min(cols - 1);
+    end.column.0 = end.column.0.saturating_sub(1).min(cols - 1);
+
+    match click_count {
+        1 => {}
+        2 => {
+            fn delimiter(ch: char) -> bool {
+                ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
+            }
+
+            let start_row = start.line.0 + display_offset as i32;
+            if let Some(line) = usize::try_from(start_row)
+                .ok()
+                .and_then(|row| lines.get(row))
+            {
+                while start.column.0 > 0 {
+                    let prev = line.get(start.column.0 - 1).map(|cell| cell.ch);
+                    let current = line.get(start.column.0).map(|cell| cell.ch);
+                    if prev
+                        .zip(current)
+                        .is_none_or(|(a, b)| delimiter(a) || delimiter(b))
+                    {
+                        break;
+                    }
+                    start.column.0 -= 1;
+                }
+            }
+
+            let end_row = end.line.0 + display_offset as i32;
+            if let Some(line) = usize::try_from(end_row).ok().and_then(|row| lines.get(row)) {
+                while end.column.0 < cols - 1 {
+                    let current = line.get(end.column.0).map(|cell| cell.ch);
+                    let next = line.get(end.column.0 + 1).map(|cell| cell.ch);
+                    if current
+                        .zip(next)
+                        .is_none_or(|(a, b)| delimiter(a) || delimiter(b))
+                    {
+                        break;
+                    }
+                    end.column.0 += 1;
+                }
+            }
+        }
+        _ => {
+            start.column = Column(0);
+            end.column = Column(cols - 1);
+        }
+    }
+
+    (start <= end).then_some(GridSelection {
+        start,
+        end,
+        block: false,
+    })
+}
 
 /// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
 /// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
@@ -226,15 +408,15 @@ struct MouseState {
     wheel_delta_x: f32,
     wheel_delta_y: f32,
     cursor_pos: CursorPosition,
+    // Pixel location is kept only for distinguishing link clicks from drags.
     pressed_pos: Option<CursorPosition>,
-    released_pos: Option<CursorPosition>,
-    // 選択を絶対行に固定するため、押下/離した時点のスクロール量を覚えておく。
-    pressed_offset: i64,
-    released_offset: i64,
-    // 押下時に矩形選択(Alt)だったか。
+    // Logical selection lives in alacritty's absolute scrollback grid.
+    selection_start: Option<Point>,
+    selection: Option<GridSelection>,
+    // 押下時に矩形選択(Ctrl)だったか。
     block: bool,
     // 現在のドラッグがローカル選択か（押下時に確定）。途中で Shift を離しても
-    // ボタンを離すまでローカル選択を続け、released_pos を確実に立てるため。
+    // ボタンを離すまでローカル選択を続けるため。
     selecting: bool,
     click_count: usize,
     last_clicked: std::time::Instant,
@@ -285,9 +467,8 @@ impl TerminalWindow {
                 wheel_delta_y: 0.0,
                 cursor_pos: CursorPosition::default(),
                 pressed_pos: None,
-                released_pos: None,
-                pressed_offset: 0,
-                released_offset: 0,
+                selection_start: None,
+                selection: None,
                 block: false,
                 selecting: false,
                 click_count: 0,
@@ -331,7 +512,6 @@ impl TerminalWindow {
         }
 
         let (cols, rows) = self.terminal.size();
-        let terminal_size = TerminalSize { rows, cols };
 
         // 画面が変わったときだけ alacritty のグリッドを取り込んで描画を更新する。
         if self.terminal.take_dirty() {
@@ -358,131 +538,46 @@ impl TerminalWindow {
             });
         }
 
-        // Update text selection（スクロール追従＋矩形対応）
-        if let Some(CursorPosition { x: sx, y: sy }) = self.mouse.pressed_pos {
-            let CursorPosition { x: ex, y: ey } =
-                self.mouse.released_pos.unwrap_or(self.mouse.cursor_pos);
-
-            let lines = &self.view.lines;
-            let rows = terminal_size.rows;
-            let cols = terminal_size.cols;
-            let rows_i = rows as i64;
-
-            // 列はスクロールの影響を受けないのでピクセルから直接。
-            let x_max = cell_size.w as f64 * cols as f64;
-            let sx = sx.clamp(0.0, x_max - 0.1);
-            let ex = ex.clamp(0.0, x_max - 0.1);
-            let mut s_col = (sx / cell_size.w as f64).round() as usize;
-            let mut e_col = (ex / cell_size.w as f64).round() as usize;
-
-            // 行は「押下/離した時点のスクロール量」で絶対行に正規化し、現在の
-            // スクロール量で画面行へ戻す。これで選択が中身に貼り付き、スクロール
-            // しても付いていく（以前は画面位置に固定されていてズレた）。
-            let cur_off = self.terminal.display_offset() as i64;
-            let end_off = if self.mouse.released_pos.is_some() {
-                self.mouse.released_offset
-            } else {
-                cur_off
-            };
-            let s_row_cap = ((sy / cell_size.h as f64).floor() as i64).clamp(0, rows_i - 1);
-            let e_row_cap = ((ey / cell_size.h as f64).floor() as i64).clamp(0, rows_i - 1);
-            let s_row_now = s_row_cap - self.mouse.pressed_offset + cur_off;
-            let e_row_now = e_row_cap - end_off + cur_off;
-
-            let new_selection_range = if (s_row_now < 0 && e_row_now < 0)
-                || (s_row_now >= rows_i && e_row_now >= rows_i)
-            {
-                // スクロールで選択が完全に画面外へ出た → 何も塗らない。
-                None
-            } else {
-                let mut s_row = s_row_now.clamp(0, rows_i - 1) as usize;
-                let mut e_row = e_row_now.clamp(0, rows_i - 1) as usize;
-
-                if self.mouse.block {
-                    // 矩形選択：行範囲 × 列範囲（各軸 min/max の閉区間）。
-                    let top = s_row.min(e_row);
-                    let bottom = s_row.max(e_row);
-                    let left = s_col.min(e_col);
-                    let right = s_col.max(e_col).saturating_sub(1);
-                    if left <= right {
-                        Some(Selection::Block {
-                            top,
-                            bottom,
-                            left,
-                            right,
-                        })
-                    } else {
-                        None
-                    }
-                } else {
-                    if (e_row, e_col) < (s_row, s_col) {
-                        std::mem::swap(&mut s_row, &mut e_row);
-                        std::mem::swap(&mut s_col, &mut e_col);
-                    }
-
-                    // NOTE: selecton is closed range [s, e]
-                    e_col = e_col.saturating_sub(1);
-
-                    match self.mouse.click_count {
-                        // single click: character selection
-                        1 => {}
-
-                        // double click: word selection
-                        2 => {
-                            fn delimiter(ch: char) -> bool {
-                                ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
-                            }
-                            fn on_different_word(a: char, b: char) -> bool {
-                                delimiter(a) || delimiter(b)
-                            }
-
-                            while 0 < s_col && s_col < cols {
-                                let prev = lines[s_row].get(s_col - 1).unwrap().ch;
-                                let curr = lines[s_row].get(s_col).unwrap().ch;
-                                if on_different_word(prev, curr) {
-                                    break;
-                                }
-                                s_col -= 1;
-                            }
-                            while e_col < cols - 1 {
-                                let prev = lines[e_row].get(e_col).unwrap().ch;
-                                let curr = lines[e_row].get(e_col + 1).unwrap().ch;
-                                if on_different_word(prev, curr) {
-                                    break;
-                                }
-                                e_col += 1;
-                            }
-                        }
-
-                        // triple click (or more): line selection
-                        _ => {
-                            s_col = 0;
-                            e_col = cols - 1;
-                        }
-                    }
-
-                    let l = s_row * cols + s_col;
-                    let r = e_row * cols + e_col;
-                    if l <= r {
-                        Some(Selection::Linear { left: l, right: r })
-                    } else {
-                        None
-                    }
-                }
-            };
-
-            if self.view.selection_range != new_selection_range {
-                self.view.update_contents(|view| {
-                    view.selection_range = new_selection_range;
-                });
-            }
-        } else if self.view.selection_range.is_some() {
+        let new_selection_range = self.mouse.selection.and_then(|selection| {
+            visible_selection(selection, self.terminal.display_offset(), rows, cols)
+        });
+        if self.view.selection_range != new_selection_range {
             self.view.update_contents(|view| {
-                view.selection_range = None;
+                view.selection_range = new_selection_range;
             });
         }
 
         false
+    }
+
+    fn update_mouse_selection(&mut self) {
+        let Some(start) = self.mouse.selection_start else {
+            return;
+        };
+        let (cols, rows) = self.terminal.size();
+        let display_offset = self.terminal.display_offset();
+        let end = cursor_to_grid_point(
+            self.mouse.cursor_pos,
+            self.view.cell_size(),
+            rows,
+            cols,
+            display_offset,
+        );
+        self.mouse.selection = selection_from_grid_points(
+            start,
+            end,
+            self.mouse.block,
+            self.mouse.click_count,
+            &self.view.lines,
+            display_offset,
+            cols,
+        );
+    }
+
+    fn clear_mouse_selection(&mut self) {
+        self.mouse.pressed_pos = None;
+        self.mouse.selection_start = None;
+        self.mouse.selection = None;
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
@@ -602,8 +697,7 @@ impl TerminalWindow {
     }
 
     fn resize_buffer(&mut self) {
-        self.mouse.pressed_pos = None;
-        self.mouse.released_pos = None;
+        self.clear_mouse_selection();
 
         let viewport = self.view.viewport();
 
@@ -696,6 +790,9 @@ impl TerminalWindow {
                 let x = position.x - viewport.x as f64;
                 let y = position.y - viewport.y as f64;
                 self.mouse.cursor_pos = CursorPosition { x, y };
+                if self.mouse.selecting {
+                    self.update_mouse_selection();
+                }
 
                 // リンクの上ではポインタ（手）カーソルにして「クリックできる」と
                 // 分かるようにする。URL は常に、ファイルパスは Ctrl 押下時のみ。
@@ -724,8 +821,7 @@ impl TerminalWindow {
                 };
 
                 if !is_inner {
-                    self.mouse.pressed_pos = None;
-                    self.mouse.released_pos = None;
+                    self.clear_mouse_selection();
                     self.mouse.selecting = false;
                     return;
                 }
@@ -735,8 +831,7 @@ impl TerminalWindow {
                 // Shift+ドラッグで画面の文字を選択 → Ctrl+Shift+C でコピーできる。
                 // Released は「ドラッグ開始時にローカル選択だったか(selecting)」も見る。
                 // 途中で Shift を離してもボタンを離すまでローカル選択を続け、
-                // released_pos を必ず立てる（立たないと離した後も選択がマウスに
-                // 追従して固定できない）。
+                // 選択範囲を固定する。
                 let report_to_app = self.terminal.mouse_mode() && !self.modifiers.shift_key();
                 let report = match state {
                     ElementState::Pressed => report_to_app,
@@ -789,19 +884,23 @@ impl TerminalWindow {
                             log::debug!("clicked {} times", self.mouse.click_count);
 
                             self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
-                            self.mouse.released_pos = None;
-                            // 選択をスクロールに追従させるため押下時のスクロール量を記録。
-                            self.mouse.pressed_offset = self.terminal.display_offset() as i64;
-                            self.mouse.released_offset = self.mouse.pressed_offset;
                             // Ctrl を押しながらの開始は矩形選択。
                             self.mouse.block = self.modifiers.control_key();
+                            let (cols, rows) = self.terminal.size();
+                            self.mouse.selection_start = Some(cursor_to_grid_point(
+                                self.mouse.cursor_pos,
+                                self.view.cell_size(),
+                                rows,
+                                cols,
+                                self.terminal.display_offset(),
+                            ));
                             // このドラッグはローカル選択。離すまで継続する。
                             self.mouse.selecting = true;
+                            self.update_mouse_selection();
                         }
                         ElementState::Released => {
+                            self.update_mouse_selection();
                             self.mouse.selecting = false;
-                            self.mouse.released_pos = Some(self.mouse.cursor_pos);
-                            self.mouse.released_offset = self.terminal.display_offset() as i64;
 
                             // ドラッグ（選択）でない単純な左クリック。URL は素のクリックで
                             // 開き、ファイルは Ctrl+クリックのときだけ開く（handle_link_click
@@ -920,6 +1019,9 @@ impl TerminalWindow {
                         self.terminal.write(hk);
                     }
                 }
+                if self.mouse.selecting {
+                    self.update_mouse_selection();
+                }
             }
 
             _ => {}
@@ -1012,8 +1114,7 @@ impl TerminalWindow {
         } else {
             match (ctrl, shift, keycode) {
                 (false, _, KeyCode::Escape) => {
-                    self.mouse.pressed_pos = None;
-                    self.mouse.released_pos = None;
+                    self.clear_mouse_selection();
                     self.terminal.write(b"\x1B");
                 }
 
@@ -1090,8 +1191,7 @@ impl TerminalWindow {
                 view.selection_range = None;
             });
 
-            self.mouse.pressed_pos = None;
-            self.mouse.released_pos = None;
+            self.clear_mouse_selection();
 
             // 実際の入力をしたらスクロールバックを最下部に戻す
             // （履歴を見たまま打って迷子になるのを防ぐ）。コピー等の
@@ -1103,65 +1203,10 @@ impl TerminalWindow {
     fn copy_clipboard(&mut self) {
         let mut text = String::new();
 
-        match self.view.selection_range {
-            None => {}
-
-            // 通常選択：行方向の連続範囲。
-            Some(Selection::Linear { left, right }) => {
-                'row: for (i, row) in self.view.lines.iter().enumerate() {
-                    let cols = row.columns();
-                    for (j, cell) in row.iter().enumerate() {
-                        if cell.width == 0 {
-                            continue;
-                        }
-                        let offset = i * cols + j;
-                        let center = offset + (cell.width / 2) as usize;
-                        if left <= center && center <= right {
-                            text.push(cell.ch);
-                        }
-                        if cell.ch == '\n' {
-                            continue 'row;
-                        }
-                    }
-                    if !row.linewrap() {
-                        let offset = (i + 1) * cols;
-                        if left < offset && offset <= right {
-                            // 行末の余分な空白は貼り付け先で邪魔になるので落とす。
-                            let n = text.trim_end_matches([' ', '\t']).len();
-                            text.truncate(n);
-                            text.push('\n');
-                        }
-                    }
-                }
+        if let Some(selection) = self.mouse.selection {
+            text = self.terminal.selection_text(selection);
+            if !selection.block {
                 text = dedent_common_indent(&text);
-            }
-
-            // 矩形選択：各行の列範囲 [left, right] を取り、行間に改行を入れる。
-            Some(Selection::Block {
-                top,
-                bottom,
-                left,
-                right,
-            }) => {
-                for (i, row) in self.view.lines.iter().enumerate() {
-                    if i < top || i > bottom {
-                        continue;
-                    }
-                    let mut line = String::new();
-                    for (j, cell) in row.iter().enumerate() {
-                        if cell.width == 0 {
-                            continue;
-                        }
-                        if left <= j && j <= right {
-                            line.push(cell.ch);
-                        }
-                    }
-                    // 矩形の右側にできる余分な空白を行ごとに落とす。
-                    text.push_str(line.trim_end_matches([' ', '\t']));
-                    if i != bottom {
-                        text.push('\n');
-                    }
-                }
             }
         }
 
@@ -1253,8 +1298,91 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedent_common_indent, resolve_existing_file_token, resolve_path_token};
+    use super::{
+        cursor_to_grid_point, dedent_common_indent, resolve_existing_file_token,
+        resolve_path_token, selection_from_grid_points, visible_selection, CursorPosition,
+    };
+    use crate::terminal::CellSize;
+    use crate::view::Selection;
+    use crate::vt::GridSelection;
+    use alacritty_terminal::index::{Column, Line, Point};
     use std::path::{Path, PathBuf};
+
+    fn linear_grid_selection(start: (i32, usize), end: (i32, usize)) -> GridSelection {
+        GridSelection {
+            start: Point::new(Line(start.0), Column(start.1)),
+            end: Point::new(Line(end.0), Column(end.1)),
+            block: false,
+        }
+    }
+
+    #[test]
+    fn selection_fully_above_viewport_is_not_painted() {
+        let selection = linear_grid_selection((-8, 1), (-6, 4));
+        assert_eq!(visible_selection(selection, 3, 4, 10), None);
+    }
+
+    #[test]
+    fn selection_crossing_viewport_is_clipped_to_visible_rows() {
+        let selection = linear_grid_selection((-5, 2), (1, 4));
+        assert_eq!(
+            visible_selection(selection, 3, 4, 10),
+            Some(Selection::Linear { left: 0, right: 39 })
+        );
+    }
+
+    #[test]
+    fn block_selection_clips_rows_without_linearizing_columns() {
+        let selection = GridSelection {
+            start: Point::new(Line(-5), Column(7)),
+            end: Point::new(Line(-1), Column(2)),
+            block: true,
+        };
+        assert_eq!(
+            visible_selection(selection, 3, 4, 10),
+            Some(Selection::Block {
+                top: 0,
+                bottom: 2,
+                left: 2,
+                right: 7,
+            })
+        );
+    }
+
+    #[test]
+    fn cursor_position_maps_to_scrollback_grid_line() {
+        assert_eq!(
+            cursor_to_grid_point(
+                CursorPosition::new(25.0, 45.0),
+                CellSize { w: 10, h: 20 },
+                4,
+                10,
+                3,
+            ),
+            Point::new(Line(-1), Column(3))
+        );
+    }
+
+    #[test]
+    fn drag_selection_keeps_absolute_grid_endpoints() {
+        let selection = selection_from_grid_points(
+            Point::new(Line(-2), Column(2)),
+            Point::new(Line(0), Column(5)),
+            false,
+            1,
+            &[],
+            3,
+            10,
+        );
+        assert_eq!(
+            selection,
+            Some(GridSelection {
+                start: Point::new(Line(-2), Column(2)),
+                end: Point::new(Line(0), Column(4)),
+                block: false,
+            })
+        );
+    }
 
     #[test]
     fn dedent_common_indent_removes_shared_prefix() {
