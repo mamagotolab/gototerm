@@ -78,6 +78,20 @@ enum Node {
     Empty,
 }
 
+struct Tab<T = Node> {
+    root: T,
+    workbench_visible: bool,
+}
+
+impl<T> Tab<T> {
+    fn new(root: T) -> Self {
+        Self {
+            root,
+            workbench_visible: false,
+        }
+    }
+}
+
 struct SplitNode {
     partition: Partition,
     ratio: f64,
@@ -530,6 +544,24 @@ mod tests {
     use super::*;
 
     #[test]
+    fn switching_tabs_restores_each_workbench_visibility() {
+        let mut tabs = vec![Tab::new(()), Tab::new(())];
+        tabs[0].workbench_visible = true;
+        assert!(tabs[0].workbench_visible);
+        assert!(!tabs[1].workbench_visible);
+    }
+
+    #[test]
+    fn removing_a_tab_keeps_visibility_attached_to_the_remaining_tab() {
+        let mut tabs = vec![Tab::new(()), Tab::new(()), Tab::new(())];
+        tabs[0].workbench_visible = true;
+        tabs[2].workbench_visible = true;
+        tabs.remove(1);
+        assert!(tabs[0].workbench_visible);
+        assert!(tabs[1].workbench_visible);
+    }
+
+    #[test]
     fn sh_quote_wraps_and_escapes_single_quotes() {
         assert_eq!(sh_quote("codex"), "'codex'");
         assert_eq!(sh_quote("a'b"), "'a'\\''b'");
@@ -822,7 +854,7 @@ pub struct Multiplexer {
     editor_focused: bool,
     reader_focused: bool,
     gt_file_assembler: GtFileAssembler,
-    tabs: Vec<Node>,
+    tabs: Vec<Tab>,
     focus: usize,
     modifiers: ModifiersState,
     cursor_pos: PhysicalPosition<f64>,
@@ -894,7 +926,7 @@ impl Multiplexer {
             editor_focused: false,
             reader_focused: false,
             gt_file_assembler: GtFileAssembler::default(),
-            tabs: vec![first],
+            tabs: vec![Tab::new(first)],
             focus: 0,
             modifiers: ModifiersState::empty(),
             cursor_pos: PhysicalPosition::default(),
@@ -921,11 +953,34 @@ impl Multiplexer {
     }
 
     fn focused_root(&mut self) -> &mut Node {
-        &mut self.tabs[self.focus]
+        &mut self.tabs[self.focus].root
     }
 
     fn focused_location(&mut self) -> ShellLocation {
         self.focused_root().focused_leaf_mut().pane_location()
+    }
+
+    fn apply_focused_tab_workbench(&mut self) {
+        let visible = self.tabs[self.focus].workbench_visible;
+        let location = self.focused_location();
+        self.sidebar.set_visible(&location, visible);
+
+        if self.sidebar_focused {
+            self.sidebar_focused = false;
+            self.sidebar.set_focused(false);
+        }
+        if self.editor_focused {
+            if let Some(editor) = self.preview_slot.editor_mut() {
+                editor.focus_changed(false);
+            }
+            self.editor_focused = false;
+        }
+        if self.reader_focused {
+            self.unfocus_reader();
+        }
+
+        self.refresh_layout();
+        self.focused_root().focused_leaf_mut().focus_changed(true);
     }
 
     /// フォーカスを矢印方向へ動かす。ワークベンチ表示中は3領域
@@ -933,7 +988,7 @@ impl Multiplexer {
     /// ターミナル領域内では従来どおり分割ツリーを辿り、端に達したら隣の領域へ。
     fn move_focus_workbench(&mut self, dir: Dir) {
         if !self.sidebar.is_visible() {
-            self.tabs[self.focus].move_focus(dir);
+            self.tabs[self.focus].root.move_focus(dir);
             return;
         }
         if self.sidebar_focused {
@@ -960,7 +1015,7 @@ impl Multiplexer {
             return;
         }
         // ターミナル領域。まず分割ツリー内で移動し、端に達したら隣の領域へ。
-        if self.tabs[self.focus].move_focus(dir) {
+        if self.tabs[self.focus].root.move_focus(dir) {
             return;
         }
         match dir {
@@ -993,7 +1048,7 @@ impl Multiplexer {
                 }
             }
             self.refresh_layout();
-        } else if self.tabs[self.focus].resize_focused(axis, delta) {
+        } else if self.tabs[self.focus].root.resize_focused(axis, delta) {
             self.refresh_layout();
         }
     }
@@ -1028,7 +1083,7 @@ impl Multiplexer {
         };
         self.status_view.set_viewport(bar);
 
-        let cvp = if self.sidebar.is_visible() {
+        let cvp = if self.tabs[self.focus].workbench_visible {
             let viewports = workbench_viewports(
                 self.content_viewport(),
                 self.sidebar_ratio,
@@ -1041,7 +1096,7 @@ impl Multiplexer {
             self.content_viewport()
         };
         for tab in &mut self.tabs {
-            tab.set_viewport(cvp);
+            tab.root.set_viewport(cvp);
         }
     }
 
@@ -1140,7 +1195,7 @@ impl Multiplexer {
             }
 
             Action::CloseFocused => {
-                let tab_empty = self.tabs[self.focus].close_focused();
+                let tab_empty = self.tabs[self.focus].root.close_focused();
                 if tab_empty {
                     self.tabs.remove(self.focus);
                     if self.tabs.is_empty() {
@@ -1150,10 +1205,11 @@ impl Multiplexer {
                     if self.focus >= self.tabs.len() {
                         self.focus = self.tabs.len() - 1;
                     }
-                    self.focused_root().focused_leaf_mut().focus_changed(true);
+                    self.apply_focused_tab_workbench();
+                } else {
+                    // 分割の畳み込みだけなら表示状態は変わらない。
+                    self.refresh_layout();
                 }
-                // タブ削除でも分割の畳み込みでも、残ったペインを広げ直す。
-                self.refresh_layout();
                 self.update_status_bar();
             }
 
@@ -1167,7 +1223,7 @@ impl Multiplexer {
                     Action::NextTab => (self.focus + 1) % n,
                     _ => (self.focus + n - 1) % n,
                 };
-                self.focused_root().focused_leaf_mut().focus_changed(true);
+                self.apply_focused_tab_workbench();
                 self.update_status_bar();
             }
 
@@ -1179,7 +1235,9 @@ impl Multiplexer {
                 let window = self.window.clone();
                 let display = self.display.clone();
                 let font_diff = self.font_diff;
-                self.tabs[self.focus].split_focused(partition, &window, &display, None, font_diff);
+                self.tabs[self.focus]
+                    .root
+                    .split_focused(partition, &window, &display, None, font_diff);
             }
 
             Action::Focus(dir) => {
@@ -1190,25 +1248,9 @@ impl Multiplexer {
                 self.resize(dir);
             }
 
-            // 1キーで3状態を回す：非表示→開いてフォーカス／表示中(端末フォーカス)→
-            // サイドバーへフォーカス／サイドバーフォーカス中→閉じて端末へ。
-            // 旧 Ctrl+Shift+B（フォーカスのみ）はこのサイクルに統合した。
             Action::ToggleSidebar => {
-                if !self.sidebar.is_visible() {
-                    let location = self.focused_location();
-                    self.sidebar.toggle(&location);
-                    self.refresh_layout();
-                    self.focus_sidebar();
-                } else if !self.sidebar_focused {
-                    self.focus_sidebar();
-                } else {
-                    let location = self.focused_location();
-                    self.sidebar.toggle(&location);
-                    self.release_sidebar_focus();
-                    self.release_editor_focus();
-                    self.release_reader_focus();
-                    self.refresh_layout();
-                }
+                self.tabs[self.focus].workbench_visible = !self.tabs[self.focus].workbench_visible;
+                self.apply_focused_tab_workbench();
             }
 
             Action::ToggleFollow => {
@@ -1236,7 +1278,7 @@ impl Multiplexer {
         }
 
         for tab in &mut self.tabs {
-            tab.for_each_leaf(&mut |w| w.change_font_size(applied));
+            tab.root.for_each_leaf(&mut |w| w.change_font_size(applied));
         }
         self.sidebar.change_font_size(applied);
         self.preview_slot.change_font_size(applied);
@@ -1270,10 +1312,9 @@ impl Multiplexer {
             command,
         ));
         self.apply_current_font(&mut win);
-        self.tabs.push(Node::Leaf(win));
+        self.tabs.push(Tab::new(Node::Leaf(win)));
         self.focus = self.tabs.len() - 1;
-        self.refresh_layout();
-        self.focused_root().focused_leaf_mut().focus_changed(true);
+        self.apply_focused_tab_workbench();
         self.update_status_bar();
         if let Some(cwd) = cwd {
             self.recent.record(cwd);
@@ -1373,11 +1414,10 @@ impl Multiplexer {
         self.open_tab_in(Some(dir), command);
         // 起動時ランチャーで選んだ場合、自動で立った最初の空シェルタブを畳む。
         if replace_startup && self.tabs.len() > 1 {
-            self.tabs[0].close_focused(); // 最初のタブは単一ペイン＝PTY を閉じる
+            self.tabs[0].root.close_focused(); // 最初のタブは単一ペイン＝PTY を閉じる
             self.tabs.remove(0);
             self.focus = self.tabs.len() - 1;
-            self.refresh_layout();
-            self.focused_root().focused_leaf_mut().focus_changed(true);
+            self.apply_focused_tab_workbench();
             self.update_status_bar();
         }
         self.window.request_redraw();
@@ -1503,9 +1543,8 @@ impl Multiplexer {
         };
 
         if !self.sidebar.is_visible() {
-            let location = self.focused_location();
-            self.sidebar.toggle(&location);
-            self.refresh_layout();
+            self.tabs[self.focus].workbench_visible = true;
+            self.apply_focused_tab_workbench();
         }
         let root = self.sidebar.root().map(Path::to_path_buf);
         if let Some(reader) = self.preview_slot.reader_mut() {
@@ -1604,7 +1643,7 @@ impl Multiplexer {
         // 軽さ）なので、常時ドレインしても分割数が多少あっても問題にならない。
         let mut messages = Vec::new();
         for tab in &mut self.tabs {
-            tab.take_gt_messages(&mut messages);
+            tab.root.take_gt_messages(&mut messages);
         }
         self.preview_slot.take_gt_messages(&mut messages);
 
@@ -1791,7 +1830,7 @@ impl Multiplexer {
                     if self.status_bar_height() > 0 {
                         self.status_view.draw(&mut surface);
                     }
-                    self.tabs[self.focus].draw(&mut surface);
+                    self.tabs[self.focus].root.draw(&mut surface);
                     if self.sidebar.is_visible() {
                         self.preview_slot.draw(&mut surface);
                     }
@@ -1810,7 +1849,7 @@ impl Multiplexer {
                     self.modifiers = m.state();
                     // 各ペインの内部修飾キー状態も合わせておく（フォーカス切替後も正しく）。
                     for tab in &mut self.tabs {
-                        tab.for_each_leaf(&mut |w| w.process_window_event(wev));
+                        tab.root.for_each_leaf(&mut |w| w.process_window_event(wev));
                     }
                 }
 
@@ -1882,7 +1921,9 @@ impl Multiplexer {
                     self.cursor_pos = *position;
                     // どのペインでドラッグ選択しても効くよう、全ペインへ座標を配る。
                     let focus_tab = self.focus;
-                    self.tabs[focus_tab].for_each_leaf(&mut |w| w.process_window_event(wev));
+                    self.tabs[focus_tab]
+                        .root
+                        .for_each_leaf(&mut |w| w.process_window_event(wev));
                 }
 
                 WindowEvent::MouseInput {
@@ -1925,7 +1966,7 @@ impl Multiplexer {
                     } else {
                         self.focused_root().focused_leaf_mut().focus_changed(false);
                     }
-                    self.tabs[self.focus].focus_at(p);
+                    self.tabs[self.focus].root.focus_at(p);
                     self.focused_root().focused_leaf_mut().focus_changed(true);
                     self.focused_root()
                         .focused_leaf_mut()
@@ -1996,16 +2037,18 @@ impl Multiplexer {
             Event::AboutToWait => {
                 // 全タブの PTY を汲み取り、終了したペイン/タブを取り除く。
                 let mut changed = false;
+                let mut tab_removed = false;
                 let mut i = 0;
                 while i < self.tabs.len() {
                     let mut collapsed = false;
-                    let empty = self.tabs[i].update_and_prune(&mut collapsed);
+                    let empty = self.tabs[i].root.update_and_prune(&mut collapsed);
                     if collapsed {
                         changed = true;
                     }
                     if empty {
                         self.tabs.remove(i);
                         changed = true;
+                        tab_removed = true;
                         if self.tabs.is_empty() {
                             // exited を立てないと、終了確定前に届く次のイベント
                             // （AboutToWait やフォーカス/クリック）が空の tabs を
@@ -2022,8 +2065,6 @@ impl Multiplexer {
                             if self.focus >= self.tabs.len() {
                                 self.focus = self.tabs.len() - 1;
                             }
-                            // フォーカスしていたタブが消えたので、新しいタブの葉へ。
-                            self.focused_root().focused_leaf_mut().focus_changed(true);
                         }
                         // remove(i) で詰めたので i はそのまま次のタブを指す。
                     } else {
@@ -2031,7 +2072,10 @@ impl Multiplexer {
                     }
                 }
                 // ペインやタブが減ったら、残ったペインを領域いっぱいに広げ直す。
-                if changed {
+                if tab_removed {
+                    self.apply_focused_tab_workbench();
+                    self.update_status_bar();
+                } else if changed {
                     self.refresh_layout();
                     self.update_status_bar();
                 }
@@ -2083,7 +2127,7 @@ impl Multiplexer {
 
                 // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。
                 // 内容更新自体は上で汲み取り済みなので、再表示時にまとめて描ける。
-                let need = self.tabs[self.focus].needs_redraw()
+                let need = self.tabs[self.focus].root.needs_redraw()
                     || (self.status_bar_height() > 0 && self.status_view.needs_redraw())
                     || self.sidebar.needs_redraw()
                     || (self.sidebar.is_visible() && self.preview_slot.needs_redraw())

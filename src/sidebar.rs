@@ -106,9 +106,12 @@ impl Sidebar {
         self.rebuild();
     }
 
-    pub fn toggle(&mut self, location: &ShellLocation) {
-        self.visible = !self.visible;
-        if self.visible {
+    pub fn set_visible(&mut self, location: &ShellLocation, visible: bool) {
+        if self.visible == visible {
+            return;
+        }
+        self.visible = visible;
+        if visible {
             self.refresh_location(location);
         } else {
             self.focused = false;
