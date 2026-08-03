@@ -11,7 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use alacritty_terminal::event::{Event as AlacEvent, EventListener, WindowSize};
 use alacritty_terminal::grid::Dimensions;
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::{Selection as AlacSelection, SelectionType};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Rgb;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
@@ -37,6 +38,43 @@ pub(crate) struct GridSelection {
     pub(crate) start: Point,
     pub(crate) end: Point,
     pub(crate) block: bool,
+}
+
+fn selection_text_from_term<T>(term: &Term<T>, selection: GridSelection) -> String {
+    let in_bounds = |point: Point| {
+        point.line >= term.topmost_line()
+            && point.line <= term.bottommost_line()
+            && point.column.0 < term.columns()
+    };
+    if !in_bounds(selection.start) || !in_bounds(selection.end) {
+        return String::new();
+    }
+
+    if selection.block {
+        let top = selection.start.line.0.min(selection.end.line.0);
+        let bottom = selection.start.line.0.max(selection.end.line.0);
+        let left = selection.start.column.0.min(selection.end.column.0);
+        let right = selection.start.column.0.max(selection.end.column.0);
+
+        (top..=bottom)
+            .map(|line| {
+                term.bounds_to_string(
+                    Point::new(Line(line), Column(left)),
+                    Point::new(Line(line), Column(right)),
+                )
+                .trim_end_matches([' ', '\t'])
+                .to_owned()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    } else {
+        let (start, end) = if selection.start <= selection.end {
+            (selection.start, selection.end)
+        } else {
+            (selection.end, selection.start)
+        };
+        term.bounds_to_string(start, end)
+    }
 }
 
 /// alacritty の Term が応答シーケンスを送るときに呼ばれるリスナー。
@@ -178,6 +216,13 @@ fn window_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> WindowSiz
         cell_width: cell_w,
         cell_height: cell_h,
     }
+}
+
+fn selection_delimiters() -> String {
+    (0u8..=127)
+        .map(char::from)
+        .filter(|ch| ch.is_ascii_punctuation() || ch.is_ascii_whitespace())
+        .collect()
 }
 
 /// PTY バイト列を分割した断片。
@@ -664,6 +709,7 @@ impl VtTerminal {
         let size = GridSize { cols, lines };
         let term_config = Config {
             scrolling_history: crate::TOYTERM_CONFIG.scrollback_lines,
+            semantic_escape_chars: selection_delimiters(),
             ..Config::default()
         };
         let term = Arc::new(Mutex::new(Term::new(term_config, &size, proxy)));
@@ -853,7 +899,9 @@ impl VtTerminal {
 
     /// スクロールバック（履歴）を消去する。
     pub fn clear_history(&self) {
-        self.term.lock().unwrap().grid_mut().clear_history();
+        let mut term = self.term.lock().unwrap();
+        term.grid_mut().clear_history();
+        term.selection = None;
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -873,35 +921,47 @@ impl VtTerminal {
         self.term.lock().unwrap().grid().display_offset()
     }
 
+    pub(crate) fn start_selection(&self, selection_type: SelectionType, point: Point, side: Side) {
+        self.term.lock().unwrap().selection = Some(AlacSelection::new(selection_type, point, side));
+    }
+
+    pub(crate) fn update_selection(&self, point: Point, side: Side) {
+        if let Some(selection) = self.term.lock().unwrap().selection.as_mut() {
+            selection.update(point, side);
+        }
+    }
+
+    pub(crate) fn grid_selection(&self) -> Option<GridSelection> {
+        let term = self.term.lock().unwrap();
+        let range = term.selection.as_ref()?.to_range(&term)?;
+        Some(GridSelection {
+            start: range.start,
+            end: range.end,
+            block: range.is_block,
+        })
+    }
+
+    pub(crate) fn clear_selection(&self) {
+        self.term.lock().unwrap().selection = None;
+    }
+
     /// Copy the logical grid range without consulting the current viewport.
+    #[allow(dead_code)] // Explicit-range API retained for callers/tests; UI copy uses atomic tracking.
     pub(crate) fn selection_text(&self, selection: GridSelection) -> String {
         let term = self.term.lock().unwrap();
+        selection_text_from_term(&term, selection)
+    }
 
-        if selection.block {
-            let top = selection.start.line.0.min(selection.end.line.0);
-            let bottom = selection.start.line.0.max(selection.end.line.0);
-            let left = selection.start.column.0.min(selection.end.column.0);
-            let right = selection.start.column.0.max(selection.end.column.0);
-
-            (top..=bottom)
-                .map(|line| {
-                    term.bounds_to_string(
-                        Point::new(Line(line), Column(left)),
-                        Point::new(Line(line), Column(right)),
-                    )
-                    .trim_end_matches([' ', '\t'])
-                    .to_owned()
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        } else {
-            let (start, end) = if selection.start <= selection.end {
-                (selection.start, selection.end)
-            } else {
-                (selection.end, selection.start)
-            };
-            term.bounds_to_string(start, end)
-        }
+    pub(crate) fn tracked_selection_text(&self) -> Option<(GridSelection, String)> {
+        let term = self.term.lock().unwrap();
+        let range = term.selection.as_ref()?.to_range(&term)?;
+        let selection = GridSelection {
+            start: range.start,
+            end: range.end,
+            block: range.is_block,
+        };
+        let text = selection_text_from_term(&term, selection);
+        Some((selection, text))
     }
 
     /// スクロールバックを最下部（現在）に戻す。キー入力時に呼ぶ。
@@ -1175,7 +1235,9 @@ fn pty_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> PtySize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alacritty_terminal::index::Side;
     use alacritty_terminal::index::{Column, Line};
+    use alacritty_terminal::selection::SelectionType;
     use std::path::Path;
 
     /// 共有 Vec に書き出すテスト用 Writer。
@@ -1252,6 +1314,146 @@ mod tests {
             block: true,
         };
         assert_eq!(terminal.selection_text(selection), "abc\nabc");
+    }
+
+    #[test]
+    fn selection_tracks_grid_rotation_after_additional_output() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("L{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        terminal.start_selection(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        terminal.update_selection(Point::new(Line(0), Column(1)), Side::Right);
+        assert_eq!(
+            terminal.selection_text(terminal.grid_selection().unwrap()),
+            "L5"
+        );
+
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"L8\r\n");
+        let rotated = terminal
+            .grid_selection()
+            .expect("selection should rotate with its text");
+        assert_eq!(terminal.selection_text(rotated), "L5");
+        assert_eq!(
+            terminal.tracked_selection_text(),
+            Some((rotated, "L5".to_owned()))
+        );
+    }
+
+    #[test]
+    fn cleared_history_rejects_stale_selection_bounds() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("L{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        let stale = GridSelection {
+            start: Point::new(Line(-1), Column(0)),
+            end: Point::new(Line(-1), Column(1)),
+            block: false,
+        };
+        assert_eq!(terminal.selection_text(stale), "L4");
+
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"\x1b[3J");
+        assert_eq!(terminal.selection_text(stale), "");
+    }
+
+    #[test]
+    fn explicit_history_clear_invalidates_tracked_selection() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("L{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        terminal.start_selection(
+            SelectionType::Simple,
+            Point::new(Line(-1), Column(0)),
+            Side::Left,
+        );
+        terminal.update_selection(Point::new(Line(-1), Column(1)), Side::Right);
+        terminal.clear_history();
+
+        assert!(terminal.term.lock().unwrap().selection.is_none());
+    }
+
+    #[test]
+    fn alternate_screen_switch_invalidates_selection() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"primary");
+
+        terminal.start_selection(
+            SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        terminal.update_selection(Point::new(Line(0), Column(6)), Side::Right);
+        assert!(terminal.grid_selection().is_some());
+
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"\x1b[?1049h");
+        assert_eq!(terminal.grid_selection(), None);
+    }
+
+    #[test]
+    fn semantic_selection_keeps_expanded_anchor_while_display_scrolls() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("word{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        let anchor = Point::new(Line(0), Column(2));
+        terminal.start_selection(SelectionType::Semantic, anchor, Side::Left);
+        terminal.update_selection(anchor, Side::Right);
+        assert_eq!(
+            terminal.selection_text(terminal.grid_selection().unwrap()),
+            "word5"
+        );
+
+        terminal.scroll(2);
+        let current_top = Point::new(Line(-2), Column(2));
+        terminal.update_selection(current_top, Side::Right);
+        assert_eq!(
+            terminal.selection_text(terminal.grid_selection().unwrap()),
+            "word3\nword4\nword5"
+        );
+    }
+
+    #[test]
+    fn semantic_selection_preserves_ascii_punctuation_word_boundaries() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"foo-bar");
+
+        let anchor = Point::new(Line(0), Column(1));
+        terminal.start_selection(SelectionType::Semantic, anchor, Side::Left);
+        terminal.update_selection(anchor, Side::Right);
+        assert_eq!(
+            terminal.selection_text(terminal.grid_selection().unwrap()),
+            "foo"
+        );
     }
 
     #[test]

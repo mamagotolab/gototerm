@@ -15,7 +15,8 @@ use crate::terminal::{CellSize, TerminalSize};
 use crate::view::{Selection, TerminalView, Viewport};
 use crate::vt::{GridSelection, ShellLocation, VtTerminal};
 use crate::Display;
-use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::index::{Column, Line, Point, Side};
+use alacritty_terminal::selection::SelectionType;
 
 type CursorPosition = PhysicalPosition<f64>;
 
@@ -90,13 +91,13 @@ pub(crate) fn visible_selection(
     }
 }
 
-fn cursor_to_grid_point(
+fn cursor_to_selection_point(
     position: CursorPosition,
     cell_size: CellSize,
     rows: usize,
     cols: usize,
     display_offset: usize,
-) -> Point {
+) -> (Point, Side) {
     let rows = rows.max(1);
     let cols = cols.max(1);
     let width = cell_size.w.max(1) as f64;
@@ -104,100 +105,30 @@ fn cursor_to_grid_point(
     let x_max = width * cols as f64;
     let x = position.x.clamp(0.0, x_max - 0.1);
     let screen_line = ((position.y / height).floor() as i32).clamp(0, rows as i32 - 1);
-    let column = ((x / width).round() as usize).min(cols);
+    let cell_x = x / width;
+    let column = (cell_x.floor() as usize).min(cols - 1);
+    let side = if cell_x.fract() < 0.5 {
+        Side::Left
+    } else {
+        Side::Right
+    };
 
-    Point::new(Line(screen_line - display_offset as i32), Column(column))
+    (
+        Point::new(Line(screen_line - display_offset as i32), Column(column)),
+        side,
+    )
 }
 
-fn selection_from_grid_points(
-    start: Point,
-    end: Point,
-    block: bool,
-    click_count: usize,
-    lines: &[crate::terminal::Line],
-    display_offset: usize,
-    cols: usize,
-) -> Option<GridSelection> {
-    if cols == 0 {
-        return None;
-    }
-
+fn selection_type_for_click(click_count: usize, block: bool) -> SelectionType {
     if block {
-        let top = start.line.0.min(end.line.0);
-        let bottom = start.line.0.max(end.line.0);
-        let left = start.column.0.min(end.column.0);
-        let right = start
-            .column
-            .0
-            .max(end.column.0)
-            .saturating_sub(1)
-            .min(cols - 1);
-        return (left <= right).then_some(GridSelection {
-            start: Point::new(Line(top), Column(left)),
-            end: Point::new(Line(bottom), Column(right)),
-            block: true,
-        });
-    }
-
-    let (mut start, mut end) = if start <= end {
-        (start, end)
+        SelectionType::Block
     } else {
-        (end, start)
-    };
-    start.column.0 = start.column.0.min(cols - 1);
-    end.column.0 = end.column.0.saturating_sub(1).min(cols - 1);
-
-    match click_count {
-        1 => {}
-        2 => {
-            fn delimiter(ch: char) -> bool {
-                ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
-            }
-
-            let start_row = start.line.0 + display_offset as i32;
-            if let Some(line) = usize::try_from(start_row)
-                .ok()
-                .and_then(|row| lines.get(row))
-            {
-                while start.column.0 > 0 {
-                    let prev = line.get(start.column.0 - 1).map(|cell| cell.ch);
-                    let current = line.get(start.column.0).map(|cell| cell.ch);
-                    if prev
-                        .zip(current)
-                        .is_none_or(|(a, b)| delimiter(a) || delimiter(b))
-                    {
-                        break;
-                    }
-                    start.column.0 -= 1;
-                }
-            }
-
-            let end_row = end.line.0 + display_offset as i32;
-            if let Some(line) = usize::try_from(end_row).ok().and_then(|row| lines.get(row)) {
-                while end.column.0 < cols - 1 {
-                    let current = line.get(end.column.0).map(|cell| cell.ch);
-                    let next = line.get(end.column.0 + 1).map(|cell| cell.ch);
-                    if current
-                        .zip(next)
-                        .is_none_or(|(a, b)| delimiter(a) || delimiter(b))
-                    {
-                        break;
-                    }
-                    end.column.0 += 1;
-                }
-            }
-        }
-        _ => {
-            start.column = Column(0);
-            end.column = Column(cols - 1);
+        match click_count {
+            1 => SelectionType::Simple,
+            2 => SelectionType::Semantic,
+            _ => SelectionType::Lines,
         }
     }
-
-    (start <= end).then_some(GridSelection {
-        start,
-        end,
-        block: false,
-    })
 }
 
 /// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
@@ -410,11 +341,6 @@ struct MouseState {
     cursor_pos: CursorPosition,
     // Pixel location is kept only for distinguishing link clicks from drags.
     pressed_pos: Option<CursorPosition>,
-    // Logical selection lives in alacritty's absolute scrollback grid.
-    selection_start: Option<Point>,
-    selection: Option<GridSelection>,
-    // 押下時に矩形選択(Ctrl)だったか。
-    block: bool,
     // 現在のドラッグがローカル選択か（押下時に確定）。途中で Shift を離しても
     // ボタンを離すまでローカル選択を続けるため。
     selecting: bool,
@@ -467,9 +393,6 @@ impl TerminalWindow {
                 wheel_delta_y: 0.0,
                 cursor_pos: CursorPosition::default(),
                 pressed_pos: None,
-                selection_start: None,
-                selection: None,
-                block: false,
                 selecting: false,
                 click_count: 0,
                 last_clicked: std::time::Instant::now() - std::time::Duration::from_secs(10),
@@ -538,7 +461,7 @@ impl TerminalWindow {
             });
         }
 
-        let new_selection_range = self.mouse.selection.and_then(|selection| {
+        let new_selection_range = self.terminal.grid_selection().and_then(|selection| {
             visible_selection(selection, self.terminal.display_offset(), rows, cols)
         });
         if self.view.selection_range != new_selection_range {
@@ -551,33 +474,21 @@ impl TerminalWindow {
     }
 
     fn update_mouse_selection(&mut self) {
-        let Some(start) = self.mouse.selection_start else {
-            return;
-        };
         let (cols, rows) = self.terminal.size();
         let display_offset = self.terminal.display_offset();
-        let end = cursor_to_grid_point(
+        let (point, side) = cursor_to_selection_point(
             self.mouse.cursor_pos,
             self.view.cell_size(),
             rows,
             cols,
             display_offset,
         );
-        self.mouse.selection = selection_from_grid_points(
-            start,
-            end,
-            self.mouse.block,
-            self.mouse.click_count,
-            &self.view.lines,
-            display_offset,
-            cols,
-        );
+        self.terminal.update_selection(point, side);
     }
 
     fn clear_mouse_selection(&mut self) {
         self.mouse.pressed_pos = None;
-        self.mouse.selection_start = None;
-        self.mouse.selection = None;
+        self.terminal.clear_selection();
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
@@ -885,15 +796,20 @@ impl TerminalWindow {
 
                             self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
                             // Ctrl を押しながらの開始は矩形選択。
-                            self.mouse.block = self.modifiers.control_key();
+                            let block = self.modifiers.control_key();
                             let (cols, rows) = self.terminal.size();
-                            self.mouse.selection_start = Some(cursor_to_grid_point(
+                            let (point, side) = cursor_to_selection_point(
                                 self.mouse.cursor_pos,
                                 self.view.cell_size(),
                                 rows,
                                 cols,
                                 self.terminal.display_offset(),
-                            ));
+                            );
+                            self.terminal.start_selection(
+                                selection_type_for_click(self.mouse.click_count, block),
+                                point,
+                                side,
+                            );
                             // このドラッグはローカル選択。離すまで継続する。
                             self.mouse.selecting = true;
                             self.update_mouse_selection();
@@ -1203,8 +1119,8 @@ impl TerminalWindow {
     fn copy_clipboard(&mut self) {
         let mut text = String::new();
 
-        if let Some(selection) = self.mouse.selection {
-            text = self.terminal.selection_text(selection);
+        if let Some((selection, selected_text)) = self.terminal.tracked_selection_text() {
+            text = selected_text;
             if !selection.block {
                 text = dedent_common_indent(&text);
             }
@@ -1299,13 +1215,14 @@ fn dedent_common_indent(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        cursor_to_grid_point, dedent_common_indent, resolve_existing_file_token,
-        resolve_path_token, selection_from_grid_points, visible_selection, CursorPosition,
+        cursor_to_selection_point, dedent_common_indent, resolve_existing_file_token,
+        resolve_path_token, selection_type_for_click, visible_selection, CursorPosition,
     };
     use crate::terminal::CellSize;
     use crate::view::Selection;
     use crate::vt::GridSelection;
-    use alacritty_terminal::index::{Column, Line, Point};
+    use alacritty_terminal::index::{Column, Line, Point, Side};
+    use alacritty_terminal::selection::SelectionType;
     use std::path::{Path, PathBuf};
 
     fn linear_grid_selection(start: (i32, usize), end: (i32, usize)) -> GridSelection {
@@ -1350,38 +1267,25 @@ mod tests {
     }
 
     #[test]
-    fn cursor_position_maps_to_scrollback_grid_line() {
+    fn cursor_position_maps_to_scrollback_cell_and_side() {
         assert_eq!(
-            cursor_to_grid_point(
+            cursor_to_selection_point(
                 CursorPosition::new(25.0, 45.0),
                 CellSize { w: 10, h: 20 },
                 4,
                 10,
                 3,
             ),
-            Point::new(Line(-1), Column(3))
+            (Point::new(Line(-1), Column(2)), Side::Right)
         );
     }
 
     #[test]
-    fn drag_selection_keeps_absolute_grid_endpoints() {
-        let selection = selection_from_grid_points(
-            Point::new(Line(-2), Column(2)),
-            Point::new(Line(0), Column(5)),
-            false,
-            1,
-            &[],
-            3,
-            10,
-        );
-        assert_eq!(
-            selection,
-            Some(GridSelection {
-                start: Point::new(Line(-2), Column(2)),
-                end: Point::new(Line(0), Column(4)),
-                block: false,
-            })
-        );
+    fn click_count_selects_tracked_selection_kind() {
+        assert_eq!(selection_type_for_click(1, false), SelectionType::Simple);
+        assert_eq!(selection_type_for_click(2, false), SelectionType::Semantic);
+        assert_eq!(selection_type_for_click(3, false), SelectionType::Lines);
+        assert_eq!(selection_type_for_click(2, true), SelectionType::Block);
     }
 
     #[test]
