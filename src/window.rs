@@ -102,13 +102,8 @@ fn selection_type_for_click(click_count: usize, block: bool) -> SelectionType {
     }
 }
 
-/// URL を OS 標準のブラウザで開く。Linux は xdg-open。Windows は
-/// rundll32 の FileProtocolHandler を使う。explorer に URL を渡すと
-/// 引数をパスと誤解してフォルダを開くことがあるため使わない。
 /// AI（Claude Code）の Stop hook 受信時、ウィンドウが非フォーカスなら呼ぶ想定の
-/// OS 通知。中身は固定文言のみ（動的な文字列を組み込まない）。Windows 側は
-/// PowerShell 経由で文字列をコード片として解釈させるため、任意テキストを渡すと
-/// インジェクションの余地になる——ここでは既知の日本語文字列だけを埋め込む。
+/// OS 通知。中身は固定文言のみ（動的な文字列を組み込まない）。
 pub(crate) fn notify_completion() {
     const TITLE: &str = "gototerm";
     const BODY: &str = "AIの応答が完了しました";
@@ -119,48 +114,87 @@ pub(crate) fn notify_completion() {
         .spawn();
 
     #[cfg(windows)]
-    let result = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        // 追加インストール無しでトースト通知を出す定番の手（WinRT の
-        // ToastNotificationManager を PowerShell から直接叩く）。AppId は
-        // Explorer のものを借用する一般的な回避策。
-        // 未検証（実機なし）: 将来 Windows 実機で確認が必要。
-        let script = format!(
-            "[Windows.UI.Notifications.ToastNotificationManager,Windows.UI.Notifications,ContentType=WindowsRuntime]>$null;\
-             [Windows.Data.Xml.Dom.XmlDocument,Windows.Data.Xml.Dom,ContentType=WindowsRuntime]>$null;\
-             $t=[Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02);\
-             $x=$t.GetElementsByTagName('text');\
-             $x.Item(0).AppendChild($t.CreateTextNode('{TITLE}'))>$null;\
-             $x.Item(1).AppendChild($t.CreateTextNode('{BODY}'))>$null;\
-             [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('Microsoft.Windows.Explorer').Show([Windows.UI.Notifications.ToastNotification]::new($t))"
-        );
-        std::process::Command::new("powershell")
-            .args(["-NoProfile", "-Command", &script])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
-    };
+    let result = show_toast(TITLE, BODY);
 
     if let Err(e) = result {
         log::debug!("OS 通知をスキップしました: {}", e);
     }
 }
 
-pub(crate) fn open_url(url: &str) {
-    use std::process::Command;
-    #[cfg(not(windows))]
-    let result = Command::new("xdg-open").arg(url).spawn();
-    #[cfg(windows)]
-    let result = {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        Command::new("rundll32")
-            .args(["url.dll,FileProtocolHandler", url])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()
+/// WinRT のトースト通知をプロセス内から直接出す。
+///
+/// 以前は同じ WinRT API を `powershell -Command` の非表示起動から叩いていたが、
+/// 「隠しウィンドウで PowerShell を実行する」はマルウェアの常套手段そのもので、
+/// Windows Defender が exe を隔離してしまった。子プロセスを起動しなければ
+/// 検出理由そのものが無くなる。
+#[cfg(windows)]
+fn show_toast(title: &str, body: &str) -> windows::core::Result<()> {
+    use windows::core::HSTRING;
+    use windows::Data::Xml::Dom::XmlDocument;
+    use windows::UI::Notifications::{
+        ToastNotification, ToastNotificationManager, ToastTemplateType,
     };
+
+    // AppId は Explorer のものを借用する。未パッケージのアプリが追加インストール
+    // 無しで通知を出すための一般的な回避策。
+    const APP_ID: &str = "Microsoft.Windows.Explorer";
+
+    // ToastText02 は「太字の1行目＋本文」のテンプレート。text 要素が2つある。
+    let xml: XmlDocument =
+        ToastNotificationManager::GetTemplateContent(ToastTemplateType::ToastText02)?;
+    let texts = xml.GetElementsByTagName(&HSTRING::from("text"))?;
+    texts
+        .Item(0)?
+        .AppendChild(&xml.CreateTextNode(&HSTRING::from(title))?)?;
+    texts
+        .Item(1)?
+        .AppendChild(&xml.CreateTextNode(&HSTRING::from(body))?)?;
+
+    let toast = ToastNotification::CreateToastNotification(&xml)?;
+    ToastNotificationManager::CreateToastNotifierWithId(&HSTRING::from(APP_ID))?.Show(&toast)
+}
+
+/// URL やファイルを OS 標準のアプリで開く。Linux は xdg-open。Windows は
+/// ShellExecuteW を直接呼ぶ。explorer に URL を渡すと引数をパスと誤解して
+/// フォルダを開くことがあるため使わない。
+pub(crate) fn open_url(url: &str) {
+    #[cfg(not(windows))]
+    let result = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(windows)]
+    let result = shell_open(url);
     if let Err(e) = result {
         log::error!("URL を開けませんでした ({}): {}", url, e);
+    }
+}
+
+/// URL やファイルを既定のアプリで開く。
+///
+/// 以前は `rundll32 url.dll,FileProtocolHandler` を起動していたが、rundll32 は
+/// 正規ツールを悪用する手口(LOLBin)として Defender の監視対象。同じことは
+/// ShellExecuteW を直接呼べば子プロセス無しで済む。
+#[cfg(windows)]
+fn shell_open(target: &str) -> windows::core::Result<()> {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+    let verb = HSTRING::from("open");
+    let target = HSTRING::from(target);
+    let result = unsafe {
+        ShellExecuteW(
+            None,
+            &verb,
+            &target,
+            PCWSTR::null(),
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    // 成功すると 32 より大きい擬似ハンドルが返る。32 以下はエラーコード。
+    if result.0 as isize > 32 {
+        Ok(())
+    } else {
+        Err(windows::core::Error::from_win32())
     }
 }
 

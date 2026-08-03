@@ -47,6 +47,16 @@ vte = "0.15"
 # Windows 限定ゲートなので Linux のビルドには影響しない。
 [target.'cfg(windows)'.dependencies]
 arboard = { version = "3", default-features = false }
+# 通知と URL 起動を OS API の直接呼び出しで行う。以前は powershell / rundll32 を
+# 非表示で起動していたが、その振る舞いを Windows Defender がマルウェアとして
+# 検出し、exe が隔離されて使えなくなった（実機で発生）。
+windows = { version = "0.62", features = [
+    "Data_Xml_Dom",
+    "UI_Notifications",
+    "Win32_Foundation",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
 
 # exe にアイコンを埋め込む（build.rs）。ホストが Windows のときだけ使う。
 [target.'cfg(windows)'.build-dependencies]
