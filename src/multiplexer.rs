@@ -10,7 +10,7 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use winit::{
-    dpi::PhysicalPosition,
+    dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoopWindowTarget},
     keyboard::{ModifiersState, PhysicalKey},
@@ -35,6 +35,80 @@ type Event = winit::event::Event<()>;
 
 /// 分割の境界に空ける隙間（px）。
 const GAP: u32 = 2;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct DpiUpdate {
+    surface_size: Option<PhysicalSize<u32>>,
+    viewport_size: Option<PhysicalSize<u32>>,
+    sync_layout_and_pty: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DpiTransitionState {
+    scale_factor: f64,
+    physical_size: PhysicalSize<u32>,
+    pending_metrics_sync: bool,
+}
+
+impl DpiTransitionState {
+    fn new(scale_factor: f64, physical_size: PhysicalSize<u32>) -> Self {
+        Self {
+            scale_factor,
+            physical_size,
+            pending_metrics_sync: false,
+        }
+    }
+
+    fn scale_factor(&self) -> f64 {
+        self.scale_factor
+    }
+
+    fn begin_scale_factor_change(&mut self, scale_factor: f64) -> Option<f64> {
+        if self.scale_factor == scale_factor {
+            return None;
+        }
+        self.scale_factor = scale_factor;
+        Some(scale_factor)
+    }
+
+    fn mark_metrics_changed(&mut self, changed: bool) {
+        self.pending_metrics_sync |= changed;
+    }
+
+    fn on_resized(&mut self, physical_size: PhysicalSize<u32>) -> DpiUpdate {
+        let size_changed = self.physical_size != physical_size;
+        self.physical_size = physical_size;
+
+        if physical_size.width == 0 || physical_size.height == 0 {
+            return DpiUpdate {
+                viewport_size: size_changed.then_some(physical_size),
+                ..DpiUpdate::default()
+            };
+        }
+
+        let sync_layout_and_pty = size_changed || self.pending_metrics_sync;
+        self.pending_metrics_sync = false;
+        DpiUpdate {
+            surface_size: size_changed.then_some(physical_size),
+            viewport_size: size_changed.then_some(physical_size),
+            sync_layout_and_pty,
+        }
+    }
+
+    fn flush_pending(&mut self) -> DpiUpdate {
+        if !self.pending_metrics_sync
+            || self.physical_size.width == 0
+            || self.physical_size.height == 0
+        {
+            return DpiUpdate::default();
+        }
+        self.pending_metrics_sync = false;
+        DpiUpdate {
+            sync_layout_and_pty: true,
+            ..DpiUpdate::default()
+        }
+    }
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Partition {
@@ -630,6 +704,55 @@ impl Node {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dpi_scale_then_resize_syncs_surface_and_pty_once() {
+        let original = winit::dpi::PhysicalSize::new(800, 600);
+        let resized = winit::dpi::PhysicalSize::new(1200, 900);
+        let mut state = DpiTransitionState::new(1.0, original);
+
+        assert_eq!(state.begin_scale_factor_change(1.5), Some(1.5));
+        state.mark_metrics_changed(true);
+        assert_eq!(
+            state.on_resized(resized),
+            DpiUpdate {
+                surface_size: Some(resized),
+                viewport_size: Some(resized),
+                sync_layout_and_pty: true,
+            }
+        );
+        assert_eq!(state.flush_pending(), DpiUpdate::default());
+        assert_eq!(state.on_resized(resized), DpiUpdate::default());
+    }
+
+    #[test]
+    fn dpi_scale_without_resize_flushes_new_metrics_at_existing_size() {
+        let size = winit::dpi::PhysicalSize::new(800, 600);
+        let mut state = DpiTransitionState::new(1.0, size);
+
+        assert_eq!(state.begin_scale_factor_change(1.25), Some(1.25));
+        state.mark_metrics_changed(true);
+        assert_eq!(
+            state.flush_pending(),
+            DpiUpdate {
+                sync_layout_and_pty: true,
+                ..DpiUpdate::default()
+            }
+        );
+        assert_eq!(state.flush_pending(), DpiUpdate::default());
+    }
+
+    #[test]
+    fn dpi_repeated_events_and_unchanged_metrics_are_noops() {
+        let size = winit::dpi::PhysicalSize::new(800, 600);
+        let mut state = DpiTransitionState::new(1.0, size);
+
+        assert_eq!(state.begin_scale_factor_change(1.0), None);
+        assert_eq!(state.on_resized(size), DpiUpdate::default());
+        assert_eq!(state.begin_scale_factor_change(1.01), Some(1.01));
+        state.mark_metrics_changed(false);
+        assert_eq!(state.flush_pending(), DpiUpdate::default());
+    }
+
     #[derive(Default)]
     struct RecordedWorkbench {
         visibility_calls: Vec<(ShellLocation, bool)>,
@@ -1036,14 +1159,13 @@ impl PreviewSlot {
         }
     }
 
-    fn set_scale_factor(&mut self, scale_factor: f64) {
+    fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
         match self {
             PreviewSlot::Reader(reader) => reader.set_scale_factor(scale_factor),
             PreviewSlot::Editor { win, saved } => {
-                win.set_scale_factor(scale_factor);
-                saved.set_scale_factor(scale_factor);
+                win.set_scale_factor(scale_factor) | saved.set_scale_factor(scale_factor)
             }
-            PreviewSlot::Empty => {}
+            PreviewSlot::Empty => false,
         }
     }
 
@@ -1116,8 +1238,7 @@ pub struct Multiplexer {
     /// 設定の既定サイズからのフォント差分。あとから開くペイン・タブ・ランチャーにも
     /// この差分を適用して、画面全体の文字サイズを常に揃える。
     font_diff: i32,
-    /// 現在のモニターの論理px→物理px倍率。
-    scale_factor: f64,
+    dpi_transition: DpiTransitionState,
 }
 
 impl Multiplexer {
@@ -1126,6 +1247,7 @@ impl Multiplexer {
 
         let size = window.inner_size();
         let scale_factor = window.scale_factor();
+        let dpi_transition = DpiTransitionState::new(scale_factor, size);
         let viewport = Viewport {
             x: 0,
             y: 0,
@@ -1184,7 +1306,7 @@ impl Multiplexer {
             sidebar_ratio: crate::TOYTERM_CONFIG.sidebar_ratio,
             preview_ratio: crate::TOYTERM_CONFIG.preview_ratio,
             font_diff: 0,
-            scale_factor,
+            dpi_transition,
         };
         mux.refresh_layout();
         // 設定で有効なら、起動直後にランチャーを重ねて出す。
@@ -1192,7 +1314,7 @@ impl Multiplexer {
             mux.launcher = Some(Launcher::new(
                 mux.display.clone(),
                 mux.viewport,
-                mux.scale_factor,
+                mux.dpi_transition.scale_factor(),
                 mux.recent.entries(),
             ));
             mux.startup_launcher = true;
@@ -1450,7 +1572,7 @@ impl Multiplexer {
                 let mut launcher = Launcher::new(
                     self.display.clone(),
                     self.viewport,
-                    self.scale_factor,
+                    self.dpi_transition.scale_factor(),
                     self.recent.entries(),
                 );
                 if self.font_diff != 0 {
@@ -1498,7 +1620,7 @@ impl Multiplexer {
                 };
                 let window = self.window.clone();
                 let display = self.display.clone();
-                let scale_factor = self.scale_factor;
+                let scale_factor = self.dpi_transition.scale_factor();
                 let font_diff = self.font_diff;
                 self.tabs[self.focus].root.split_focused(
                     partition,
@@ -1569,20 +1691,47 @@ impl Multiplexer {
         }
     }
 
-    fn set_scale_factor(&mut self, scale_factor: f64) {
-        self.scale_factor = scale_factor;
+    fn apply_scale_factor(&mut self, scale_factor: f64) -> bool {
+        let mut metrics_changed = false;
         for tab in &mut self.tabs {
-            tab.root
-                .for_each_leaf(&mut |window| window.set_scale_factor(scale_factor));
+            tab.root.for_each_leaf(&mut |window| {
+                metrics_changed |= window.set_scale_factor(scale_factor);
+            });
         }
-        self.status_view.set_scale_factor(scale_factor);
-        self.sidebar.set_scale_factor(scale_factor);
-        self.preview_slot.set_scale_factor(scale_factor);
+        metrics_changed |= self.status_view.set_scale_factor(scale_factor);
+        metrics_changed |= self.sidebar.set_scale_factor(scale_factor);
+        metrics_changed |= self.preview_slot.set_scale_factor(scale_factor);
         if let Some(launcher) = self.launcher.as_mut() {
             launcher.set_scale_factor(scale_factor);
         }
         if let Some(review) = self.session_review.as_mut() {
             review.set_scale_factor(scale_factor);
+        }
+        metrics_changed
+    }
+
+    fn apply_dpi_update(&mut self, update: DpiUpdate) {
+        if let Some(size) = update.surface_size {
+            // glium 0.34 の手書きサーフェスは自動リサイズされないため明示。
+            self.display.resize((size.width, size.height));
+        }
+        if let Some(size) = update.viewport_size {
+            self.viewport = Viewport {
+                x: 0,
+                y: 0,
+                w: size.width,
+                h: size.height,
+            };
+        }
+        if update.sync_layout_and_pty {
+            self.refresh_layout();
+            if let Some(launcher) = self.launcher.as_mut() {
+                launcher.set_viewport(self.viewport);
+            }
+            if let Some(review) = self.session_review.as_mut() {
+                review.set_viewport(self.viewport);
+            }
+            self.update_status_bar();
         }
     }
 
@@ -1595,7 +1744,7 @@ impl Multiplexer {
             self.window.clone(),
             self.display.clone(),
             cvp,
-            self.scale_factor,
+            self.dpi_transition.scale_factor(),
             cwd,
             command,
         ));
@@ -1638,7 +1787,7 @@ impl Multiplexer {
         self.session_review = Some(SessionReview::new(
             self.display.clone(),
             self.viewport,
-            self.scale_factor,
+            self.dpi_transition.scale_factor(),
             summary,
         ));
         self.window.request_redraw();
@@ -1911,7 +2060,7 @@ impl Multiplexer {
             self.window.clone(),
             self.display.clone(),
             viewport,
-            self.scale_factor,
+            self.dpi_transition.scale_factor(),
             cwd.as_deref(),
             Some(&command),
         ));
@@ -2006,35 +2155,10 @@ impl Multiplexer {
                 }
 
                 &WindowEvent::Resized(new_size) => {
-                    // 最小化すると Windows は Resized(0,0) を送ってくる。0 サイズで
-                    // glium をリサイズすると落ちるうえ、描いても無意味なので、
-                    // ビューポートだけ 0 にして（drawable() が false になる）戻る。
-                    // 復元時は非0の Resized が再度届き、下の通常経路で描き直す。
-                    if new_size.width == 0 || new_size.height == 0 {
-                        self.viewport = Viewport {
-                            x: 0,
-                            y: 0,
-                            w: 0,
-                            h: 0,
-                        };
-                        return;
-                    }
-                    // glium 0.34 の手書きサーフェスは自動リサイズされないため明示。
-                    self.display.resize((new_size.width, new_size.height));
-                    self.viewport = Viewport {
-                        x: 0,
-                        y: 0,
-                        w: new_size.width,
-                        h: new_size.height,
-                    };
-                    self.refresh_layout();
-                    if let Some(launcher) = self.launcher.as_mut() {
-                        launcher.set_viewport(self.viewport);
-                    }
-                    if let Some(review) = self.session_review.as_mut() {
-                        review.set_viewport(self.viewport);
-                    }
-                    self.update_status_bar();
+                    // ScaleFactorChanged のコールバック中は Window::inner_size() がまだ
+                    // 旧値なので、確定した物理サイズはこのイベントで一度だけ適用する。
+                    let update = self.dpi_transition.on_resized(new_size);
+                    self.apply_dpi_update(update);
                     // リサイズが来た＝ウィンドウは見えている。モニター切替時に
                     // Occluded(true) を受けたまま解除イベントを取りこぼすと画面が
                     // 固まるため、ここで遮蔽フラグを下ろして即再描画する。
@@ -2043,29 +2167,16 @@ impl Multiplexer {
                 }
 
                 WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
-                    // モニター間移動やマルチ→シングル切替で DPI(スケール)が変わると、
-                    // ピクセルサイズが同じでもサーフェスが古いまま残ることがある。
-                    // 実サイズで再同期し、遮蔽フラグも下ろして描き直す。直後に
-                    // Resized が続く場合もあるが、来ないケースの取りこぼしを防ぐ。
-                    let new = self.window.inner_size();
-                    self.display.resize((new.width, new.height));
-                    self.viewport = Viewport {
-                        x: 0,
-                        y: 0,
-                        w: new.width,
-                        h: new.height,
-                    };
-                    self.set_scale_factor(*scale_factor);
-                    self.refresh_layout();
-                    if let Some(launcher) = self.launcher.as_mut() {
-                        launcher.set_viewport(self.viewport);
+                    // winit 0.29 はこのコールバックの後で OS 提案サイズを適用する。
+                    // ここではフォントだけ準備し、サーフェス・PTY は Resized（または
+                    // 同じ物理サイズで Resized が来ない場合の AboutToWait）へ遅延する。
+                    if let Some(scale_factor) =
+                        self.dpi_transition.begin_scale_factor_change(*scale_factor)
+                    {
+                        let metrics_changed = self.apply_scale_factor(scale_factor);
+                        self.dpi_transition.mark_metrics_changed(metrics_changed);
                     }
-                    if let Some(review) = self.session_review.as_mut() {
-                        review.set_viewport(self.viewport);
-                    }
-                    self.update_status_bar();
                     self.occluded = false;
-                    self.window.request_redraw();
                 }
 
                 &WindowEvent::Focused(focused) => {
@@ -2325,6 +2436,11 @@ impl Multiplexer {
             },
 
             Event::AboutToWait => {
+                // DPI変更後に物理サイズが変わらず Resized が来ない場合も、新しい
+                // セル寸法をPTYとIMEへこのイベントバッチ中に一度だけ同期する。
+                let dpi_update = self.dpi_transition.flush_pending();
+                self.apply_dpi_update(dpi_update);
+
                 // 全タブの PTY を汲み取り、終了したペイン/タブを取り除く。
                 let mut changed = false;
                 let mut tab_removed = false;

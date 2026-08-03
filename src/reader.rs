@@ -135,15 +135,16 @@ impl ReaderPane {
         self.rebuild();
     }
 
-    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+    pub fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
         if !self.view.set_scale_factor(scale_factor) {
-            return;
+            return false;
         }
         if self.update_fit() && self.preview.image().is_some() {
             self.preview.refresh_current();
         }
         self.refresh_reader_document();
         self.rebuild();
+        true
     }
 
     pub fn on_scroll(&mut self, delta: i32) {

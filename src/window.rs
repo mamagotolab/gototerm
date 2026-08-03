@@ -583,11 +583,8 @@ impl TerminalWindow {
         }
     }
 
-    pub fn set_scale_factor(&mut self, scale_factor: f64) {
-        if self.view.set_scale_factor(scale_factor) {
-            self.resize_buffer();
-            self.update_ime_position();
-        }
+    pub fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
+        self.view.set_scale_factor(scale_factor)
     }
 
     fn resize_buffer(&mut self) {

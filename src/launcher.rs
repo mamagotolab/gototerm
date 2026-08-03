@@ -96,10 +96,12 @@ impl Launcher {
         }
     }
 
-    pub fn set_scale_factor(&mut self, scale_factor: f64) {
-        if self.view.set_scale_factor(scale_factor) {
+    pub fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
+        let changed = self.view.set_scale_factor(scale_factor);
+        if changed {
             self.rebuild();
         }
+        changed
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
