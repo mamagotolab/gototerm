@@ -422,11 +422,13 @@ fn selection_delimiters() -> String {
 /// PTY バイト列を分割した断片。
 enum Seg {
     /// 通常の VT 列。alacritty の Processor へ流す。
-    Pass(Vec<u8>),
+    Pass { source_offset: u64, bytes: Vec<u8> },
     /// Sixel の本体（`ESC P …q` と ST を除いた中身）。自前で描画する。
     Sixel(Vec<u8>),
     /// gototerm が読む OSC。OSC 7717 は Phase 8a では抽出だけ行う。
     Osc { code: OscCode, payload: String },
+    /// 内容を破棄した OSC。診断上のストリーム境界だけを残す。
+    Boundary,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -465,20 +467,61 @@ struct SixelSplitter {
     osc_code: Vec<u8>,
     osc_kind: Option<OscCode>,
     osc_discard: bool,
+    raw_offset: u64,
 }
 
 impl SixelSplitter {
+    fn push_pass_byte(
+        pass: &mut Vec<u8>,
+        pass_offset: &mut Option<u64>,
+        source_offset: u64,
+        byte: u8,
+    ) {
+        if pass.is_empty() {
+            *pass_offset = Some(source_offset);
+        }
+        pass.push(byte);
+    }
+
+    fn push_pass_slice(
+        pass: &mut Vec<u8>,
+        pass_offset: &mut Option<u64>,
+        source_offset: u64,
+        bytes: &[u8],
+    ) {
+        if bytes.is_empty() {
+            return;
+        }
+        if pass.is_empty() {
+            *pass_offset = Some(source_offset);
+        }
+        pass.extend_from_slice(bytes);
+    }
+
+    fn flush_pass(segs: &mut Vec<Seg>, pass: &mut Vec<u8>, pass_offset: &mut Option<u64>) {
+        if pass.is_empty() {
+            return;
+        }
+        segs.push(Seg::Pass {
+            source_offset: pass_offset.take().expect("pass bytes have a source offset"),
+            bytes: std::mem::take(pass),
+        });
+    }
+
     fn feed(&mut self, input: &[u8]) -> Vec<Seg> {
         let mut segs: Vec<Seg> = Vec::new();
         let mut pass: Vec<u8> = Vec::new();
+        let mut pass_offset = None;
 
         for &b in input {
+            let source_offset = self.raw_offset;
+            self.raw_offset = self.raw_offset.saturating_add(1);
             match self.state {
                 SplitState::Normal => {
                     if b == 0x1b {
                         self.state = SplitState::Esc;
                     } else {
-                        pass.push(b);
+                        Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                     }
                 }
                 SplitState::Esc => {
@@ -492,11 +535,16 @@ impl SixelSplitter {
                         self.osc_kind = None;
                         self.osc_discard = false;
                     } else {
-                        pass.push(0x1b);
+                        Self::push_pass_byte(
+                            &mut pass,
+                            &mut pass_offset,
+                            source_offset.saturating_sub(1),
+                            0x1b,
+                        );
                         if b == 0x1b {
                             // ESC ESC: 2つ目を新たな ESC として扱う
                         } else {
-                            pass.push(b);
+                            Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                             self.state = SplitState::Normal;
                         }
                     }
@@ -508,10 +556,19 @@ impl SixelSplitter {
                             self.payload.clear();
                         } else {
                             // 非Sixel DCS: ここまでを pass に出し ST まで素通し
-                            pass.push(0x1b);
-                            pass.push(b'P');
-                            pass.extend_from_slice(&self.intro);
-                            pass.push(b);
+                            let intro_offset = source_offset
+                                .saturating_sub(self.intro.len() as u64)
+                                .saturating_sub(2);
+                            let mut intro = Vec::with_capacity(self.intro.len() + 3);
+                            intro.extend_from_slice(b"\x1bP");
+                            intro.extend_from_slice(&self.intro);
+                            intro.push(b);
+                            Self::push_pass_slice(
+                                &mut pass,
+                                &mut pass_offset,
+                                intro_offset,
+                                &intro,
+                            );
                             self.state = SplitState::DcsPass;
                         }
                     } else {
@@ -523,9 +580,7 @@ impl SixelSplitter {
                 }
                 SplitState::SixelData => {
                     if b == 0x07 {
-                        if !pass.is_empty() {
-                            segs.push(Seg::Pass(std::mem::take(&mut pass)));
-                        }
+                        Self::flush_pass(&mut segs, &mut pass, &mut pass_offset);
                         segs.push(Seg::Sixel(std::mem::take(&mut self.payload)));
                         self.state = SplitState::Normal;
                     } else if b == 0x1b {
@@ -536,19 +591,17 @@ impl SixelSplitter {
                 }
                 SplitState::SixelEsc => {
                     // ESC '\' = ST。いずれにせよ Sixel は終了。
-                    if !pass.is_empty() {
-                        segs.push(Seg::Pass(std::mem::take(&mut pass)));
-                    }
+                    Self::flush_pass(&mut segs, &mut pass, &mut pass_offset);
                     segs.push(Seg::Sixel(std::mem::take(&mut self.payload)));
                     self.state = SplitState::Normal;
                     if b == 0x1b {
                         self.state = SplitState::Esc;
                     } else if b != b'\\' {
-                        pass.push(b);
+                        Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                     }
                 }
                 SplitState::DcsPass => {
-                    pass.push(b);
+                    Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                     if b == 0x07 {
                         self.state = SplitState::Normal;
                     } else if b == 0x1b {
@@ -556,7 +609,7 @@ impl SixelSplitter {
                     }
                 }
                 SplitState::DcsPassEsc => {
-                    pass.push(b);
+                    Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                     self.state = if b == b'\\' {
                         SplitState::Normal
                     } else {
@@ -574,42 +627,54 @@ impl SixelSplitter {
                             self.payload.clear();
                             self.state = SplitState::OscData;
                         } else {
-                            pass.push(0x1b);
-                            pass.push(b']');
-                            pass.extend_from_slice(&self.osc_code);
-                            pass.push(b';');
+                            let osc_offset = source_offset
+                                .saturating_sub(self.osc_code.len() as u64)
+                                .saturating_sub(2);
+                            let mut prefix = Vec::with_capacity(self.osc_code.len() + 3);
+                            prefix.extend_from_slice(b"\x1b]");
+                            prefix.extend_from_slice(&self.osc_code);
+                            prefix.push(b';');
+                            Self::push_pass_slice(&mut pass, &mut pass_offset, osc_offset, &prefix);
                             self.state = SplitState::OscPass;
                         }
                     } else if b == 0x07 {
-                        pass.push(0x1b);
-                        pass.push(b']');
-                        pass.extend_from_slice(&self.osc_code);
-                        pass.push(b);
+                        let osc_offset = source_offset
+                            .saturating_sub(self.osc_code.len() as u64)
+                            .saturating_sub(2);
+                        let mut sequence = Vec::with_capacity(self.osc_code.len() + 3);
+                        sequence.extend_from_slice(b"\x1b]");
+                        sequence.extend_from_slice(&self.osc_code);
+                        sequence.push(b);
+                        Self::push_pass_slice(&mut pass, &mut pass_offset, osc_offset, &sequence);
                         self.state = SplitState::Normal;
                     } else if b == 0x1b {
-                        pass.push(0x1b);
-                        pass.push(b']');
-                        pass.extend_from_slice(&self.osc_code);
-                        pass.push(b);
+                        let osc_offset = source_offset
+                            .saturating_sub(self.osc_code.len() as u64)
+                            .saturating_sub(2);
+                        let mut sequence = Vec::with_capacity(self.osc_code.len() + 3);
+                        sequence.extend_from_slice(b"\x1b]");
+                        sequence.extend_from_slice(&self.osc_code);
+                        sequence.push(b);
+                        Self::push_pass_slice(&mut pass, &mut pass_offset, osc_offset, &sequence);
                         self.state = SplitState::OscPassEsc;
                     } else if b.is_ascii_digit() {
                         self.osc_code.push(b);
                     } else {
-                        pass.push(0x1b);
-                        pass.push(b']');
-                        pass.extend_from_slice(&self.osc_code);
-                        pass.push(b);
+                        let osc_offset = source_offset
+                            .saturating_sub(self.osc_code.len() as u64)
+                            .saturating_sub(2);
+                        let mut sequence = Vec::with_capacity(self.osc_code.len() + 3);
+                        sequence.extend_from_slice(b"\x1b]");
+                        sequence.extend_from_slice(&self.osc_code);
+                        sequence.push(b);
+                        Self::push_pass_slice(&mut pass, &mut pass_offset, osc_offset, &sequence);
                         self.state = SplitState::OscPass;
                     }
                 }
                 SplitState::OscData => {
                     if b == 0x07 {
-                        if let Some(seg) = self.finish_osc() {
-                            if !pass.is_empty() {
-                                segs.push(Seg::Pass(std::mem::take(&mut pass)));
-                            }
-                            segs.push(seg);
-                        }
+                        Self::flush_pass(&mut segs, &mut pass, &mut pass_offset);
+                        segs.push(self.finish_osc());
                         self.state = SplitState::Normal;
                     } else if b == 0x1b {
                         self.state = SplitState::OscEsc;
@@ -619,12 +684,8 @@ impl SixelSplitter {
                 }
                 SplitState::OscEsc => {
                     if b == b'\\' {
-                        if let Some(seg) = self.finish_osc() {
-                            if !pass.is_empty() {
-                                segs.push(Seg::Pass(std::mem::take(&mut pass)));
-                            }
-                            segs.push(seg);
-                        }
+                        Self::flush_pass(&mut segs, &mut pass, &mut pass_offset);
+                        segs.push(self.finish_osc());
                         self.state = SplitState::Normal;
                     } else {
                         self.push_osc_payload(0x1b);
@@ -633,7 +694,7 @@ impl SixelSplitter {
                     }
                 }
                 SplitState::OscPass => {
-                    pass.push(b);
+                    Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                     if b == 0x07 {
                         self.state = SplitState::Normal;
                     } else if b == 0x1b {
@@ -641,7 +702,7 @@ impl SixelSplitter {
                     }
                 }
                 SplitState::OscPassEsc => {
-                    pass.push(b);
+                    Self::push_pass_byte(&mut pass, &mut pass_offset, source_offset, b);
                     self.state = if b == b'\\' {
                         SplitState::Normal
                     } else {
@@ -650,9 +711,7 @@ impl SixelSplitter {
                 }
             }
         }
-        if !pass.is_empty() {
-            segs.push(Seg::Pass(pass));
-        }
+        Self::flush_pass(&mut segs, &mut pass, &mut pass_offset);
         segs
     }
 
@@ -668,15 +727,20 @@ impl SixelSplitter {
         }
     }
 
-    fn finish_osc(&mut self) -> Option<Seg> {
+    fn finish_osc(&mut self) -> Seg {
         if self.osc_discard {
             self.payload.clear();
-            return None;
+            return Seg::Boundary;
         }
-        let code = self.osc_kind?;
+        let Some(code) = self.osc_kind else {
+            self.payload.clear();
+            return Seg::Boundary;
+        };
         let bytes = std::mem::take(&mut self.payload);
-        let payload = String::from_utf8(bytes).ok()?;
-        Some(Seg::Osc { code, payload })
+        match String::from_utf8(bytes) {
+            Ok(payload) => Seg::Osc { code, payload },
+            Err(_) => Seg::Boundary,
+        }
     }
 }
 
@@ -720,9 +784,10 @@ struct Utf8Diagnostic {
     enabled: bool,
     pending: [u8; 3],
     pending_len: u8,
+    pending_modes: Option<DiagnosticModes>,
     stream_offset: u64,
     invalid_count: u64,
-    incomplete_prefix_count: u64,
+    incomplete_count: u64,
 }
 
 impl Utf8Diagnostic {
@@ -731,10 +796,31 @@ impl Utf8Diagnostic {
             enabled,
             pending: [0; 3],
             pending_len: 0,
+            pending_modes: None,
             stream_offset: 0,
             invalid_count: 0,
-            incomplete_prefix_count: 0,
+            incomplete_count: 0,
         }
+    }
+
+    fn observe_at(
+        &mut self,
+        source_offset: u64,
+        bytes: &[u8],
+        modes: DiagnosticModes,
+    ) -> Vec<Utf8Issue> {
+        if !self.enabled {
+            return Vec::new();
+        }
+
+        let mut issues = if source_offset == self.stream_offset {
+            Vec::new()
+        } else {
+            self.finish()
+        };
+        self.stream_offset = source_offset;
+        issues.extend(self.observe(bytes, modes));
+        issues
     }
 
     fn observe(&mut self, bytes: &[u8], modes: DiagnosticModes) -> Vec<Utf8Issue> {
@@ -743,12 +829,15 @@ impl Utf8Diagnostic {
         }
 
         let pending_len = usize::from(self.pending_len);
+        let carried_modes = self.pending_modes.take();
+        let call_offset = self.stream_offset;
         let base_offset = self.stream_offset.saturating_sub(pending_len as u64);
         self.stream_offset = self.stream_offset.saturating_add(bytes.len() as u64);
 
         let mut input = Vec::with_capacity(pending_len + bytes.len());
         input.extend_from_slice(&self.pending[..pending_len]);
         input.extend_from_slice(bytes);
+        self.pending = [0; 3];
         self.pending_len = 0;
 
         let mut issues = Vec::new();
@@ -760,9 +849,14 @@ impl Utf8Diagnostic {
                     cursor += error.valid_up_to();
                     match error.error_len() {
                         Some(invalid_len) => {
+                            let offset = base_offset.saturating_add(cursor as u64);
                             let issue = Utf8Issue {
-                                offset: base_offset.saturating_add(cursor as u64),
-                                modes,
+                                offset,
+                                modes: if offset < call_offset {
+                                    carried_modes.unwrap_or(modes)
+                                } else {
+                                    modes
+                                },
                             };
                             self.invalid_count = self.invalid_count.saturating_add(1);
                             log::warn!(
@@ -781,8 +875,12 @@ impl Utf8Diagnostic {
                             debug_assert!(incomplete.len() <= self.pending.len());
                             self.pending[..incomplete.len()].copy_from_slice(incomplete);
                             self.pending_len = incomplete.len() as u8;
-                            self.incomplete_prefix_count =
-                                self.incomplete_prefix_count.saturating_add(1);
+                            let offset = base_offset.saturating_add(cursor as u64);
+                            self.pending_modes = Some(if offset < call_offset {
+                                carried_modes.unwrap_or(modes)
+                            } else {
+                                modes
+                            });
                             break;
                         }
                     }
@@ -791,6 +889,80 @@ impl Utf8Diagnostic {
         }
 
         issues
+    }
+
+    fn finish(&mut self) -> Vec<Utf8Issue> {
+        if !self.enabled || self.pending_len == 0 {
+            return Vec::new();
+        }
+
+        let issue = Utf8Issue {
+            offset: self
+                .stream_offset
+                .saturating_sub(u64::from(self.pending_len)),
+            modes: self
+                .pending_modes
+                .take()
+                .expect("pending UTF-8 prefix has terminal modes"),
+        };
+        self.pending = [0; 3];
+        self.pending_len = 0;
+        self.incomplete_count = self.incomplete_count.saturating_add(1);
+        log::warn!(
+            "UTF-8 diagnostic: incomplete_sequence_count={} offset={} application_cursor={} alternate_screen={} mouse={}",
+            self.incomplete_count,
+            issue.offset,
+            issue.modes.application_cursor,
+            issue.modes.alternate_screen,
+            issue.modes.mouse,
+        );
+        vec![issue]
+    }
+}
+
+fn advance_pass(
+    processor: &mut Processor,
+    term: &mut Term<EventProxy>,
+    source_offset: u64,
+    bytes: &[u8],
+    diagnostic: &mut Utf8Diagnostic,
+) -> Vec<Utf8Issue> {
+    if !diagnostic.enabled {
+        processor.advance(term, bytes);
+        return Vec::new();
+    }
+
+    let mut issues = Vec::new();
+    for (index, byte) in bytes.iter().enumerate() {
+        let modes = DiagnosticModes::from_term(term);
+        issues.extend(diagnostic.observe_at(
+            source_offset.saturating_add(index as u64),
+            std::slice::from_ref(byte),
+            modes,
+        ));
+        processor.advance(term, std::slice::from_ref(byte));
+    }
+    issues
+}
+
+fn advance_pass_or_finish_boundary(
+    seg: &Seg,
+    processor: &mut Processor,
+    term: &Arc<Mutex<Term<EventProxy>>>,
+    diagnostic: &mut Utf8Diagnostic,
+) -> Vec<Utf8Issue> {
+    match seg {
+        Seg::Pass {
+            source_offset,
+            bytes,
+        } => advance_pass(
+            processor,
+            &mut *term.lock().unwrap(),
+            *source_offset,
+            bytes,
+            diagnostic,
+        ),
+        Seg::Sixel(_) | Seg::Osc { .. } | Seg::Boundary => diagnostic.finish(),
     }
 }
 
@@ -1053,15 +1225,14 @@ impl VtTerminal {
                         Ok(0) => break, // EOF: 子プロセス終了
                         Ok(n) => {
                             for seg in splitter.feed(&buf[..n]) {
+                                let _ = advance_pass_or_finish_boundary(
+                                    &seg,
+                                    &mut processor,
+                                    &term,
+                                    &mut utf8_diagnostic,
+                                );
                                 match seg {
-                                    Seg::Pass(bytes) => {
-                                        let mut term = term.lock().unwrap();
-                                        if utf8_diagnostic.enabled {
-                                            let modes = DiagnosticModes::from_term(&*term);
-                                            let _ = utf8_diagnostic.observe(&bytes, modes);
-                                        }
-                                        processor.advance(&mut *term, &bytes);
-                                    }
+                                    Seg::Pass { .. } => {}
                                     Seg::Sixel(payload) => {
                                         place_sixel(
                                             &payload,
@@ -1087,6 +1258,7 @@ impl VtTerminal {
                                             }
                                         }
                                     }
+                                    Seg::Boundary => {}
                                 }
                             }
                             dirty.store(true, Ordering::SeqCst);
@@ -1095,6 +1267,7 @@ impl VtTerminal {
                         Err(_) => break,
                     }
                 }
+                let _ = utf8_diagnostic.finish();
                 exited.store(true, Ordering::SeqCst);
             });
         }
@@ -1642,7 +1815,7 @@ mod tests {
 
         for chunk in [&input[..split], &input[split..]] {
             for seg in splitter.feed(chunk) {
-                if let Seg::Pass(bytes) = seg {
+                if let Seg::Pass { bytes, .. } = seg {
                     processor.advance(&mut term, &bytes);
                 }
             }
@@ -1690,6 +1863,9 @@ mod tests {
             .observe(&[0xe6, 0x97], diagnostic_modes())
             .is_empty());
         assert!(diagnostic.observe(&[0xa5], diagnostic_modes()).is_empty());
+        assert!(diagnostic.finish().is_empty());
+        assert_eq!(diagnostic.invalid_count, 0);
+        assert_eq!(diagnostic.incomplete_count, 0);
     }
 
     #[test]
@@ -1699,6 +1875,107 @@ mod tests {
         assert_eq!(issues[0].offset, 0);
         assert_eq!(issues[0].modes, diagnostic_modes());
         assert!(!format!("{issues:?}").contains("ff"));
+    }
+
+    #[test]
+    fn utf8_diagnostic_reports_truncated_prefix_only_at_eof() {
+        let mut diagnostic = Utf8Diagnostic::new(true);
+        assert!(diagnostic
+            .observe(&[0xe6, 0x97], diagnostic_modes())
+            .is_empty());
+
+        let issues = diagnostic.finish();
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].offset, 0);
+        assert_eq!(issues[0].modes, diagnostic_modes());
+        assert_eq!(diagnostic.invalid_count, 0);
+        assert_eq!(diagnostic.incomplete_count, 1);
+    }
+
+    fn run_diagnostic_pipeline(chunks: &[&[u8]]) -> Vec<Utf8Issue> {
+        let (writer, _buf) = dummy_writer();
+        let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
+        let proxy = EventProxy { writer, winsize };
+        let term = Arc::new(Mutex::new(Term::new(
+            Config::default(),
+            &GridSize {
+                cols: 80,
+                lines: 24,
+            },
+            proxy,
+        )));
+        let mut processor: Processor = Processor::new();
+        let mut splitter = SixelSplitter::default();
+        let mut diagnostic = Utf8Diagnostic::new(true);
+        let mut issues = Vec::new();
+
+        for chunk in chunks {
+            for seg in splitter.feed(chunk) {
+                issues.extend(advance_pass_or_finish_boundary(
+                    &seg,
+                    &mut processor,
+                    &term,
+                    &mut diagnostic,
+                ));
+            }
+        }
+        issues.extend(diagnostic.finish());
+        issues
+    }
+
+    #[test]
+    fn utf8_prefix_interrupted_by_sixel_is_not_joined() {
+        let input = b"\xe6\x97\x1bPq~\x1b\\\xa5";
+        let issues = run_diagnostic_pipeline(&[input]);
+        assert_eq!(issues.len(), 2);
+        assert_eq!(issues[0].offset, 0);
+        assert_eq!(issues[1].offset, 8);
+
+        for split in 0..=input.len() {
+            assert_eq!(
+                run_diagnostic_pipeline(&[&input[..split], &input[split..]]),
+                issues,
+                "Sixel interruption changed at byte split {split}"
+            );
+        }
+    }
+
+    #[test]
+    fn utf8_issue_offsets_include_intercepted_osc_and_sixel_bytes() {
+        let cases: [(&[u8], u64); 2] = [
+            (b"\x1b]7;file:///tmp\x07\xff", 16),
+            (b"\x1bPq~\x1b\\\xff", 6),
+        ];
+
+        for (input, expected_offset) in cases {
+            let issues = run_diagnostic_pipeline(&[input]);
+            assert_eq!(issues.len(), 1);
+            assert_eq!(issues[0].offset, expected_offset);
+            for split in 0..=input.len() {
+                assert_eq!(
+                    run_diagnostic_pipeline(&[&input[..split], &input[split..]]),
+                    issues,
+                    "source offset changed at byte split {split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_issue_modes_follow_preceding_controls_independent_of_chunking() {
+        let input = b"\x1b[?1h\xff\x1b[?1l\xff";
+        let unsplit = run_diagnostic_pipeline(&[input]);
+        assert_eq!(unsplit.len(), 2);
+        assert!(unsplit[0].modes.application_cursor);
+        assert!(!unsplit[1].modes.application_cursor);
+
+        for split in 0..=input.len() {
+            assert_eq!(
+                run_diagnostic_pipeline(&[&input[..split], &input[split..]]),
+                unsplit,
+                "diagnostic mode changed at byte split {split}"
+            );
+        }
     }
 
     #[test]
@@ -2086,13 +2363,14 @@ mod tests {
 
     fn segs_to_debug(segs: &[Seg]) -> Vec<(char, String)> {
         segs.iter()
-            .map(|s| match s {
-                Seg::Pass(b) => ('P', String::from_utf8_lossy(b).into_owned()),
-                Seg::Sixel(b) => ('S', String::from_utf8_lossy(b).into_owned()),
-                Seg::Osc { code, payload } => match code {
+            .filter_map(|s| match s {
+                Seg::Pass { bytes, .. } => Some(('P', String::from_utf8_lossy(bytes).into_owned())),
+                Seg::Sixel(b) => Some(('S', String::from_utf8_lossy(b).into_owned())),
+                Seg::Osc { code, payload } => Some(match code {
                     OscCode::Cwd => ('7', payload.clone()),
                     OscCode::Gt => ('G', payload.clone()),
-                },
+                }),
+                Seg::Boundary => None,
             })
             .collect()
     }
