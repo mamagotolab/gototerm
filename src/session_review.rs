@@ -37,12 +37,18 @@ pub struct SessionReview {
 }
 
 impl SessionReview {
-    pub fn new(display: Display, viewport: Viewport, summary: SessionSummary) -> Self {
+    pub fn new(
+        display: Display,
+        viewport: Viewport,
+        scale_factor: f64,
+        summary: SessionSummary,
+    ) -> Self {
         let mut review = Self {
             view: TerminalView::with_viewport(
                 display,
                 viewport,
                 crate::TOYTERM_CONFIG.font_size,
+                scale_factor,
                 None,
             ),
             summary,
@@ -57,8 +63,15 @@ impl SessionReview {
     }
 
     pub fn change_font_size(&mut self, diff: i32) {
-        self.view.increase_font_size(diff);
-        self.rebuild();
+        if self.view.increase_font_size(diff) {
+            self.rebuild();
+        }
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if self.view.set_scale_factor(scale_factor) {
+            self.rebuild();
+        }
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {

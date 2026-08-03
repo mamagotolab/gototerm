@@ -454,6 +454,7 @@ impl Node {
         window: &Rc<Window>,
         display: &Display,
         command: Option<&[String]>,
+        scale_factor: f64,
         font_diff: i32,
     ) {
         match self {
@@ -476,6 +477,7 @@ impl Node {
                     window.clone(),
                     display.clone(),
                     vp,
+                    scale_factor,
                     cwd.as_deref(),
                     command,
                 ));
@@ -500,9 +502,23 @@ impl Node {
             }
             Node::Split(s) => {
                 if s.focus_first {
-                    s.first.split_focused(partition, window, display, command, font_diff);
+                    s.first.split_focused(
+                        partition,
+                        window,
+                        display,
+                        command,
+                        scale_factor,
+                        font_diff,
+                    );
                 } else {
-                    s.second.split_focused(partition, window, display, command, font_diff);
+                    s.second.split_focused(
+                        partition,
+                        window,
+                        display,
+                        command,
+                        scale_factor,
+                        font_diff,
+                    );
                 }
             }
             Node::Empty => {}
@@ -1020,6 +1036,17 @@ impl PreviewSlot {
         }
     }
 
+    fn set_scale_factor(&mut self, scale_factor: f64) {
+        match self {
+            PreviewSlot::Reader(reader) => reader.set_scale_factor(scale_factor),
+            PreviewSlot::Editor { win, saved } => {
+                win.set_scale_factor(scale_factor);
+                saved.set_scale_factor(scale_factor);
+            }
+            PreviewSlot::Empty => {}
+        }
+    }
+
     fn draw(&mut self, surface: &mut glium::Frame) {
         match self {
             PreviewSlot::Reader(reader) => reader.draw(surface),
@@ -1089,6 +1116,8 @@ pub struct Multiplexer {
     /// 設定の既定サイズからのフォント差分。あとから開くペイン・タブ・ランチャーにも
     /// この差分を適用して、画面全体の文字サイズを常に揃える。
     font_diff: i32,
+    /// 現在のモニターの論理px→物理px倍率。
+    scale_factor: f64,
 }
 
 impl Multiplexer {
@@ -1096,6 +1125,7 @@ impl Multiplexer {
         let window = Rc::new(window);
 
         let size = window.inner_size();
+        let scale_factor = window.scale_factor();
         let viewport = Viewport {
             x: 0,
             y: 0,
@@ -1107,10 +1137,12 @@ impl Multiplexer {
             display.clone(),
             viewport,
             crate::TOYTERM_CONFIG.status_bar_font_size,
+            scale_factor,
             None,
         );
-        let sidebar = Sidebar::new(display.clone(), viewport);
-        let preview_slot = PreviewSlot::Reader(ReaderPane::new(display.clone(), viewport));
+        let sidebar = Sidebar::new(display.clone(), viewport, scale_factor);
+        let preview_slot =
+            PreviewSlot::Reader(ReaderPane::new(display.clone(), viewport, scale_factor));
 
         let mut recent = RecentProjects::load();
         let initial_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
@@ -1120,6 +1152,7 @@ impl Multiplexer {
             window.clone(),
             display.clone(),
             viewport,
+            scale_factor,
             None,
         )));
         recent.record(&initial_cwd);
@@ -1151,6 +1184,7 @@ impl Multiplexer {
             sidebar_ratio: crate::TOYTERM_CONFIG.sidebar_ratio,
             preview_ratio: crate::TOYTERM_CONFIG.preview_ratio,
             font_diff: 0,
+            scale_factor,
         };
         mux.refresh_layout();
         // 設定で有効なら、起動直後にランチャーを重ねて出す。
@@ -1158,6 +1192,7 @@ impl Multiplexer {
             mux.launcher = Some(Launcher::new(
                 mux.display.clone(),
                 mux.viewport,
+                mux.scale_factor,
                 mux.recent.entries(),
             ));
             mux.startup_launcher = true;
@@ -1412,8 +1447,12 @@ impl Multiplexer {
             }
 
             Action::OpenLauncher => {
-                let mut launcher =
-                    Launcher::new(self.display.clone(), self.viewport, self.recent.entries());
+                let mut launcher = Launcher::new(
+                    self.display.clone(),
+                    self.viewport,
+                    self.scale_factor,
+                    self.recent.entries(),
+                );
                 if self.font_diff != 0 {
                     launcher.change_font_size(self.font_diff);
                 }
@@ -1459,10 +1498,16 @@ impl Multiplexer {
                 };
                 let window = self.window.clone();
                 let display = self.display.clone();
+                let scale_factor = self.scale_factor;
                 let font_diff = self.font_diff;
-                self.tabs[self.focus]
-                    .root
-                    .split_focused(partition, &window, &display, None, font_diff);
+                self.tabs[self.focus].root.split_focused(
+                    partition,
+                    &window,
+                    &display,
+                    None,
+                    scale_factor,
+                    font_diff,
+                );
             }
 
             Action::Focus(dir) => {
@@ -1524,6 +1569,23 @@ impl Multiplexer {
         }
     }
 
+    fn set_scale_factor(&mut self, scale_factor: f64) {
+        self.scale_factor = scale_factor;
+        for tab in &mut self.tabs {
+            tab.root
+                .for_each_leaf(&mut |window| window.set_scale_factor(scale_factor));
+        }
+        self.status_view.set_scale_factor(scale_factor);
+        self.sidebar.set_scale_factor(scale_factor);
+        self.preview_slot.set_scale_factor(scale_factor);
+        if let Some(launcher) = self.launcher.as_mut() {
+            launcher.set_scale_factor(scale_factor);
+        }
+        if let Some(review) = self.session_review.as_mut() {
+            review.set_scale_factor(scale_factor);
+        }
+    }
+
     fn open_tab_in(&mut self, cwd: Option<&Path>, command: Option<&[String]>) {
         self.focused_root().focused_leaf_mut().focus_changed(false);
 
@@ -1533,6 +1595,7 @@ impl Multiplexer {
             self.window.clone(),
             self.display.clone(),
             cvp,
+            self.scale_factor,
             cwd,
             command,
         ));
@@ -1575,6 +1638,7 @@ impl Multiplexer {
         self.session_review = Some(SessionReview::new(
             self.display.clone(),
             self.viewport,
+            self.scale_factor,
             summary,
         ));
         self.window.request_redraw();
@@ -1847,6 +1911,7 @@ impl Multiplexer {
             self.window.clone(),
             self.display.clone(),
             viewport,
+            self.scale_factor,
             cwd.as_deref(),
             Some(&command),
         ));
@@ -1977,7 +2042,7 @@ impl Multiplexer {
                     self.window.request_redraw();
                 }
 
-                WindowEvent::ScaleFactorChanged { .. } => {
+                WindowEvent::ScaleFactorChanged { scale_factor, .. } => {
                     // モニター間移動やマルチ→シングル切替で DPI(スケール)が変わると、
                     // ピクセルサイズが同じでもサーフェスが古いまま残ることがある。
                     // 実サイズで再同期し、遮蔽フラグも下ろして描き直す。直後に
@@ -1990,6 +2055,7 @@ impl Multiplexer {
                         w: new.width,
                         h: new.height,
                     };
+                    self.set_scale_factor(*scale_factor);
                     self.refresh_layout();
                     if let Some(launcher) = self.launcher.as_mut() {
                         launcher.set_viewport(self.viewport);

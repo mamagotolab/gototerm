@@ -34,12 +34,13 @@ pub struct ReaderPane {
 }
 
 impl ReaderPane {
-    pub fn new(display: Display, viewport: Viewport) -> Self {
+    pub fn new(display: Display, viewport: Viewport, scale_factor: f64) -> Self {
         let mut pane = Self {
             view: TerminalView::with_viewport(
                 display,
                 viewport,
                 crate::TOYTERM_CONFIG.font_size,
+                scale_factor,
                 None,
             ),
             preview: FilePreview::new(),
@@ -123,8 +124,21 @@ impl ReaderPane {
     }
 
     pub fn change_font_size(&mut self, size_diff: i32) {
-        self.view.increase_font_size(size_diff);
+        if !self.view.increase_font_size(size_diff) {
+            return;
+        }
         // 折り返し幅（列数）と画像の収まりが変わるので、本文を作り直す。
+        if self.update_fit() && self.preview.image().is_some() {
+            self.preview.refresh_current();
+        }
+        self.refresh_reader_document();
+        self.rebuild();
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if !self.view.set_scale_factor(scale_factor) {
+            return;
+        }
         if self.update_fit() && self.preview.image().is_some() {
             self.preview.refresh_current();
         }

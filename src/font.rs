@@ -15,6 +15,14 @@ thread_local! {
     static FT_LIBRARY: Library = freetype::Library::init().expect("FreeType init");
 }
 
+pub(crate) fn font_render_flags(is_windows: bool) -> LoadFlag {
+    if is_windows {
+        LoadFlag::RENDER
+    } else {
+        LoadFlag::RENDER | LoadFlag::TARGET_LIGHT
+    }
+}
+
 pub struct Font {
     face: Face,
 }
@@ -52,7 +60,7 @@ impl Font {
 
     fn render(&self, ch: char) -> Option<(RawImage2d<'_, u8>, GlyphMetrics)> {
         if let idx @ 1.. = self.face.get_char_index(ch as usize) {
-            let flags = LoadFlag::RENDER | LoadFlag::TARGET_LIGHT;
+            let flags = font_render_flags(cfg!(windows));
             self.face.load_glyph(idx, flags).expect("render");
             let glyph = self.face.glyph();
 
@@ -126,10 +134,6 @@ impl FontSet {
         self.fonts.get(&style)?.iter().find_map(|f| f.render(ch))
     }
 
-    pub fn fontsize(&self) -> u32 {
-        self.font_size
-    }
-
     pub fn set_fontsize(&mut self, new_size: u32) {
         self.font_size = new_size;
         for list in self.fonts.values_mut() {
@@ -143,6 +147,12 @@ impl FontSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_uses_standard_hinting_and_unix_keeps_light_hinting() {
+        assert!(!font_render_flags(true).contains(LoadFlag::TARGET_LIGHT));
+        assert!(font_render_flags(false).contains(LoadFlag::TARGET_LIGHT));
+    }
 
     // ディスク上の実フォントを FreeType にストリームさせても（from_file）、
     // ASCII と CJK の両方のグリフが引けることを確認する。file-based にしても

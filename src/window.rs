@@ -324,20 +324,28 @@ impl TerminalWindow {
         window: Rc<Window>,
         display: Display,
         viewport: Viewport,
+        scale_factor: f64,
         cwd: Option<&std::path::Path>,
     ) -> Self {
-        Self::with_viewport_command(window, display, viewport, cwd, None)
+        Self::with_viewport_command(window, display, viewport, scale_factor, cwd, None)
     }
 
     pub fn with_viewport_command(
         window: Rc<Window>,
         display: Display,
         viewport: Viewport,
+        scale_factor: f64,
         cwd: Option<&std::path::Path>,
         command: Option<&[String]>,
     ) -> Self {
         let font_size = crate::TOYTERM_CONFIG.font_size;
-        let view = TerminalView::with_viewport(display, viewport, font_size, Some((0, viewport.h)));
+        let view = TerminalView::with_viewport(
+            display,
+            viewport,
+            font_size,
+            scale_factor,
+            Some((0, viewport.h)),
+        );
 
         let terminal = {
             let parent_cwd = std::env::current_dir().expect("cwd");
@@ -489,6 +497,7 @@ impl TerminalWindow {
         log::debug!("viewport changed: {:?}", new_viewport);
         self.view.set_viewport(new_viewport);
         self.resize_buffer();
+        self.update_ime_position();
     }
 
     fn token_at(&self, row: usize, col: usize) -> Option<String> {
@@ -568,8 +577,17 @@ impl TerminalWindow {
 
     /// フォントサイズを差分だけ変える。セルが変わるので PTY のグリッドを組み直す。
     pub fn change_font_size(&mut self, size_diff: i32) {
-        self.view.increase_font_size(size_diff);
-        self.resize_buffer();
+        if self.view.increase_font_size(size_diff) {
+            self.resize_buffer();
+            self.update_ime_position();
+        }
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if self.view.set_scale_factor(scale_factor) {
+            self.resize_buffer();
+            self.update_ime_position();
+        }
     }
 
     fn resize_buffer(&mut self) {

@@ -64,13 +64,19 @@ pub struct Launcher {
 }
 
 impl Launcher {
-    pub fn new(display: Display, viewport: Viewport, recent: &[PathBuf]) -> Self {
+    pub fn new(
+        display: Display,
+        viewport: Viewport,
+        scale_factor: f64,
+        recent: &[PathBuf],
+    ) -> Self {
         let state = LauncherState::new(recent.to_vec());
         let mut launcher = Self {
             view: TerminalView::with_viewport(
                 display,
                 viewport,
                 crate::TOYTERM_CONFIG.font_size,
+                scale_factor,
                 None,
             ),
             state,
@@ -85,8 +91,15 @@ impl Launcher {
     }
 
     pub fn change_font_size(&mut self, size_diff: i32) {
-        self.view.increase_font_size(size_diff);
-        self.rebuild();
+        if self.view.increase_font_size(size_diff) {
+            self.rebuild();
+        }
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        if self.view.set_scale_factor(scale_factor) {
+            self.rebuild();
+        }
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {

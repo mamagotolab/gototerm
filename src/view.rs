@@ -55,9 +55,27 @@ pub enum Selection {
     },
 }
 
+fn normalized_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+pub(crate) fn physical_font_size(logical: u32, scale_factor: f64) -> u32 {
+    ((logical.max(1) as f64 * normalized_scale_factor(scale_factor)).round() as u32).max(1)
+}
+
+pub(crate) fn scale_change_requires_rebuild(old_scale: f64, new_scale: f64, logical: u32) -> bool {
+    physical_font_size(logical, old_scale) != physical_font_size(logical, new_scale)
+}
+
 pub struct TerminalView {
     fonts: FontSet,
     cache: GlyphCache,
+    logical_font_size: u32,
+    scale_factor: f64,
     viewport: Viewport,
     cell_size: CellSize,
     cell_max_over: i32,
@@ -101,10 +119,12 @@ impl TerminalView {
     pub fn with_viewport(
         display: Display,
         viewport: Viewport,
-        font_size: u32,
+        logical_font_size: u32,
+        scale_factor: f64,
         scroll_bar: Option<(u32, u32)>,
     ) -> Self {
-        let fonts = build_font_set(font_size);
+        let scale_factor = normalized_scale_factor(scale_factor);
+        let fonts = build_font_set(physical_font_size(logical_font_size, scale_factor));
 
         let (cell_size, cell_max_over) = calculate_cell_size(&fonts);
 
@@ -153,6 +173,8 @@ impl TerminalView {
         TerminalView {
             fonts,
             cache,
+            logical_font_size,
+            scale_factor,
 
             viewport,
             cell_size,
@@ -224,15 +246,34 @@ impl TerminalView {
         self.cell_size
     }
 
-    pub fn increase_font_size(&mut self, size_diff: i32) {
+    pub fn increase_font_size(&mut self, size_diff: i32) -> bool {
         log::debug!("increase font size: {} (diff)", size_diff);
 
-        {
-            let size = self.fonts.fontsize();
-            let new_size = (size as i32 + size_diff).max(1) as u32;
-            self.fonts.set_fontsize(new_size);
+        let new_logical_size = (self.logical_font_size as i32 + size_diff).max(1) as u32;
+        let old_physical_size = physical_font_size(self.logical_font_size, self.scale_factor);
+        let new_physical_size = physical_font_size(new_logical_size, self.scale_factor);
+        self.logical_font_size = new_logical_size;
+        if old_physical_size == new_physical_size {
+            return false;
         }
 
+        self.rebuild_font(new_physical_size);
+        true
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
+        let scale_factor = normalized_scale_factor(scale_factor);
+        let rebuild =
+            scale_change_requires_rebuild(self.scale_factor, scale_factor, self.logical_font_size);
+        self.scale_factor = scale_factor;
+        if rebuild {
+            self.rebuild_font(physical_font_size(self.logical_font_size, scale_factor));
+        }
+        rebuild
+    }
+
+    fn rebuild_font(&mut self, physical_font_size: u32) {
+        self.fonts.set_fontsize(physical_font_size);
         let (new_cell_size, new_cell_max_over) = calculate_cell_size(&self.fonts);
         self.cell_size = new_cell_size;
         self.cell_max_over = new_cell_max_over;
@@ -1018,8 +1059,21 @@ fn image_vertices(gl_rect: GlRect) -> [ImageVertex; 6] {
 
 #[cfg(test)]
 mod tests {
-    use super::embedded_font_data;
+    use super::{embedded_font_data, physical_font_size, scale_change_requires_rebuild};
     use std::rc::Rc;
+
+    #[test]
+    fn physical_font_size_preserves_one_x_and_rounds_scaled_sizes() {
+        assert_eq!(physical_font_size(18, 1.0), 18);
+        assert_eq!(physical_font_size(18, 1.25), 23);
+        assert_eq!(physical_font_size(18, 1.5), 27);
+    }
+
+    #[test]
+    fn repeated_scale_factor_does_not_request_rebuild() {
+        assert!(!scale_change_requires_rebuild(1.0, 1.0, 18));
+        assert!(scale_change_requires_rebuild(1.0, 1.5, 18));
+    }
 
     #[test]
     fn embedded_font_data_is_shared() {
