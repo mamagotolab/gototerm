@@ -957,7 +957,7 @@ fn advance_pass_or_finish_boundary(
             bytes,
         } => advance_pass(
             processor,
-            &mut *term.lock().unwrap(),
+            &mut term.lock().unwrap(),
             *source_offset,
             bytes,
             diagnostic,
