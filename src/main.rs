@@ -27,9 +27,16 @@ fn main() {
     // Setup env_logger
     let our_logs = concat!(module_path!(), "=debug");
     let env = env_logger::Env::default().default_filter_or(our_logs);
-    env_logger::Builder::from_env(env)
-        .format_timestamp(None)
-        .init();
+    let mut builder = env_logger::Builder::from_env(env);
+    builder.format_timestamp(None);
+    // Windows のリリース版はコンソールを持たない（windows_subsystem="windows"）
+    // ため、stderr に出したログは誰にも読めない。文字化けのような「実機でしか
+    // 起きない」問題を追えるよう、ログをファイルにも残す。
+    #[cfg(all(windows, not(debug_assertions)))]
+    if let Some(target) = open_log_file() {
+        builder.target(env_logger::Target::Pipe(Box::new(target)));
+    }
+    builder.init();
 
     let event_loop = winit::event_loop::EventLoopBuilder::new()
         .build()
@@ -48,6 +55,17 @@ fn main() {
             mux.on_event(&event, elwt);
         })
         .expect("run");
+}
+
+/// ログの出力先ファイル。crash.log と同じフォルダに gototerm.log として置く。
+/// 起動ごとに切り詰める（追記しない）。放置しても際限なく育たないようにする。
+#[cfg(all(windows, not(debug_assertions)))]
+fn open_log_file() -> Option<std::fs::File> {
+    let path = crash_log_path().with_file_name("gototerm.log");
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).ok()?;
+    }
+    std::fs::File::create(&path).ok()
 }
 
 /// パニック時にメッセージとバックトレースを crash.log へ追記する。
