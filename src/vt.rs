@@ -680,6 +680,120 @@ impl SixelSplitter {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DiagnosticModes {
+    application_cursor: bool,
+    alternate_screen: bool,
+    mouse: bool,
+}
+
+impl DiagnosticModes {
+    fn from_term<T>(term: &Term<T>) -> Self {
+        use alacritty_terminal::term::TermMode;
+
+        let mode = term.mode();
+        Self {
+            application_cursor: mode.contains(TermMode::APP_CURSOR),
+            alternate_screen: mode.contains(TermMode::ALT_SCREEN),
+            mouse: mode.intersects(TermMode::MOUSE_MODE),
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Utf8Issue {
+    offset: u64,
+    modes: DiagnosticModes,
+}
+
+impl std::fmt::Debug for Utf8Issue {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("Utf8Issue")
+            .field(&self.offset)
+            .field(&self.modes)
+            .finish()
+    }
+}
+
+struct Utf8Diagnostic {
+    enabled: bool,
+    pending: [u8; 3],
+    pending_len: u8,
+    stream_offset: u64,
+    invalid_count: u64,
+    incomplete_prefix_count: u64,
+}
+
+impl Utf8Diagnostic {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: [0; 3],
+            pending_len: 0,
+            stream_offset: 0,
+            invalid_count: 0,
+            incomplete_prefix_count: 0,
+        }
+    }
+
+    fn observe(&mut self, bytes: &[u8], modes: DiagnosticModes) -> Vec<Utf8Issue> {
+        if !self.enabled || bytes.is_empty() {
+            return Vec::new();
+        }
+
+        let pending_len = usize::from(self.pending_len);
+        let base_offset = self.stream_offset.saturating_sub(pending_len as u64);
+        self.stream_offset = self.stream_offset.saturating_add(bytes.len() as u64);
+
+        let mut input = Vec::with_capacity(pending_len + bytes.len());
+        input.extend_from_slice(&self.pending[..pending_len]);
+        input.extend_from_slice(bytes);
+        self.pending_len = 0;
+
+        let mut issues = Vec::new();
+        let mut cursor = 0;
+        while cursor < input.len() {
+            match std::str::from_utf8(&input[cursor..]) {
+                Ok(_) => break,
+                Err(error) => {
+                    cursor += error.valid_up_to();
+                    match error.error_len() {
+                        Some(invalid_len) => {
+                            let issue = Utf8Issue {
+                                offset: base_offset.saturating_add(cursor as u64),
+                                modes,
+                            };
+                            self.invalid_count = self.invalid_count.saturating_add(1);
+                            log::warn!(
+                                "UTF-8 diagnostic: invalid_sequence_count={} offset={} application_cursor={} alternate_screen={} mouse={}",
+                                self.invalid_count,
+                                issue.offset,
+                                issue.modes.application_cursor,
+                                issue.modes.alternate_screen,
+                                issue.modes.mouse,
+                            );
+                            issues.push(issue);
+                            cursor += invalid_len;
+                        }
+                        None => {
+                            let incomplete = &input[cursor..];
+                            debug_assert!(incomplete.len() <= self.pending.len());
+                            self.pending[..incomplete.len()].copy_from_slice(incomplete);
+                            self.pending_len = incomplete.len() as u8;
+                            self.incomplete_prefix_count =
+                                self.incomplete_prefix_count.saturating_add(1);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        issues
+    }
+}
+
 pub(crate) fn parse_osc7(payload: &str) -> Option<(String, PathBuf)> {
     let rest = payload.strip_prefix("file://")?;
     let slash = rest.find('/')?;
@@ -927,6 +1041,11 @@ impl VtTerminal {
             std::thread::spawn(move || {
                 let mut processor: Processor = Processor::new();
                 let mut splitter = SixelSplitter::default();
+                let diagnostics_enabled = matches!(
+                    std::env::var("GOTOTERM_UTF8_DIAGNOSTICS").as_deref(),
+                    Ok("1")
+                );
+                let mut utf8_diagnostic = Utf8Diagnostic::new(diagnostics_enabled);
                 let mut reader = reader;
                 let mut buf = [0u8; 4096];
                 loop {
@@ -937,6 +1056,10 @@ impl VtTerminal {
                                 match seg {
                                     Seg::Pass(bytes) => {
                                         let mut term = term.lock().unwrap();
+                                        if utf8_diagnostic.enabled {
+                                            let modes = DiagnosticModes::from_term(&*term);
+                                            let _ = utf8_diagnostic.observe(&bytes, modes);
+                                        }
                                         processor.advance(&mut *term, &bytes);
                                     }
                                     Seg::Sixel(payload) => {
@@ -1500,6 +1623,82 @@ mod tests {
         let buf = Arc::new(Mutex::new(Vec::<u8>::new()));
         let writer: SharedWriter = Arc::new(Mutex::new(Box::new(VecWriter(buf.clone()))));
         (writer, buf)
+    }
+
+    fn render_split_input(input: &[u8], split: usize) -> String {
+        let (writer, _buf) = dummy_writer();
+        let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
+        let proxy = EventProxy { writer, winsize };
+        let mut term = Term::new(
+            Config::default(),
+            &GridSize {
+                cols: 80,
+                lines: 24,
+            },
+            proxy,
+        );
+        let mut processor: Processor = Processor::new();
+        let mut splitter = SixelSplitter::default();
+
+        for chunk in [&input[..split], &input[split..]] {
+            for seg in splitter.feed(chunk) {
+                if let Seg::Pass(bytes) = seg {
+                    processor.advance(&mut term, &bytes);
+                }
+            }
+        }
+
+        term.bounds_to_string(
+            Point::new(Line(0), Column(0)),
+            Point::new(Line(23), Column(79)),
+        )
+    }
+
+    #[test]
+    fn utf8_render_is_independent_of_read_boundary() {
+        let cases: [&[u8]; 3] = [
+            "件名：再利用メール".as_bytes(),
+            "\x1b]7;file:///tmp\x07件名：再利用メール".as_bytes(),
+            "\x1bPq#0;2;100;0;0~\x1b\\件名：再利用メール".as_bytes(),
+        ];
+
+        for input in cases {
+            let unsplit = render_split_input(input, input.len());
+            assert!(unsplit.contains("件名：再利用メール"));
+            for split in 0..=input.len() {
+                assert_eq!(
+                    render_split_input(input, split),
+                    unsplit,
+                    "render changed at byte split {split}"
+                );
+            }
+        }
+    }
+
+    fn diagnostic_modes() -> DiagnosticModes {
+        DiagnosticModes {
+            application_cursor: true,
+            alternate_screen: false,
+            mouse: true,
+        }
+    }
+
+    #[test]
+    fn utf8_diagnostic_carries_incomplete_prefix_without_reporting_content() {
+        let mut diagnostic = Utf8Diagnostic::new(true);
+        assert!(diagnostic
+            .observe(&[0xe6, 0x97], diagnostic_modes())
+            .is_empty());
+        assert!(diagnostic.observe(&[0xa5], diagnostic_modes()).is_empty());
+    }
+
+    #[test]
+    fn utf8_diagnostic_issue_contains_position_and_modes_but_no_bytes() {
+        let mut diagnostic = Utf8Diagnostic::new(true);
+        let issues = diagnostic.observe(&[0xff], diagnostic_modes());
+        assert_eq!(issues[0].offset, 0);
+        assert_eq!(issues[0].modes, diagnostic_modes());
+        assert!(!format!("{issues:?}").contains("ff"));
     }
 
     #[test]

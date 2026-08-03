@@ -520,6 +520,26 @@ new_tab = "Ctrl+Shift+N"
 
 ---
 
+## トラブルシューティング
+
+### SSH先で日本語表示が崩れる場合
+
+PTY出力のUTF-8診断は、PowerShellで次のように明示的に有効化できます。
+
+```powershell
+$env:GOTOTERM_UTF8_DIAGNOSTICS = "1"
+./gototerm-windows-x64.exe
+```
+
+診断ログに記録するのは、不正なUTF-8の件数、PTY出力内の相対オフセット、
+その時点の端末モードだけです。メール本文や入力バイト列は記録しません。
+診断後は `Remove-Item Env:GOTOTERM_UTF8_DIAGNOSTICS` で環境変数を解除してください。
+
+gototermはメール本文の文字コードを判定・変換しません。診断でUTF-8の異常が
+見つからない場合は、SSH先のlocaleやmutt側のメール文字コード設定も確認してください。
+
+---
+
 ## 対応・非対応
 
 - ✅ 日本語入力（IME・インライン変換）、UTF-8、マウスレポート、ハードウェア描画
