@@ -40,6 +40,49 @@ pub(crate) struct GridSelection {
     pub(crate) block: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct ExpandedSelection {
+    selection_type: SelectionType,
+    anchor_left: Column,
+    anchor_right: Column,
+    forward: Option<bool>,
+}
+
+fn physical_selection_bounds<T>(
+    term: &Term<T>,
+    selection_type: SelectionType,
+    point: Point,
+) -> (Point, Point) {
+    let last_column = term.last_column();
+    if selection_type == SelectionType::Lines {
+        return (
+            Point::new(point.line, Column(0)),
+            Point::new(point.line, last_column),
+        );
+    }
+
+    let row = &term.grid()[point.line];
+    let delimiter = |column: Column| {
+        let ch = row[column].c;
+        ch.is_ascii_punctuation() || ch.is_ascii_whitespace()
+    };
+    if delimiter(point.column) {
+        return (point, point);
+    }
+
+    let mut left = point.column;
+    while left > 0 && !delimiter(left - 1) {
+        left -= 1;
+    }
+
+    let mut right = point.column;
+    while right < last_column && !delimiter(right + 1) {
+        right += 1;
+    }
+
+    (Point::new(point.line, left), Point::new(point.line, right))
+}
+
 fn selection_text_from_term<T>(term: &Term<T>, selection: GridSelection) -> String {
     let in_bounds = |point: Point| {
         point.line >= term.topmost_line()
@@ -207,6 +250,7 @@ pub struct VtTerminal {
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     child_pid: Option<u32>,
     shell_location: Arc<Mutex<Option<ShellLocation>>>,
+    selection_drag: Mutex<Option<ExpandedSelection>>,
 }
 
 fn window_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> WindowSize {
@@ -808,6 +852,7 @@ impl VtTerminal {
             last_alt,
             child_pid,
             shell_location,
+            selection_drag: Mutex::new(None),
         }
     }
 
@@ -902,6 +947,7 @@ impl VtTerminal {
         let mut term = self.term.lock().unwrap();
         term.grid_mut().clear_history();
         term.selection = None;
+        *self.selection_drag.lock().unwrap() = None;
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -922,13 +968,77 @@ impl VtTerminal {
     }
 
     pub(crate) fn start_selection(&self, selection_type: SelectionType, point: Point, side: Side) {
-        self.term.lock().unwrap().selection = Some(AlacSelection::new(selection_type, point, side));
+        let mut term = self.term.lock().unwrap();
+        let mut drag = self.selection_drag.lock().unwrap();
+
+        if matches!(
+            selection_type,
+            SelectionType::Semantic | SelectionType::Lines
+        ) {
+            let (start, end) = physical_selection_bounds(&term, selection_type, point);
+            let mut selection = AlacSelection::new(SelectionType::Simple, start, Side::Left);
+            selection.update(end, Side::Right);
+            term.selection = Some(selection);
+            *drag = Some(ExpandedSelection {
+                selection_type,
+                anchor_left: start.column,
+                anchor_right: end.column,
+                forward: None,
+            });
+        } else {
+            term.selection = Some(AlacSelection::new(selection_type, point, side));
+            *drag = None;
+        }
     }
 
     pub(crate) fn update_selection(&self, point: Point, side: Side) {
-        if let Some(selection) = self.term.lock().unwrap().selection.as_mut() {
-            selection.update(point, side);
+        let mut term = self.term.lock().unwrap();
+        let mut drag = self.selection_drag.lock().unwrap();
+        let Some(mut expanded) = *drag else {
+            if let Some(selection) = term.selection.as_mut() {
+                selection.update(point, side);
+            }
+            return;
+        };
+        let Some(range) = term
+            .selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(&term))
+        else {
+            *drag = None;
+            return;
+        };
+
+        let anchor_line = match expanded.forward {
+            Some(false) => range.end.line,
+            Some(true) | None => range.start.line,
+        };
+        let (current_start, current_end) =
+            physical_selection_bounds(&term, expanded.selection_type, point);
+        let forward = current_start.line > anchor_line
+            || (current_start.line == anchor_line && current_start.column >= expanded.anchor_left);
+
+        let mut selection = if forward {
+            AlacSelection::new(
+                SelectionType::Simple,
+                Point::new(anchor_line, expanded.anchor_left),
+                Side::Left,
+            )
+        } else {
+            AlacSelection::new(
+                SelectionType::Simple,
+                Point::new(anchor_line, expanded.anchor_right),
+                Side::Right,
+            )
+        };
+        if forward {
+            selection.update(current_end, Side::Right);
+        } else {
+            selection.update(current_start, Side::Left);
         }
+        term.selection = Some(selection);
+        expanded.forward = Some(forward);
+        *drag = Some(expanded);
     }
 
     pub(crate) fn grid_selection(&self) -> Option<GridSelection> {
@@ -943,6 +1053,7 @@ impl VtTerminal {
 
     pub(crate) fn clear_selection(&self) {
         self.term.lock().unwrap().selection = None;
+        *self.selection_drag.lock().unwrap() = None;
     }
 
     /// Copy the logical grid range without consulting the current viewport.
@@ -1441,6 +1552,31 @@ mod tests {
     }
 
     #[test]
+    fn semantic_selection_tracks_expanded_anchor_through_pty_output() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        let mut data = Vec::new();
+        for line in 0..8 {
+            data.extend_from_slice(format!("word{line}\r\n").as_bytes());
+        }
+        processor.advance(&mut *terminal.term.lock().unwrap(), &data);
+
+        let anchor = Point::new(Line(0), Column(2));
+        terminal.start_selection(SelectionType::Semantic, anchor, Side::Left);
+        terminal.update_selection(anchor, Side::Right);
+        let before = terminal.grid_selection().unwrap();
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "word5");
+
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"word8\r\n");
+
+        let after = terminal.grid_selection().unwrap();
+        assert_eq!(after.start.line, before.start.line - 1);
+        assert_eq!(after.end.line, before.end.line - 1);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "word5");
+    }
+
+    #[test]
     fn semantic_selection_preserves_ascii_punctuation_word_boundaries() {
         let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
         let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
@@ -1454,6 +1590,45 @@ mod tests {
             terminal.selection_text(terminal.grid_selection().unwrap()),
             "foo"
         );
+    }
+
+    #[test]
+    fn semantic_selection_on_punctuation_selects_only_that_cell() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"(foo)");
+
+        let anchor = Point::new(Line(0), Column(0));
+        terminal.start_selection(SelectionType::Semantic, anchor, Side::Left);
+        terminal.update_selection(anchor, Side::Right);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "(");
+    }
+
+    #[test]
+    fn semantic_selection_stops_at_soft_wrapped_physical_row() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(5, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"abcdefgh");
+
+        let anchor = Point::new(Line(0), Column(2));
+        terminal.start_selection(SelectionType::Semantic, anchor, Side::Left);
+        terminal.update_selection(anchor, Side::Right);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "abcde");
+    }
+
+    #[test]
+    fn line_selection_stops_at_soft_wrapped_physical_row() {
+        let command = vec!["sh".to_owned(), "-c".to_owned(), "exit 0".to_owned()];
+        let terminal = VtTerminal::new(5, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut *terminal.term.lock().unwrap(), b"abcdefgh");
+
+        let anchor = Point::new(Line(0), Column(2));
+        terminal.start_selection(SelectionType::Lines, anchor, Side::Left);
+        terminal.update_selection(anchor, Side::Right);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "abcde");
     }
 
     #[test]
