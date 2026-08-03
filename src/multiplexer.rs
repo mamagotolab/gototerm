@@ -183,6 +183,22 @@ trait WorkbenchVisibility {
     fn set_visible(&mut self, location: &ShellLocation, visible: bool);
 }
 
+trait WorkbenchViewInitializer {
+    fn ensure_initialized(&mut self);
+}
+
+fn ensure_focused_workbench_views<T>(
+    tabs: &[Tab<T>],
+    focus: usize,
+    sidebar: &mut impl WorkbenchViewInitializer,
+    preview: &mut impl WorkbenchViewInitializer,
+) {
+    if tabs[focus].workbench_visible {
+        sidebar.ensure_initialized();
+        preview.ensure_initialized();
+    }
+}
+
 impl WorkbenchVisibility for Sidebar {
     fn set_visible(&mut self, location: &ShellLocation, visible: bool) {
         Sidebar::set_visible(self, location, visible);
@@ -299,6 +315,7 @@ fn workbench_viewports(vp: Viewport, sidebar_ratio: f64, preview_ratio: f64) -> 
     }
 }
 
+#[cfg(test)]
 fn focused_workbench_viewports<T>(
     tabs: &[Tab<T>],
     focus: usize,
@@ -309,6 +326,22 @@ fn focused_workbench_viewports<T>(
     tabs[focus]
         .workbench_visible
         .then(|| workbench_viewports(content, sidebar_ratio, preview_ratio))
+}
+
+fn layout_for_focused_tab<T>(
+    tabs: &[Tab<T>],
+    focus: usize,
+    content: Viewport,
+    sidebar_ratio: f64,
+    preview_ratio: f64,
+) -> (WorkbenchViewports, Viewport) {
+    let panels = workbench_viewports(content, sidebar_ratio, preview_ratio);
+    let terminal = if tabs[focus].workbench_visible {
+        panels.terminal
+    } else {
+        content
+    };
+    (panels, terminal)
 }
 
 pub(crate) fn command_exists(command: &str) -> bool {
@@ -758,6 +791,21 @@ mod tests {
         visibility_calls: Vec<(ShellLocation, bool)>,
     }
 
+    #[derive(Default)]
+    struct RecordedWorkbenchViews {
+        initialized: bool,
+        initializations: usize,
+    }
+
+    impl WorkbenchViewInitializer for RecordedWorkbenchViews {
+        fn ensure_initialized(&mut self) {
+            if !self.initialized {
+                self.initialized = true;
+                self.initializations += 1;
+            }
+        }
+    }
+
     impl WorkbenchVisibility for RecordedWorkbench {
         fn set_visible(&mut self, location: &ShellLocation, visible: bool) {
             self.visibility_calls.push((location.clone(), visible));
@@ -896,6 +944,44 @@ mod tests {
     }
 
     #[test]
+    fn hidden_workbench_keeps_lazy_panel_viewports_current() {
+        let tabs = vec![Tab::new(())];
+        let content = Viewport {
+            x: 0,
+            y: 20,
+            w: 1000,
+            h: 700,
+        };
+
+        let (panels, terminal) = layout_for_focused_tab(&tabs, 0, content, 0.25, 0.5);
+
+        assert_eq!(
+            panels,
+            WorkbenchViewports {
+                sidebar: Viewport {
+                    x: 0,
+                    y: 20,
+                    w: 248,
+                    h: 700
+                },
+                preview: Viewport {
+                    x: 252,
+                    y: 20,
+                    w: 748,
+                    h: 348
+                },
+                terminal: Viewport {
+                    x: 252,
+                    y: 372,
+                    w: 748,
+                    h: 348
+                },
+            }
+        );
+        assert_eq!(terminal, content);
+    }
+
+    #[test]
     fn switching_tabs_restores_each_workbench_visibility() {
         let mut tabs = vec![Tab::new(()), Tab::new(())];
         tabs[0].workbench_visible = true;
@@ -911,6 +997,26 @@ mod tests {
         tabs.remove(1);
         assert!(tabs[0].workbench_visible);
         assert!(tabs[1].workbench_visible);
+    }
+
+    #[test]
+    fn workbench_views_are_lazy() {
+        let mut tabs = vec![Tab::new(())];
+        let mut sidebar = RecordedWorkbenchViews::default();
+        let mut reader = RecordedWorkbenchViews::default();
+
+        ensure_focused_workbench_views(&tabs, 0, &mut sidebar, &mut reader);
+        assert_eq!((sidebar.initializations, reader.initializations), (0, 0));
+
+        tabs[0].workbench_visible = true;
+        ensure_focused_workbench_views(&tabs, 0, &mut sidebar, &mut reader);
+        assert_eq!((sidebar.initializations, reader.initializations), (1, 1));
+
+        tabs[0].workbench_visible = false;
+        ensure_focused_workbench_views(&tabs, 0, &mut sidebar, &mut reader);
+        tabs[0].workbench_visible = true;
+        ensure_focused_workbench_views(&tabs, 0, &mut sidebar, &mut reader);
+        assert_eq!((sidebar.initializations, reader.initializations), (1, 1));
     }
 
     #[test]
@@ -1114,6 +1220,12 @@ impl PreviewSlot {
         }
     }
 
+    fn ensure_view_initialized(&mut self) {
+        if let Some(reader) = self.reader_mut() {
+            reader.ensure_view_initialized();
+        }
+    }
+
     fn visible_reader_mut(&mut self) -> Option<&mut ReaderPane> {
         match self {
             PreviewSlot::Reader(reader) => Some(reader),
@@ -1196,6 +1308,18 @@ impl PreviewSlot {
         if let PreviewSlot::Editor { win, .. } = self {
             out.extend(win.take_gt_messages());
         }
+    }
+}
+
+impl WorkbenchViewInitializer for Sidebar {
+    fn ensure_initialized(&mut self) {
+        self.ensure_view_initialized();
+    }
+}
+
+impl WorkbenchViewInitializer for PreviewSlot {
+    fn ensure_initialized(&mut self) {
+        self.ensure_view_initialized();
     }
 }
 
@@ -1331,6 +1455,12 @@ impl Multiplexer {
     }
 
     fn apply_focused_tab_workbench(&mut self) {
+        ensure_focused_workbench_views(
+            &self.tabs,
+            self.focus,
+            &mut self.sidebar,
+            &mut self.preview_slot,
+        );
         let location = self.focused_location();
         let previous_focus = WorkbenchFocus {
             sidebar: self.sidebar_focused,
@@ -1466,19 +1596,15 @@ impl Multiplexer {
         self.status_view.set_viewport(bar);
 
         let content = self.content_viewport();
-        let cvp = if let Some(viewports) = focused_workbench_viewports(
+        let (viewports, cvp) = layout_for_focused_tab(
             &self.tabs,
             self.focus,
             content,
             self.sidebar_ratio,
             self.preview_ratio,
-        ) {
-            self.sidebar.set_viewport(viewports.sidebar);
-            self.preview_slot.set_viewport(viewports.preview);
-            viewports.terminal
-        } else {
-            content
-        };
+        );
+        self.sidebar.set_viewport(viewports.sidebar);
+        self.preview_slot.set_viewport(viewports.preview);
         for tab in &mut self.tabs {
             tab.root.set_viewport(cvp);
         }

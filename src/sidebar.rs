@@ -12,7 +12,7 @@ use winit::{
 use crate::gt::AgentSignal;
 use crate::terminal::{Cell, Color, GraphicAttribute, Line};
 use crate::timeline::{format_age, Timeline};
-use crate::view::{TerminalView, Viewport};
+use crate::view::{LazyTerminalView, Viewport};
 use crate::vt::ShellLocation;
 use crate::watcher::{merge_kind, ChangeKind, FileChange, WorkspaceWatcher};
 use crate::workspace::{self, WorkspaceInfo};
@@ -38,7 +38,7 @@ fn sidebar_visibility_action(current: bool, requested: bool) -> SidebarVisibilit
 }
 
 pub struct Sidebar {
-    view: TerminalView,
+    view: LazyTerminalView,
     visible: bool,
     info: Option<WorkspaceInfo>,
     /// バックグラウンドで取得中の workspace 情報（git status は Windows では
@@ -77,7 +77,7 @@ pub struct Sidebar {
 impl Sidebar {
     pub fn new(display: Display, viewport: Viewport, scale_factor: f64) -> Self {
         Sidebar {
-            view: TerminalView::with_viewport(
+            view: LazyTerminalView::new(
                 display,
                 viewport,
                 crate::TOYTERM_CONFIG.font_size,
@@ -142,6 +142,12 @@ impl Sidebar {
         self.visible
     }
 
+    pub(crate) fn ensure_view_initialized(&mut self) {
+        if self.view.ensure_initialized() {
+            self.rebuild();
+        }
+    }
+
     pub fn set_focused(&mut self, focused: bool) {
         if self.focused == focused {
             return;
@@ -158,19 +164,24 @@ impl Sidebar {
         self.visible && self.view.viewport().contains(p)
     }
 
-    pub fn cell_height(&self) -> u32 {
-        self.view.cell_size().h
+    pub fn cell_height(&mut self) -> u32 {
+        self.ensure_view_initialized();
+        self.view
+            .get()
+            .expect("workbench view initialized")
+            .cell_size()
+            .h
     }
 
     pub fn on_click(&mut self, p: PhysicalPosition<f64>) -> Option<SidebarRequest> {
         if !self.contains(p) {
             return None;
         }
-        let Some(action) = sidebar_action_at(
-            &self.row_actions,
-            click_row(self.view.viewport(), self.view.cell_size().h, p),
-        )
-        .cloned() else {
+        let viewport = self.view.viewport();
+        let cell_height = self.cell_height();
+        let Some(action) =
+            sidebar_action_at(&self.row_actions, click_row(viewport, cell_height, p)).cloned()
+        else {
             return None;
         };
 
@@ -616,12 +627,16 @@ impl Sidebar {
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
         if self.visible {
-            self.view.draw(surface);
+            self.ensure_view_initialized();
+            self.view
+                .get_mut()
+                .expect("workbench view initialized")
+                .draw(surface);
         }
     }
 
     pub fn needs_redraw(&self) -> bool {
-        self.visible && self.view.needs_redraw()
+        self.visible && self.view.get().is_some_and(|view| view.needs_redraw())
     }
 
     pub fn refresh_if_stale(&mut self, location: &ShellLocation) {
@@ -820,12 +835,13 @@ impl Sidebar {
     }
 
     fn rebuild(&mut self) {
-        if !self.visible {
+        if !self.visible || !self.view.is_initialized() {
             return;
         }
 
-        let cols = (self.view.viewport().w / self.view.cell_size().w).max(1) as usize;
-        let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
+        let view = self.view.get().expect("workbench view initialized");
+        let cols = (view.viewport().w / view.cell_size().w).max(1) as usize;
+        let rows = (view.viewport().h / view.cell_size().h).max(1) as usize;
         let content_rows = rows.saturating_sub(usize::from(self.focused));
         let mut lines = Vec::new();
         let mut row_actions = Vec::new();
@@ -946,16 +962,19 @@ impl Sidebar {
         }
         self.row_actions = row_actions;
 
-        self.view.update_contents(|view| {
-            // ターミナル／ランチャーと同じ透過（セルの Color::Background クアッドで
-            // 半透明を出す）。区切りはマネージャの黒フレームクリアが担う。
-            view.bg_color = Color::Background;
-            view.skip_default_bg = false;
-            view.lines = lines;
-            view.images = Vec::new();
-            view.cursor = None;
-            view.selection_range = None;
-        });
+        self.view
+            .get_mut()
+            .expect("workbench view initialized")
+            .update_contents(|view| {
+                // ターミナル／ランチャーと同じ透過（セルの Color::Background クアッドで
+                // 半透明を出す）。区切りはマネージャの黒フレームクリアが担う。
+                view.bg_color = Color::Background;
+                view.skip_default_bg = false;
+                view.lines = lines;
+                view.images = Vec::new();
+                view.cursor = None;
+                view.selection_range = None;
+            });
     }
 
     fn apply_selection_style(&self, lines: &mut [Line], row_actions: &[Option<RowAction>]) {

@@ -12,7 +12,7 @@ use crate::config::resolve_editor;
 use crate::highlight::{self, HighlightedLine};
 use crate::preview::{FilePreview, PreviewLines};
 use crate::terminal::{Cell, Color, GraphicAttribute, Line, PositionedImage};
-use crate::view::{TerminalView, Viewport};
+use crate::view::{LazyTerminalView, Viewport};
 use crate::Display;
 
 const PLACEHOLDER: &str = "ファイルを選ぶか、AI がファイルを書くとここに表示されます";
@@ -23,7 +23,7 @@ const BODY_MARGIN: usize = 1;
 const LINE_NUMBER_FG: Color = Color::Rgb { rgba: 0x565F_89FF };
 
 pub struct ReaderPane {
-    view: TerminalView,
+    view: LazyTerminalView,
     preview: FilePreview,
     pinned: bool,
     focused: bool,
@@ -36,7 +36,7 @@ pub struct ReaderPane {
 impl ReaderPane {
     pub fn new(display: Display, viewport: Viewport, scale_factor: f64) -> Self {
         let mut pane = Self {
-            view: TerminalView::with_viewport(
+            view: LazyTerminalView::new(
                 display,
                 viewport,
                 crate::TOYTERM_CONFIG.font_size,
@@ -56,12 +56,27 @@ impl ReaderPane {
         pane
     }
 
+    pub(crate) fn ensure_view_initialized(&mut self) {
+        if self.view.ensure_initialized() {
+            if self.update_fit() && self.preview.image().is_some() {
+                self.preview.refresh_current();
+            }
+            self.refresh_reader_document();
+            self.rebuild();
+        }
+    }
+
     pub fn contains(&self, p: PhysicalPosition<f64>) -> bool {
         self.view.viewport().contains(p)
     }
 
-    pub fn cell_height(&self) -> u32 {
-        self.view.cell_size().h
+    pub fn cell_height(&mut self) -> u32 {
+        self.ensure_view_initialized();
+        self.view
+            .get()
+            .expect("workbench view initialized")
+            .cell_size()
+            .h
     }
 
     pub fn set_viewport(&mut self, viewport: Viewport) {
@@ -78,20 +93,27 @@ impl ReaderPane {
     /// 画像を収める領域（px）をビューポートから概算して preview に伝える。
     /// ヘッダ行ぶんはざっくり差し引く。戻り値 true=変わった。
     fn update_fit(&mut self) -> bool {
-        let vp = self.view.viewport();
-        let cw = self.view.cell_size().w.max(1);
-        let ch = self.view.cell_size().h.max(1);
+        let Some(view) = self.view.get() else {
+            return false;
+        };
+        let vp = view.viewport();
+        let cw = view.cell_size().w.max(1);
+        let ch = view.cell_size().h.max(1);
         let w = vp.w.saturating_sub(cw * 2);
         let h = vp.h.saturating_sub(ch * 5);
         self.preview.set_fit(w, h)
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
-        self.view.draw(surface);
+        self.ensure_view_initialized();
+        self.view
+            .get_mut()
+            .expect("workbench view initialized")
+            .draw(surface);
     }
 
     pub fn needs_redraw(&self) -> bool {
-        self.view.needs_redraw()
+        self.view.get().is_some_and(|view| view.needs_redraw())
     }
 
     pub fn is_following(&self) -> bool {
@@ -110,7 +132,9 @@ impl ReaderPane {
         if !self.contains(p) {
             return None;
         }
-        let row = click_row(self.view.viewport(), self.view.cell_size().h, p);
+        let viewport = self.view.viewport();
+        let cell_height = self.cell_height();
+        let row = click_row(viewport, cell_height, p);
         let action = self.row_actions.get(row).and_then(Option::as_ref)?.clone();
         self.run_action(action)
     }
@@ -336,8 +360,13 @@ impl ReaderPane {
     }
 
     fn rebuild(&mut self) {
-        let cols = (self.view.viewport().w / self.view.cell_size().w).max(1) as usize;
-        let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
+        let Some(view) = self.view.get() else {
+            return;
+        };
+        let viewport = view.viewport();
+        let cell_size = view.cell_size();
+        let cols = (viewport.w / cell_size.w).max(1) as usize;
+        let rows = (viewport.h / cell_size.h).max(1) as usize;
         // フォーカス中は最下行をキーヒントに使う（サイドバーと同じ）。
         let rows = rows.saturating_sub(usize::from(self.focused));
         let mut lines = Vec::new();
@@ -412,9 +441,9 @@ impl ReaderPane {
         let mut images = Vec::new();
         if let Some((rgb, w, h)) = self.preview.image() {
             let header_rows = lines.len();
-            let cw = self.view.cell_size().w.max(1);
+            let cw = cell_size.w.max(1);
             // 横方向は中央寄せ（画像が幅より小さいとき）。
-            let x_off = self.view.viewport().w.saturating_sub(w) / 2;
+            let x_off = viewport.w.saturating_sub(w) / 2;
             images.push(PositionedImage {
                 row: header_rows as isize,
                 col: (x_off / cw) as isize,
@@ -450,19 +479,25 @@ impl ReaderPane {
             );
         }
         self.row_actions = row_actions;
-        self.view.update_contents(|view| {
-            // ターミナル／ランチャーと同じ透過（セルの Color::Background クアッドで
-            // 半透明を出す）。区切りはマネージャの黒フレームクリアが担う。
-            view.bg_color = Color::Background;
-            view.skip_default_bg = false;
-            view.lines = lines;
-            view.images = images;
-            view.cursor = None;
-            view.selection_range = None;
-        });
+        self.view
+            .get_mut()
+            .expect("workbench view initialized")
+            .update_contents(|view| {
+                // ターミナル／ランチャーと同じ透過（セルの Color::Background クアッドで
+                // 半透明を出す）。区切りはマネージャの黒フレームクリアが担う。
+                view.bg_color = Color::Background;
+                view.skip_default_bg = false;
+                view.lines = lines;
+                view.images = images;
+                view.cursor = None;
+                view.selection_range = None;
+            });
     }
 
     fn refresh_reader_document(&mut self) {
+        if !self.view.is_initialized() {
+            return;
+        }
         self.reader_lines = if self.preview.target().is_none() {
             vec![styled_plain(PLACEHOLDER.to_owned(), Color::BrightBlack)]
         } else {
@@ -522,12 +557,14 @@ impl ReaderPane {
     }
 
     fn reader_wrap_cols(&self) -> usize {
-        let cols = (self.view.viewport().w / self.view.cell_size().w).max(1) as usize;
+        let view = self.view.get().expect("workbench view initialized");
+        let cols = (view.viewport().w / view.cell_size().w).max(1) as usize;
         cols.saturating_sub(1).max(1).min(READER_WRAP_MAX)
     }
 
     fn reader_body_slots(&self) -> usize {
-        let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
+        let view = self.view.get().expect("workbench view initialized");
+        let rows = (view.viewport().h / view.cell_size().h).max(1) as usize;
         let header_rows = usize::from(self.preview.target().is_some())
             + usize::from(self.preview.is_diff())
             + usize::from(self.preview.target_abs().is_some()) * 2

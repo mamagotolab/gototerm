@@ -71,6 +71,176 @@ pub(crate) fn scale_change_requires_rebuild(old_scale: f64, new_scale: f64, logi
     physical_font_size(logical, old_scale) != physical_font_size(logical, new_scale)
 }
 
+pub(crate) struct LazySlot<T> {
+    value: Option<T>,
+}
+
+impl<T> LazySlot<T> {
+    pub(crate) fn new() -> Self {
+        Self { value: None }
+    }
+
+    pub(crate) fn ensure_with(&mut self, factory: impl FnOnce() -> T) -> &mut T {
+        self.value.get_or_insert_with(factory)
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.value.is_some()
+    }
+
+    fn get(&self) -> Option<&T> {
+        self.value.as_ref()
+    }
+
+    fn get_mut(&mut self) -> Option<&mut T> {
+        self.value.as_mut()
+    }
+}
+
+/// OpenGL-backed terminal rendering resources which are created only when the
+/// workbench is first shown. Geometry and font state remain current while the
+/// resource is absent, so the first construction uses the latest window state.
+pub(crate) struct LazyTerminalView {
+    display: Display,
+    viewport: Viewport,
+    base_font_size: u32,
+    font_diff: i32,
+    scale_factor: f64,
+    scroll_bar: Option<(u32, u32)>,
+    view: LazySlot<TerminalView>,
+}
+
+impl LazyTerminalView {
+    pub(crate) fn new(
+        display: Display,
+        viewport: Viewport,
+        logical_font_size: u32,
+        scale_factor: f64,
+        scroll_bar: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            display,
+            viewport,
+            base_font_size: logical_font_size,
+            font_diff: 0,
+            scale_factor: normalized_scale_factor(scale_factor),
+            scroll_bar,
+            view: LazySlot::new(),
+        }
+    }
+
+    fn logical_font_size(&self) -> u32 {
+        (self.base_font_size as i64 + self.font_diff as i64).max(1) as u32
+    }
+
+    pub(crate) fn ensure_initialized(&mut self) -> bool {
+        if self.view.is_initialized() {
+            return false;
+        }
+
+        let display = self.display.clone();
+        let viewport = self.viewport;
+        let logical_font_size = self.logical_font_size();
+        let scale_factor = self.scale_factor;
+        let scroll_bar = self.scroll_bar;
+        self.view.ensure_with(|| {
+            log::debug!("initializing lazy workbench terminal view");
+            TerminalView::with_viewport(
+                display,
+                viewport,
+                logical_font_size,
+                scale_factor,
+                scroll_bar,
+            )
+        });
+        true
+    }
+
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.view.is_initialized()
+    }
+
+    pub(crate) fn viewport(&self) -> Viewport {
+        self.viewport
+    }
+
+    pub(crate) fn set_viewport(&mut self, viewport: Viewport) {
+        self.viewport = viewport;
+        if let Some(view) = self.view.get_mut() {
+            view.set_viewport(viewport);
+        }
+    }
+
+    pub(crate) fn increase_font_size(&mut self, size_diff: i32) -> bool {
+        let old_size = self.logical_font_size();
+        self.font_diff = self.font_diff.saturating_add(size_diff);
+        let new_size = self.logical_font_size();
+        let Some(view) = self.view.get_mut() else {
+            return false;
+        };
+        view.increase_font_size(new_size as i32 - old_size as i32)
+    }
+
+    pub(crate) fn set_scale_factor(&mut self, scale_factor: f64) -> bool {
+        self.scale_factor = normalized_scale_factor(scale_factor);
+        let Some(view) = self.view.get_mut() else {
+            return false;
+        };
+        view.set_scale_factor(self.scale_factor)
+    }
+
+    pub(crate) fn get(&self) -> Option<&TerminalView> {
+        self.view.get()
+    }
+
+    pub(crate) fn get_mut(&mut self) -> Option<&mut TerminalView> {
+        self.view.get_mut()
+    }
+}
+
+#[cfg(test)]
+mod lazy_tests {
+    use super::LazySlot;
+    use std::cell::Cell;
+
+    #[test]
+    fn lazy_resource_constructs_once_on_first_access() {
+        let calls = Cell::new(0);
+        let mut lazy = LazySlot::new();
+
+        assert!(!lazy.is_initialized());
+        assert_eq!(
+            *lazy.ensure_with(|| {
+                calls.set(calls.get() + 1);
+                42
+            }),
+            42
+        );
+        assert_eq!(
+            *lazy.ensure_with(|| {
+                calls.set(calls.get() + 1);
+                99
+            }),
+            42
+        );
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn lazy_resource_uses_state_from_the_first_access() {
+        let mut lazy = LazySlot::new();
+        let mut latest_scale = 1.0;
+        let mut latest_font_size = 18;
+
+        assert_eq!((latest_scale, latest_font_size), (1.0, 18));
+        latest_scale = 1.5;
+        latest_font_size += 2;
+        let resource = lazy.ensure_with(|| (latest_scale, latest_font_size));
+
+        assert_eq!(*resource, (1.5, 20));
+    }
+}
+
 pub struct TerminalView {
     fonts: FontSet,
     cache: GlyphCache,
