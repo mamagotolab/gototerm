@@ -22,6 +22,21 @@ const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const FILE_BROWSER_VISIBLE_ROWS: usize = 15;
 const FILE_BROWSER_MAX_ENTRIES: usize = 500;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SidebarVisibilityAction {
+    RefreshLocation,
+    Hide,
+    None,
+}
+
+fn sidebar_visibility_action(current: bool, requested: bool) -> SidebarVisibilityAction {
+    match (current, requested) {
+        (_, true) => SidebarVisibilityAction::RefreshLocation,
+        (true, false) => SidebarVisibilityAction::Hide,
+        (false, false) => SidebarVisibilityAction::None,
+    }
+}
+
 pub struct Sidebar {
     view: TerminalView,
     visible: bool,
@@ -107,16 +122,18 @@ impl Sidebar {
     }
 
     pub fn set_visible(&mut self, location: &ShellLocation, visible: bool) {
-        if self.visible == visible {
-            return;
-        }
-        self.visible = visible;
-        if visible {
-            self.refresh_location(location);
-        } else {
-            self.focused = false;
-            self.clear_live_state();
-            self.remote_location = None;
+        match sidebar_visibility_action(self.visible, visible) {
+            SidebarVisibilityAction::RefreshLocation => {
+                self.visible = true;
+                self.refresh_location(location);
+            }
+            SidebarVisibilityAction::Hide => {
+                self.visible = false;
+                self.focused = false;
+                self.clear_live_state();
+                self.remote_location = None;
+            }
+            SidebarVisibilityAction::None => {}
         }
     }
 
@@ -1879,12 +1896,20 @@ fn display_width(text: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        clamp_browse_scroll, click_row, keep_selection_visible, sidebar_action_at, sort_entries,
-        RowAction,
+        clamp_browse_scroll, click_row, keep_selection_visible, sidebar_action_at,
+        sidebar_visibility_action, sort_entries, RowAction, SidebarVisibilityAction,
     };
     use crate::view::Viewport;
     use std::path::PathBuf;
     use winit::dpi::PhysicalPosition;
+
+    #[test]
+    fn visible_sidebar_refreshes_location_again() {
+        assert_eq!(
+            sidebar_visibility_action(true, true),
+            SidebarVisibilityAction::RefreshLocation
+        );
+    }
 
     #[test]
     fn click_row_uses_viewport_origin_and_cell_height() {

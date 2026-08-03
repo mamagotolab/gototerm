@@ -92,6 +92,65 @@ impl<T> Tab<T> {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct WorkbenchFocus {
+    sidebar: bool,
+    editor: bool,
+    reader: bool,
+}
+
+impl WorkbenchFocus {
+    fn terminal_should_focus(self) -> bool {
+        !self.sidebar && !self.editor && !self.reader
+    }
+}
+
+trait WorkbenchVisibility {
+    fn set_visible(&mut self, location: &ShellLocation, visible: bool);
+}
+
+impl WorkbenchVisibility for Sidebar {
+    fn set_visible(&mut self, location: &ShellLocation, visible: bool) {
+        Sidebar::set_visible(self, location, visible);
+    }
+}
+
+fn synchronize_focused_tab_workbench<T>(
+    tabs: &[Tab<T>],
+    focus: usize,
+    location: &ShellLocation,
+    workbench: &mut impl WorkbenchVisibility,
+    current_focus: WorkbenchFocus,
+) -> WorkbenchFocus {
+    let visible = tabs[focus].workbench_visible;
+    workbench.set_visible(location, visible);
+    if visible {
+        current_focus
+    } else {
+        WorkbenchFocus::default()
+    }
+}
+
+fn adjacent_tab_index(focus: usize, tab_count: usize, next: bool) -> usize {
+    if next {
+        (focus + 1) % tab_count
+    } else {
+        (focus + tab_count - 1) % tab_count
+    }
+}
+
+fn remove_tab<T>(tabs: &mut Vec<Tab<T>>, focus: &mut usize, index: usize) -> Tab<T> {
+    let removed = tabs.remove(index);
+    if !tabs.is_empty() {
+        if index < *focus {
+            *focus -= 1;
+        } else if *focus >= tabs.len() {
+            *focus = tabs.len() - 1;
+        }
+    }
+    removed
+}
+
 struct SplitNode {
     partition: Partition,
     ratio: f64,
@@ -164,6 +223,18 @@ fn workbench_viewports(vp: Viewport, sidebar_ratio: f64, preview_ratio: f64) -> 
         preview,
         terminal,
     }
+}
+
+fn focused_workbench_viewports<T>(
+    tabs: &[Tab<T>],
+    focus: usize,
+    content: Viewport,
+    sidebar_ratio: f64,
+    preview_ratio: f64,
+) -> Option<WorkbenchViewports> {
+    tabs[focus]
+        .workbench_visible
+        .then(|| workbench_viewports(content, sidebar_ratio, preview_ratio))
 }
 
 pub(crate) fn command_exists(command: &str) -> bool {
@@ -542,6 +613,148 @@ impl Node {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Default)]
+    struct RecordedWorkbench {
+        visibility_calls: Vec<(ShellLocation, bool)>,
+    }
+
+    impl WorkbenchVisibility for RecordedWorkbench {
+        fn set_visible(&mut self, location: &ShellLocation, visible: bool) {
+            self.visibility_calls.push((location.clone(), visible));
+        }
+    }
+
+    #[test]
+    fn visible_tab_sync_preserves_workbench_focus_and_refreshes_location() {
+        let mut tabs = vec![Tab::new(()), Tab::new(())];
+        tabs[0].workbench_visible = true;
+        tabs[1].workbench_visible = true;
+        let location = ShellLocation::Local(PathBuf::from("/second-tab"));
+        let focus = WorkbenchFocus {
+            sidebar: true,
+            editor: false,
+            reader: false,
+        };
+        let mut workbench = RecordedWorkbench::default();
+        let selected = adjacent_tab_index(0, tabs.len(), true);
+
+        let synced =
+            synchronize_focused_tab_workbench(&tabs, selected, &location, &mut workbench, focus);
+
+        assert_eq!(synced, focus, "表示中のサイドバーフォーカスを保つ");
+        assert_eq!(
+            workbench.visibility_calls,
+            vec![(location, true)],
+            "表示中同士の切替でも新しい現在地を即時反映する"
+        );
+    }
+
+    #[test]
+    fn hidden_tab_sync_releases_all_workbench_focus() {
+        let tabs = vec![Tab::new(())];
+        let location = ShellLocation::Local(PathBuf::from("/hidden-tab"));
+        let mut workbench = RecordedWorkbench::default();
+
+        let synced = synchronize_focused_tab_workbench(
+            &tabs,
+            0,
+            &location,
+            &mut workbench,
+            WorkbenchFocus {
+                sidebar: true,
+                editor: true,
+                reader: true,
+            },
+        );
+
+        assert_eq!(synced, WorkbenchFocus::default());
+        assert!(synced.terminal_should_focus());
+        assert_eq!(workbench.visibility_calls, vec![(location, false)]);
+    }
+
+    #[test]
+    fn removing_background_tab_keeps_visible_focus_state_attached() {
+        let mut tabs = vec![Tab::new("first"), Tab::new("focused"), Tab::new("last")];
+        tabs[1].workbench_visible = true;
+        let mut focus = 1;
+        let location = ShellLocation::Local(PathBuf::from("/focused"));
+        let workbench_focus = WorkbenchFocus {
+            sidebar: true,
+            editor: false,
+            reader: false,
+        };
+        let mut workbench = RecordedWorkbench::default();
+
+        let removed = remove_tab(&mut tabs, &mut focus, 0);
+        let synced = synchronize_focused_tab_workbench(
+            &tabs,
+            focus,
+            &location,
+            &mut workbench,
+            workbench_focus,
+        );
+
+        assert_eq!(removed.root, "first");
+        assert_eq!(focus, 0);
+        assert_eq!(tabs[focus].root, "focused");
+        assert!(tabs[focus].workbench_visible);
+        assert_eq!(
+            synced, workbench_focus,
+            "背景タブ削除でフォーカスを奪わない"
+        );
+        assert_eq!(workbench.visibility_calls, vec![(location, true)]);
+    }
+
+    #[test]
+    fn startup_replacement_applies_selected_tabs_visibility() {
+        let mut tabs = vec![Tab::new("startup"), Tab::new("selected")];
+        tabs[0].workbench_visible = true;
+        let mut focus = 1;
+        let location = ShellLocation::Local(PathBuf::from("/selected"));
+        let mut workbench = RecordedWorkbench::default();
+
+        let removed = remove_tab(&mut tabs, &mut focus, 0);
+        let synced = synchronize_focused_tab_workbench(
+            &tabs,
+            focus,
+            &location,
+            &mut workbench,
+            WorkbenchFocus {
+                sidebar: true,
+                editor: false,
+                reader: false,
+            },
+        );
+
+        assert_eq!(removed.root, "startup");
+        assert_eq!(focus, 0);
+        assert_eq!(tabs[focus].root, "selected");
+        assert!(!tabs[focus].workbench_visible);
+        assert_eq!(synced, WorkbenchFocus::default());
+        assert_eq!(workbench.visibility_calls, vec![(location, false)]);
+    }
+
+    #[test]
+    fn focused_tab_flag_selects_terminal_viewport() {
+        let mut tabs = vec![Tab::new(()), Tab::new(())];
+        tabs[0].workbench_visible = true;
+        let content = Viewport {
+            x: 0,
+            y: 20,
+            w: 1000,
+            h: 700,
+        };
+
+        let visible = focused_workbench_viewports(&tabs, 0, content, 0.25, 0.5);
+        let hidden = focused_workbench_viewports(&tabs, 1, content, 0.25, 0.5);
+
+        assert_eq!(
+            visible.unwrap().terminal,
+            workbench_viewports(content, 0.25, 0.5).terminal
+        );
+        assert_eq!(hidden, None);
+    }
 
     #[test]
     fn switching_tabs_restores_each_workbench_visibility() {
@@ -961,26 +1174,38 @@ impl Multiplexer {
     }
 
     fn apply_focused_tab_workbench(&mut self) {
-        let visible = self.tabs[self.focus].workbench_visible;
         let location = self.focused_location();
-        self.sidebar.set_visible(&location, visible);
+        let previous_focus = WorkbenchFocus {
+            sidebar: self.sidebar_focused,
+            editor: self.editor_focused,
+            reader: self.reader_focused,
+        };
+        let synced_focus = synchronize_focused_tab_workbench(
+            &self.tabs,
+            self.focus,
+            &location,
+            &mut self.sidebar,
+            previous_focus,
+        );
 
-        if self.sidebar_focused {
+        if previous_focus.sidebar && !synced_focus.sidebar {
             self.sidebar_focused = false;
             self.sidebar.set_focused(false);
         }
-        if self.editor_focused {
+        if previous_focus.editor && !synced_focus.editor {
             if let Some(editor) = self.preview_slot.editor_mut() {
                 editor.focus_changed(false);
             }
             self.editor_focused = false;
         }
-        if self.reader_focused {
+        if previous_focus.reader && !synced_focus.reader {
             self.unfocus_reader();
         }
 
         self.refresh_layout();
-        self.focused_root().focused_leaf_mut().focus_changed(true);
+        if synced_focus.terminal_should_focus() {
+            self.focused_root().focused_leaf_mut().focus_changed(true);
+        }
     }
 
     /// フォーカスを矢印方向へ動かす。ワークベンチ表示中は3領域
@@ -1083,17 +1308,19 @@ impl Multiplexer {
         };
         self.status_view.set_viewport(bar);
 
-        let cvp = if self.tabs[self.focus].workbench_visible {
-            let viewports = workbench_viewports(
-                self.content_viewport(),
-                self.sidebar_ratio,
-                self.preview_ratio,
-            );
+        let content = self.content_viewport();
+        let cvp = if let Some(viewports) = focused_workbench_viewports(
+            &self.tabs,
+            self.focus,
+            content,
+            self.sidebar_ratio,
+            self.preview_ratio,
+        ) {
             self.sidebar.set_viewport(viewports.sidebar);
             self.preview_slot.set_viewport(viewports.preview);
             viewports.terminal
         } else {
-            self.content_viewport()
+            content
         };
         for tab in &mut self.tabs {
             tab.root.set_viewport(cvp);
@@ -1197,13 +1424,11 @@ impl Multiplexer {
             Action::CloseFocused => {
                 let tab_empty = self.tabs[self.focus].root.close_focused();
                 if tab_empty {
-                    self.tabs.remove(self.focus);
+                    let removed_index = self.focus;
+                    remove_tab(&mut self.tabs, &mut self.focus, removed_index);
                     if self.tabs.is_empty() {
                         self.exited = true;
                         return;
-                    }
-                    if self.focus >= self.tabs.len() {
-                        self.focus = self.tabs.len() - 1;
                     }
                     self.apply_focused_tab_workbench();
                 } else {
@@ -1218,11 +1443,11 @@ impl Multiplexer {
                     return;
                 }
                 self.focused_root().focused_leaf_mut().focus_changed(false);
-                let n = self.tabs.len();
-                self.focus = match action {
-                    Action::NextTab => (self.focus + 1) % n,
-                    _ => (self.focus + n - 1) % n,
-                };
+                self.focus = adjacent_tab_index(
+                    self.focus,
+                    self.tabs.len(),
+                    matches!(action, Action::NextTab),
+                );
                 self.apply_focused_tab_workbench();
                 self.update_status_bar();
             }
@@ -1415,8 +1640,7 @@ impl Multiplexer {
         // 起動時ランチャーで選んだ場合、自動で立った最初の空シェルタブを畳む。
         if replace_startup && self.tabs.len() > 1 {
             self.tabs[0].root.close_focused(); // 最初のタブは単一ペイン＝PTY を閉じる
-            self.tabs.remove(0);
-            self.focus = self.tabs.len() - 1;
+            remove_tab(&mut self.tabs, &mut self.focus, 0);
             self.apply_focused_tab_workbench();
             self.update_status_bar();
         }
@@ -2046,7 +2270,7 @@ impl Multiplexer {
                         changed = true;
                     }
                     if empty {
-                        self.tabs.remove(i);
+                        remove_tab(&mut self.tabs, &mut self.focus, i);
                         changed = true;
                         tab_removed = true;
                         if self.tabs.is_empty() {
@@ -2057,14 +2281,6 @@ impl Multiplexer {
                             self.exited = true;
                             elwt.exit();
                             return;
-                        }
-                        // フォーカス index を取り除いた位置に合わせて補正する。
-                        if i < self.focus {
-                            self.focus -= 1;
-                        } else if i == self.focus {
-                            if self.focus >= self.tabs.len() {
-                                self.focus = self.tabs.len() - 1;
-                            }
                         }
                         // remove(i) で詰めたので i はそのまま次のタブを指す。
                     } else {
