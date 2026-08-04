@@ -1323,17 +1323,57 @@ fn calculate_cell_size(fonts: &FontSet) -> (CellSize, i32) {
     }
 
     let cell_w = max_advance_x as u32;
-    let cell_h = (max_over + max_under) as u32;
 
-    log::debug!("cell size: {}x{} (px)", cell_w, cell_h);
+    // 高さはフォントが宣言している行の高さを使う。
+    //
+    // ASCII のインク範囲だけから決めると、フォントが確保している行の高さより
+    // 小さくなる（JetBrains Mono NF の font_size=24 で 26px 対 31.7px＝18%小さい）。
+    // セルが縮むと1文字あたりのピクセルが減って解像度が落ち、セルいっぱいに
+    // 設計された PowerLine の記号も収まらなくなる。実機で Windows Terminal /
+    // WezTerm と並べた画像を測ったところ、帯の高さが 21px 対 25px だった。
+    //
+    // ASCII のインク範囲は下限として残す。フォントの申告値が小さい場合でも
+    // グリフが欠けないようにする。
+    let (font_ascender, font_line_height) = fonts
+        .primary_line_metrics()
+        .unwrap_or((max_over, max_over + max_under));
+    let (cell_h, baseline) =
+        cell_height_and_baseline(max_over, max_under, font_ascender, font_line_height);
+
+    log::debug!(
+        "cell size: {}x{} (px) baseline={} (ASCIIのインク範囲だけなら {}x{})",
+        cell_w,
+        cell_h,
+        baseline,
+        cell_w,
+        max_over + max_under
+    );
 
     (
         CellSize {
             w: cell_w,
             h: cell_h,
         },
-        max_over,
+        baseline,
     )
+}
+
+/// セルの高さとベースライン位置を決める。
+///
+/// `ascii_over` / `ascii_under` は ASCII 文字が実際にインクを置いている範囲。
+/// `font_ascender` / `font_line_height` はフォントが宣言している値。
+///
+/// フォントの申告値を採るが、ASCII のインク範囲は下限として守る。申告値が
+/// 小さいフォントでもグリフが欠けないようにするため。
+fn cell_height_and_baseline(
+    ascii_over: i32,
+    ascii_under: i32,
+    font_ascender: i32,
+    font_line_height: i32,
+) -> (u32, i32) {
+    let baseline = max(ascii_over, font_ascender);
+    let cell_h = max(baseline + ascii_under, font_line_height).max(1) as u32;
+    (cell_h, baseline)
 }
 
 fn color_to_rgba(color: Color) -> u32 {
@@ -1522,12 +1562,38 @@ fn image_vertices(gl_rect: GlRect) -> [ImageVertex; 6] {
 #[cfg(test)]
 mod tests {
     use super::{
-        cell_rect, embedded_font_data, is_cell_filling_separator, physical_font_size,
-        pick_existing, scale_change_requires_rebuild, CellSize, SYSTEM_FALLBACK_BOLD,
-        SYSTEM_FALLBACK_REGULAR,
+        cell_height_and_baseline, cell_rect, embedded_font_data, is_cell_filling_separator,
+        physical_font_size, pick_existing, scale_change_requires_rebuild, CellSize,
+        SYSTEM_FALLBACK_BOLD, SYSTEM_FALLBACK_REGULAR,
     };
     use std::path::{Path, PathBuf};
     use std::rc::Rc;
+
+    #[test]
+    fn cell_height_follows_the_font_declared_line_height() {
+        // JetBrains Mono NF, font_size=24 の実測値。
+        // ASCII のインク範囲だけなら 26px だが、フォントは 31px の行を宣言している。
+        // 小さい方を採ると1文字あたりのピクセルが減り、セルいっぱいに設計された
+        // PowerLine の記号も収まらない。
+        let (h, baseline) = cell_height_and_baseline(19, 7, 24, 31);
+        assert_eq!(h, 31, "フォントの行の高さを使う");
+        assert_eq!(baseline, 24, "ベースラインはフォントの ascender");
+    }
+
+    #[test]
+    fn ascii_ink_extent_is_kept_as_a_floor() {
+        // フォントの申告値が小さい場合でもグリフを欠けさせない。
+        let (h, baseline) = cell_height_and_baseline(30, 12, 20, 24);
+        assert_eq!(baseline, 30, "ASCII の上方向のインクを守る");
+        assert_eq!(h, 42, "上下のインクが収まる高さを確保する");
+    }
+
+    #[test]
+    fn cell_height_is_never_zero() {
+        // メトリクスが取れない異常時でも 0 除算やゼロ高さのセルを作らない。
+        let (h, _) = cell_height_and_baseline(0, 0, 0, 0);
+        assert!(h >= 1);
+    }
 
     #[test]
     fn only_powerline_separators_are_drawn_cell_filling() {

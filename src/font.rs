@@ -52,6 +52,17 @@ impl Font {
         self.face.set_pixel_sizes(0, size).unwrap();
     }
 
+    /// フォントが宣言している行の情報（ascender, 行の高さ）を px で返す。
+    ///
+    /// ASCII のインク範囲から高さを決めると、フォントが確保している行の高さより
+    /// 小さくなる（JetBrains Mono NF の font_size=24 で実測 26px 対 31.7px＝18%小さい）。
+    /// セルが縮むと1文字あたりのピクセルが減って解像度が落ち、セルいっぱいに
+    /// 設計された PowerLine の記号も収まらなくなる。
+    fn line_metrics(&self) -> Option<(i32, i32)> {
+        let m = self.face.size_metrics()?;
+        Some(((m.ascender >> 6) as i32, (m.height >> 6) as i32))
+    }
+
     fn metrics(&self, ch: char) -> Option<GlyphMetrics> {
         if let idx @ 1.. = self.face.get_char_index(ch as usize) {
             self.face.load_glyph(idx, LoadFlag::DEFAULT).expect("load");
@@ -144,6 +155,15 @@ impl FontSet {
                 f.set_fontsize(new_size);
             }
         }
+    }
+
+    /// 主フォント（Regular の先頭）が宣言している (ascender, 行の高さ) を px で返す。
+    ///
+    /// フォールバックではなく主フォントを見るのが重要。和文フォントは行が高い
+    /// ものが多く（Noto Sans CJK は ascender が em の 1.16 倍）、最大値を採ると
+    /// 行間が不必要に広がってしまう。セル幅を主フォントから決めているのと揃える。
+    pub fn primary_line_metrics(&self) -> Option<(i32, i32)> {
+        self.fonts.get(&FontStyle::Regular)?.first()?.line_metrics()
     }
 }
 
