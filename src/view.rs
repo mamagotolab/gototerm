@@ -463,8 +463,13 @@ pub struct TerminalView {
     program_img: glium::Program,
     vertices_fg: Vec<CellVertex>,
     vertices_bg: Vec<CellVertex>,
+    // PowerLine の区切り記号だけを分けて積む。セルに合わせて縮めるので、
+    // Nearest だと斜辺の刻みが不均一になる（実測で 1px ずつでなく飛ぶ）。
+    // ここだけ Linear で描くため描画バッチを分ける。
+    vertices_scaled: Vec<CellVertex>,
     draw_queries_fg: Vec<DrawQuery<CellVertex>>,
     draw_queries_bg: Vec<DrawQuery<CellVertex>>,
+    draw_queries_scaled: Vec<DrawQuery<CellVertex>>,
     draw_queries_img: Vec<DrawQuery<ImageVertex>>,
     clock: std::time::Instant,
 }
@@ -557,8 +562,10 @@ impl TerminalView {
             program_img,
             vertices_fg: Vec::new(),
             vertices_bg: Vec::new(),
+            vertices_scaled: Vec::new(),
             draw_queries_fg: Vec::new(),
             draw_queries_bg: Vec::new(),
+            draw_queries_scaled: Vec::new(),
             draw_queries_img: Vec::new(),
             clock: std::time::Instant::now(),
         }
@@ -690,8 +697,10 @@ impl TerminalView {
 
         self.vertices_fg.clear();
         self.vertices_bg.clear();
+        self.vertices_scaled.clear();
         self.draw_queries_fg.clear();
         self.draw_queries_bg.clear();
+        self.draw_queries_scaled.clear();
 
         // clear entire screen
         {
@@ -855,7 +864,11 @@ impl TerminalView {
                             let uv_rect = region.to_uv(texture.width(), texture.height());
 
                             let vs = glyph_vertices(gl_rect, uv_rect, fg, bg, blinking);
-                            self.vertices_fg.extend_from_slice(&vs);
+                            if is_cell_filling_separator(cell.ch) {
+                                self.vertices_scaled.extend_from_slice(&vs);
+                            } else {
+                                self.vertices_fg.extend_from_slice(&vs);
+                            }
                         }
                     }
                     Ok(None) => {
@@ -1049,6 +1062,14 @@ impl TerminalView {
             });
         }
 
+        if !self.vertices_scaled.is_empty() {
+            let vb = glium::VertexBuffer::new(&self.display, &self.vertices_scaled).unwrap();
+            self.draw_queries_scaled.push(DrawQuery {
+                vertices: vb,
+                texture: texture.clone(),
+            });
+        }
+
         if !self.vertices_bg.is_empty() {
             let vb_bg = glium::VertexBuffer::new(&self.display, &self.vertices_bg).unwrap();
             self.draw_queries_bg.push(DrawQuery {
@@ -1091,13 +1112,27 @@ impl TerminalView {
             surface.clear(Some(&rect), Some((r, g, b, a)), true, None, None);
         }
 
-        for query in iter_bg.chain(iter_fg) {
-            // 文字は等倍で描くので Nearest にしてにじみを抑え、輪郭をくっきりさせる。
-            let sampler = query
-                .texture
-                .sampled()
-                .magnify_filter(uniforms::MagnifySamplerFilter::Nearest)
-                .minify_filter(uniforms::MinifySamplerFilter::Nearest);
+        // 通常の文字は等倍なので Nearest（にじみを抑えて輪郭をくっきりさせる）。
+        // PowerLine の区切り記号はセルに合わせて縮めるので Linear。Nearest で縮めると
+        // 行が間引かれて斜辺の刻みが不均一になり、継ぎ目が汚く見える。
+        for (query, smooth) in iter_bg
+            .chain(iter_fg)
+            .map(|q| (q, false))
+            .chain(self.draw_queries_scaled.iter().map(|q| (q, true)))
+        {
+            let sampler = if smooth {
+                query
+                    .texture
+                    .sampled()
+                    .magnify_filter(uniforms::MagnifySamplerFilter::Linear)
+                    .minify_filter(uniforms::MinifySamplerFilter::Linear)
+            } else {
+                query
+                    .texture
+                    .sampled()
+                    .magnify_filter(uniforms::MagnifySamplerFilter::Nearest)
+                    .minify_filter(uniforms::MinifySamplerFilter::Nearest)
+            };
             let uniforms = uniform! { tex: sampler, timestamp: elapsed };
 
             surface
@@ -1115,8 +1150,8 @@ impl TerminalView {
             let sampler = query
                 .texture
                 .sampled()
-                .magnify_filter(uniforms::MagnifySamplerFilter::Linear)
-                .minify_filter(uniforms::MinifySamplerFilter::Linear);
+                .magnify_filter(uniforms::MagnifySamplerFilter::Nearest)
+                .minify_filter(uniforms::MinifySamplerFilter::Nearest);
             let uniforms = uniform! { tex: sampler };
 
             surface
