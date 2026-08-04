@@ -199,6 +199,26 @@ fn shell_open(target: &str) -> windows::core::Result<()> {
     }
 }
 
+/// Alt を押しながらの文字入力は ESC を前置して送る（xterm の metaSendsEscape 相当）。
+///
+/// winit は Alt+e の text を "e" として渡すので、そのまま送ると Alt が消える。
+/// TUI アプリのキー割り当ては ESC 前置を前提にしているため、Alt が効かなくなる。
+/// 実例: mutt の `<esc>e`（resend-message＝本文をデコードして編集）が、素の `e`
+/// （edit-message＝生のメールソース）として届き、ISO-2022-JP のまま開いてしまう。
+///
+/// Ctrl+Alt は前置しない。Windows の AltGr が Ctrl+Alt として報告され、配列が
+/// 文字そのものを生んでいるケースと区別できないため。
+fn meta_prefixed(text: &str, alt: bool, ctrl: bool) -> Vec<u8> {
+    if alt && !ctrl && !text.is_empty() {
+        let mut out = Vec::with_capacity(text.len() + 1);
+        out.push(0x1b);
+        out.extend_from_slice(text.as_bytes());
+        out
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 fn is_link_token_char(c: char) -> bool {
     // 空白を含むパスは端末上のトークン境界が曖昧なので、Phase 4 では扱わない。
     !c.is_whitespace()
@@ -1106,8 +1126,16 @@ impl TerminalWindow {
 
         if !handled {
             match &key_event.text {
-                // 通常文字（英数字・記号・全角等の非IME入力）をそのまま送る
-                Some(text) => self.terminal.write(text.as_bytes()),
+                // 通常文字（英数字・記号・全角等の非IME入力）を送る。
+                // Alt 押下時は ESC を前置する（後述の meta_prefixed 参照）。
+                Some(text) => {
+                    let bytes = meta_prefixed(
+                        text,
+                        self.modifiers.alt_key(),
+                        self.modifiers.control_key(),
+                    );
+                    self.terminal.write(&bytes);
+                }
                 // 修飾キー単体などテキストを生まないキーでは選択を消さない
                 None => clear = false,
             }
@@ -1226,7 +1254,7 @@ fn dedent_common_indent(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        dedent_common_indent, resolve_existing_file_token, resolve_path_token,
+        dedent_common_indent, meta_prefixed, resolve_existing_file_token, resolve_path_token,
         selection_type_for_click, visible_selection,
     };
     use crate::view::Selection;
@@ -1241,6 +1269,31 @@ mod tests {
             end: Point::new(Line(end.0), Column(end.1)),
             block: false,
         }
+    }
+
+    #[test]
+    fn alt_key_sends_escape_prefix() {
+        // mutt の <esc>e（resend-message）が効くために必要。
+        assert_eq!(meta_prefixed("e", true, false), b"\x1be".to_vec());
+        assert_eq!(meta_prefixed("f", true, false), b"\x1bf".to_vec());
+    }
+
+    #[test]
+    fn plain_key_is_sent_unchanged() {
+        assert_eq!(meta_prefixed("e", false, false), b"e".to_vec());
+        assert_eq!(meta_prefixed("日", false, false), "日".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn ctrl_alt_is_not_prefixed_because_of_altgr() {
+        // Windows の AltGr は Ctrl+Alt として報告され、配列が文字を生んでいる。
+        // ここで ESC を前置すると AltGr で入力できる記号が壊れる。
+        assert_eq!(meta_prefixed("@", true, true), b"@".to_vec());
+    }
+
+    #[test]
+    fn empty_text_stays_empty_even_with_alt() {
+        assert!(meta_prefixed("", true, false).is_empty());
     }
 
     #[test]
