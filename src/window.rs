@@ -9,7 +9,10 @@ use winit::{
 };
 
 use crate::gt::GtMessage;
-use crate::input::{cursor_key_bytes, cursor_key_sequence, CursorKey};
+use crate::input::{
+    backspace_bytes, cursor_key_bytes, cursor_key_sequence, enter_bytes, escape_bytes,
+    function_key_bytes, space_bytes, tab_bytes, tilde_key_bytes, CursorKey, Mods, TildeKey,
+};
 use crate::keybindings::{self, ShortcutAction};
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
@@ -975,16 +978,16 @@ impl TerminalWindow {
         }
     }
 
-    /// 矢印キーを、現在の修飾キーとカーソルモードに応じたシーケンスで送る。
-    fn write_cursor_key(&mut self, key: CursorKey) {
-        let bytes = cursor_key_bytes(
-            key,
-            self.terminal.application_cursor_mode(),
-            self.modifiers.shift_key(),
-            self.modifiers.alt_key(),
-            self.modifiers.control_key(),
-        );
+    /// カーソル系キー（矢印・Home・End）を、修飾キーとカーソルモードに応じて送る。
+    fn write_cursor_key(&mut self, key: CursorKey, mods: Mods) {
+        let bytes = cursor_key_bytes(key, self.terminal.application_cursor_mode(), mods);
         self.terminal.write(&bytes);
+    }
+
+    fn write_function_key(&mut self, n: u8, mods: Mods) {
+        if let Some(bytes) = function_key_bytes(n, mods) {
+            self.terminal.write(&bytes);
+        }
     }
 
     fn on_key_press(&mut self, key_event: &KeyEvent) {
@@ -1071,53 +1074,58 @@ impl TerminalWindow {
         if window_shortcut {
             handled = true;
         } else {
-            match (ctrl, shift, keycode) {
-                (false, _, KeyCode::Escape) => {
+            // 特殊キーは修飾キーの有無で分岐させない。以前は (false, _, ...) の形で
+            // Ctrl を弾いており、Ctrl+Backspace や Ctrl+PageUp などがどの腕にも
+            // 一致せず、フォールバック先の text も None なので無反応だった。
+            // 修飾キーの反映は src/input.rs に集約する（xterm 準拠）。
+            let mods = Mods::new(shift, self.modifiers.alt_key(), ctrl);
+            match keycode {
+                KeyCode::Escape => {
                     self.clear_mouse_selection();
-                    self.terminal.write(b"\x1B");
+                    self.terminal.write(&escape_bytes(mods));
                 }
 
-                // Backspace: send DEL instead of BS
-                (false, _, KeyCode::Backspace) => self.terminal.write(b"\x7f"),
-                (false, _, KeyCode::Delete) => self.terminal.write(b"\x1b[3~"),
+                // Backspace は BS ではなく DEL を送る（Ctrl は BS、Alt は ESC 前置）。
+                KeyCode::Backspace => self.terminal.write(&backspace_bytes(mods)),
 
-                // Shift+Enter は ESC+CR を送る。Claude Code 等の TUI はこれを
-                // 「送信せず改行」として扱う（/terminal-setup が設定するのと同じ）。
-                (false, true, KeyCode::Enter) => self.terminal.write(b"\x1b\r"),
-                (false, false, KeyCode::Enter) => self.terminal.write(b"\r"),
-                (false, _, KeyCode::Tab) => self.terminal.write(b"\t"),
+                KeyCode::Enter => self.terminal.write(&enter_bytes(mods)),
+                KeyCode::Tab => self.terminal.write(&tab_bytes(mods)),
 
-                // Space は明示的に空白を送る。IME 有効時に winit が text=None で
-                // Space を渡してくることがあり、その場合 text 経由だと何も送られず、
-                // Claude Code の選択(スペースでトグル)等が効かなくなるため。
-                // ここに来る時点で preedit は空（上でガード済み）なので変換中は影響しない。
-                (false, _, KeyCode::Space) => self.terminal.write(b" "),
+                // Space は明示的に送る。IME 有効時に winit が text=None で Space を
+                // 渡してくることがあり、text 経由だと何も送られず Claude Code の
+                // 選択(スペースでトグル)等が効かなくなるため。ここに来る時点で
+                // preedit は空（上でガード済み）なので変換中は影響しない。
+                KeyCode::Space => self.terminal.write(&space_bytes(mods)),
 
-                // 矢印は修飾キーの有無を問わず処理する。ctrl=true を弾いていた頃は
-                // Ctrl+矢印がどの腕にも一致せず、text も None なので無反応だった。
-                (_, _, KeyCode::ArrowUp) => self.write_cursor_key(CursorKey::Up),
-                (_, _, KeyCode::ArrowDown) => self.write_cursor_key(CursorKey::Down),
-                (_, _, KeyCode::ArrowRight) => self.write_cursor_key(CursorKey::Right),
-                (_, _, KeyCode::ArrowLeft) => self.write_cursor_key(CursorKey::Left),
+                KeyCode::ArrowUp => self.write_cursor_key(CursorKey::Up, mods),
+                KeyCode::ArrowDown => self.write_cursor_key(CursorKey::Down, mods),
+                KeyCode::ArrowRight => self.write_cursor_key(CursorKey::Right, mods),
+                KeyCode::ArrowLeft => self.write_cursor_key(CursorKey::Left, mods),
+                KeyCode::Home => self.write_cursor_key(CursorKey::Home, mods),
+                KeyCode::End => self.write_cursor_key(CursorKey::End, mods),
 
-                (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
-                (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),
+                KeyCode::Insert => self.terminal.write(&tilde_key_bytes(TildeKey::Insert, mods)),
+                KeyCode::Delete => self.terminal.write(&tilde_key_bytes(TildeKey::Delete, mods)),
+                KeyCode::PageUp => self.terminal.write(&tilde_key_bytes(TildeKey::PageUp, mods)),
+                KeyCode::PageDown => {
+                    self.terminal.write(&tilde_key_bytes(TildeKey::PageDown, mods))
+                }
 
-                (false, _, KeyCode::F1) => self.terminal.write(b"\x1BOP"),
-                (false, _, KeyCode::F2) => self.terminal.write(b"\x1BOQ"),
-                (false, _, KeyCode::F3) => self.terminal.write(b"\x1BOR"),
-                (false, _, KeyCode::F4) => self.terminal.write(b"\x1BOS"),
-                (false, _, KeyCode::F5) => self.terminal.write(b"\x1B[15~"),
-                (false, _, KeyCode::F6) => self.terminal.write(b"\x1B[17~"),
-                (false, _, KeyCode::F7) => self.terminal.write(b"\x1B[18~"),
-                (false, _, KeyCode::F8) => self.terminal.write(b"\x1B[19~"),
-                (false, _, KeyCode::F9) => self.terminal.write(b"\x1B[20~"),
-                (false, _, KeyCode::F10) => self.terminal.write(b"\x1B[21~"),
-                (false, _, KeyCode::F11) => self.terminal.write(b"\x1B[23~"),
-                (false, _, KeyCode::F12) => self.terminal.write(b"\x1B[24~"),
+                KeyCode::F1 => self.write_function_key(1, mods),
+                KeyCode::F2 => self.write_function_key(2, mods),
+                KeyCode::F3 => self.write_function_key(3, mods),
+                KeyCode::F4 => self.write_function_key(4, mods),
+                KeyCode::F5 => self.write_function_key(5, mods),
+                KeyCode::F6 => self.write_function_key(6, mods),
+                KeyCode::F7 => self.write_function_key(7, mods),
+                KeyCode::F8 => self.write_function_key(8, mods),
+                KeyCode::F9 => self.write_function_key(9, mods),
+                KeyCode::F10 => self.write_function_key(10, mods),
+                KeyCode::F11 => self.write_function_key(11, mods),
+                KeyCode::F12 => self.write_function_key(12, mods),
 
                 // Ctrl+英字（Shiftなし）は制御コードへ。Ctrl+C/L/V もここで処理。
-                (true, false, code) => match ctrl_letter_code(code) {
+                code if ctrl && !shift => match ctrl_letter_code(code) {
                     Some(b) => self.terminal.write(&[b]),
                     None => handled = false,
                 },
