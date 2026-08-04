@@ -9,7 +9,7 @@ use winit::{
 };
 
 use crate::gt::GtMessage;
-use crate::input::{cursor_key_sequence, CursorKey};
+use crate::input::{cursor_key_bytes, cursor_key_sequence, CursorKey};
 use crate::keybindings::{self, ShortcutAction};
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
@@ -975,6 +975,18 @@ impl TerminalWindow {
         }
     }
 
+    /// 矢印キーを、現在の修飾キーとカーソルモードに応じたシーケンスで送る。
+    fn write_cursor_key(&mut self, key: CursorKey) {
+        let bytes = cursor_key_bytes(
+            key,
+            self.terminal.application_cursor_mode(),
+            self.modifiers.shift_key(),
+            self.modifiers.alt_key(),
+            self.modifiers.control_key(),
+        );
+        self.terminal.write(&bytes);
+    }
+
     fn on_key_press(&mut self, key_event: &KeyEvent) {
         // Ctrl+英字を制御コード(0x01..=0x1A)へ。ReceivedCharacter 廃止の代替。
         fn ctrl_letter_code(code: KeyCode) -> Option<u8> {
@@ -1081,22 +1093,12 @@ impl TerminalWindow {
                 // ここに来る時点で preedit は空（上でガード済み）なので変換中は影響しない。
                 (false, _, KeyCode::Space) => self.terminal.write(b" "),
 
-                (false, _, KeyCode::ArrowUp) => self.terminal.write(cursor_key_sequence(
-                    CursorKey::Up,
-                    self.terminal.application_cursor_mode(),
-                )),
-                (false, _, KeyCode::ArrowDown) => self.terminal.write(cursor_key_sequence(
-                    CursorKey::Down,
-                    self.terminal.application_cursor_mode(),
-                )),
-                (false, _, KeyCode::ArrowRight) => self.terminal.write(cursor_key_sequence(
-                    CursorKey::Right,
-                    self.terminal.application_cursor_mode(),
-                )),
-                (false, _, KeyCode::ArrowLeft) => self.terminal.write(cursor_key_sequence(
-                    CursorKey::Left,
-                    self.terminal.application_cursor_mode(),
-                )),
+                // 矢印は修飾キーの有無を問わず処理する。ctrl=true を弾いていた頃は
+                // Ctrl+矢印がどの腕にも一致せず、text も None なので無反応だった。
+                (_, _, KeyCode::ArrowUp) => self.write_cursor_key(CursorKey::Up),
+                (_, _, KeyCode::ArrowDown) => self.write_cursor_key(CursorKey::Down),
+                (_, _, KeyCode::ArrowRight) => self.write_cursor_key(CursorKey::Right),
+                (_, _, KeyCode::ArrowLeft) => self.write_cursor_key(CursorKey::Left),
 
                 (false, _, KeyCode::PageUp) => self.terminal.write(b"\x1b[5~"),
                 (false, _, KeyCode::PageDown) => self.terminal.write(b"\x1b[6~"),
@@ -1129,11 +1131,8 @@ impl TerminalWindow {
                 // 通常文字（英数字・記号・全角等の非IME入力）を送る。
                 // Alt 押下時は ESC を前置する（後述の meta_prefixed 参照）。
                 Some(text) => {
-                    let bytes = meta_prefixed(
-                        text,
-                        self.modifiers.alt_key(),
-                        self.modifiers.control_key(),
-                    );
+                    let bytes =
+                        meta_prefixed(text, self.modifiers.alt_key(), self.modifiers.control_key());
                     self.terminal.write(&bytes);
                 }
                 // 修飾キー単体などテキストを生まないキーでは選択を消さない
