@@ -67,6 +67,31 @@ pub(crate) fn physical_font_size(logical: u32, scale_factor: f64) -> u32 {
     ((logical.max(1) as f64 * normalized_scale_factor(scale_factor)).round() as u32).max(1)
 }
 
+/// PowerLine の区切り記号か。セルの端から端まで塗りつぶして隣のセルと連結する
+/// 前提でデザインされている文字（Nerd Font の私用領域）。
+///
+/// これらは「グリフ本来の大きさ」で置くと継ぎ目が汚くなる。セルの高さは ASCII の
+/// 縦bboxから決めており（calculate_cell_size）、フォントの行の高さより小さいため、
+/// 実測で font_size=24 のとき セル26px に対しグリフ30px と上下2pxずつはみ出した。
+/// はみ出した分は隣の行の背景に塗り潰されるので、段差や隙間として見える。
+///
+/// U+E0A0〜E0AF（ブランチ・鍵などのアイコン）は通常の文字なので含めない。
+/// 罫線素片やブロック要素も含めない（線の太さや高さが設計値なので、セルへ
+/// 伸縮すると逆に崩れる）。
+fn is_cell_filling_separator(ch: char) -> bool {
+    matches!(ch, '\u{E0B0}'..='\u{E0BF}')
+}
+
+/// セル背景とまったく同じ矩形。区切り記号をここへ描けば帯と端が一致する。
+fn cell_rect(row: usize, leftline: u32, cell_size: CellSize, cell_width_px: u32) -> PixelRect {
+    PixelRect {
+        x: leftline as i32,
+        y: (row as u32 * cell_size.h) as i32,
+        w: cell_width_px,
+        h: cell_size.h,
+    }
+}
+
 pub(crate) fn scale_change_requires_rebuild(old_scale: f64, new_scale: f64, logical: u32) -> bool {
     physical_font_size(logical, old_scale) != physical_font_size(logical, new_scale)
 }
@@ -813,14 +838,18 @@ impl TerminalView {
                 {
                     Ok(Some((region, metrics))) => {
                         if !region.is_empty() {
-                            let bearing_x = (metrics.horiBearingX >> 6) as u32;
-                            let bearing_y = (metrics.horiBearingY >> 6) as u32;
+                            let rect = if is_cell_filling_separator(cell.ch) {
+                                cell_rect(i, leftline, cell_size, cell_width_px)
+                            } else {
+                                let bearing_x = (metrics.horiBearingX >> 6) as u32;
+                                let bearing_y = (metrics.horiBearingY >> 6) as u32;
 
-                            let rect = PixelRect {
-                                x: leftline as i32 + bearing_x as i32,
-                                y: baseline as i32 - bearing_y as i32,
-                                w: region.w,
-                                h: region.h,
+                                PixelRect {
+                                    x: leftline as i32 + bearing_x as i32,
+                                    y: baseline as i32 - bearing_y as i32,
+                                    w: region.w,
+                                    h: region.h,
+                                }
                             };
                             let gl_rect = rect.to_gl(viewport);
                             let uv_rect = region.to_uv(texture.width(), texture.height());
@@ -836,14 +865,18 @@ impl TerminalView {
                         if let Some((glyph_image, metrics)) = self.fonts.render(cell.ch, style) {
                             if glyph_image.width > 0 {
                                 log::info!("draw separetely");
-                                let bearing_x = (metrics.horiBearingX >> 6) as u32;
-                                let bearing_y = (metrics.horiBearingY >> 6) as u32;
+                                let rect = if is_cell_filling_separator(cell.ch) {
+                                    cell_rect(i, leftline, cell_size, cell_width_px)
+                                } else {
+                                    let bearing_x = (metrics.horiBearingX >> 6) as u32;
+                                    let bearing_y = (metrics.horiBearingY >> 6) as u32;
 
-                                let rect = PixelRect {
-                                    x: leftline as i32 + bearing_x as i32,
-                                    y: baseline as i32 - bearing_y as i32,
-                                    w: glyph_image.width,
-                                    h: glyph_image.height,
+                                    PixelRect {
+                                        x: leftline as i32 + bearing_x as i32,
+                                        y: baseline as i32 - bearing_y as i32,
+                                        w: glyph_image.width,
+                                        h: glyph_image.height,
+                                    }
                                 };
                                 let gl_rect = rect.to_gl(viewport);
                                 let uv_rect = UvRect {
@@ -1393,8 +1426,41 @@ fn image_vertices(gl_rect: GlRect) -> [ImageVertex; 6] {
 
 #[cfg(test)]
 mod tests {
-    use super::{embedded_font_data, physical_font_size, scale_change_requires_rebuild};
+    use super::{
+        cell_rect, embedded_font_data, is_cell_filling_separator, physical_font_size,
+        scale_change_requires_rebuild, CellSize,
+    };
     use std::rc::Rc;
+
+    #[test]
+    fn only_powerline_separators_are_drawn_cell_filling() {
+        // セル端まで塗る区切り記号
+        for ch in ['\u{E0B0}', '\u{E0B1}', '\u{E0B2}', '\u{E0B3}', '\u{E0BF}'] {
+            assert!(is_cell_filling_separator(ch), "{ch:?} は対象のはず");
+        }
+        // 通常のアイコン（ブランチ・鍵など）と、設計値どおりに描くべき文字
+        for ch in [
+            '\u{E0A0}', // branch
+            '\u{E0AF}', // 私用領域だが区切りではない
+            '\u{E0C0}', // 区切り範囲の直後
+            '─', '│', '┼', // 罫線素片は伸縮すると線幅が崩れる
+            '█', '▌', '▁', // ブロック要素は高さ・幅が設計値
+            'A', '日',
+        ] {
+            assert!(!is_cell_filling_separator(ch), "{ch:?} は対象外のはず");
+        }
+    }
+
+    #[test]
+    fn cell_rect_matches_the_cell_background_box() {
+        let cell_size = CellSize { w: 13, h: 26 };
+        // 3行目・左端が39px・全角(2セル)幅26px のセル
+        let rect = cell_rect(3, 39, cell_size, 26);
+        assert_eq!(rect.x, 39);
+        assert_eq!(rect.y, 3 * 26);
+        assert_eq!(rect.w, 26);
+        assert_eq!(rect.h, 26, "高さはセル高さと一致し、はみ出さない");
+    }
 
     #[test]
     fn physical_font_size_preserves_one_x_and_rounds_scaled_sizes() {

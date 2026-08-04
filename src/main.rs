@@ -125,7 +125,14 @@ fn chrono_now() -> String {
 /// フラスコアイコンと同じものを、生 RGBA から読み込んで設定する。
 fn load_window_icon() -> Option<winit::window::Icon> {
     const RGBA: &[u8] = include_bytes!("../assets/icon128.rgba");
-    winit::window::Icon::from_rgba(RGBA.to_vec(), 128, 128).ok()
+    // 失敗を黙って捨てるとアイコンが出ない理由が追えない（実機で実際に困った）。
+    match winit::window::Icon::from_rgba(RGBA.to_vec(), 128, 128) {
+        Ok(icon) => Some(icon),
+        Err(e) => {
+            log::warn!("ウィンドウアイコンを読み込めませんでした: {}", e);
+            None
+        }
+    }
 }
 
 fn build_window<T>(
