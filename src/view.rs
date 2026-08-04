@@ -3,7 +3,7 @@ use glium::{index, texture, uniform, uniforms};
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::cache::GlyphCache;
@@ -1203,7 +1203,67 @@ fn build_font_set(font_size: u32) -> FontSet {
         fonts.add(FontStyle::Faint, faint_font);
     }
 
+    // 最後の砦：OS に入っている日本語フォント。
+    //
+    // 内蔵の M PLUS 1 Code はコーディング用フォントで、全角記号の一部（？！～％＆＠＃）
+    // を持っていない。設定フォントが Nerd Font だけだと、これらを持つフォントがどこにも
+    // 無く空白になる（実機で「？が出ない」として報告された）。
+    //
+    // 内蔵フォントより後ろに足すのが重要。前に足すとセル幅の基準が日本語フォントに
+    // なってしまい、罫線や PowerLine の幅がズレる。
+    for (style, candidates) in [
+        (FontStyle::Regular, SYSTEM_FALLBACK_REGULAR),
+        (FontStyle::Bold, SYSTEM_FALLBACK_BOLD),
+        (FontStyle::Faint, SYSTEM_FALLBACK_REGULAR),
+    ] {
+        for path in pick_existing(candidates, |p| p.is_file()) {
+            match Font::from_file(&path, 0) {
+                Ok(font) => {
+                    log::debug!("OS のフォールバックフォント: {:?}", path.display());
+                    fonts.add(style, font);
+                }
+                Err(e) => log::debug!("フォールバック候補を使えません {:?}: {}", path.display(), e),
+            }
+        }
+    }
+
     fonts
+}
+
+/// OS の日本語フォントの候補（標準の位置）。存在するものだけを使う。
+#[cfg(windows)]
+const SYSTEM_FALLBACK_REGULAR: &[&str] = &[
+    "C:/Windows/Fonts/YuGothM.ttc",
+    "C:/Windows/Fonts/meiryo.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+];
+#[cfg(windows)]
+const SYSTEM_FALLBACK_BOLD: &[&str] = &[
+    "C:/Windows/Fonts/YuGothB.ttc",
+    "C:/Windows/Fonts/meiryob.ttc",
+    "C:/Windows/Fonts/msgothic.ttc",
+];
+
+#[cfg(not(windows))]
+const SYSTEM_FALLBACK_REGULAR: &[&str] = &[
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+];
+#[cfg(not(windows))]
+const SYSTEM_FALLBACK_BOLD: &[&str] = &[
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
+    "/usr/share/fonts/truetype/fonts-japanese-gothic.ttf",
+];
+
+/// 候補のうち、実在するものだけを順番どおりに返す。
+fn pick_existing(candidates: &[&str], exists: impl Fn(&Path) -> bool) -> Vec<PathBuf> {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .filter(|p| exists(p))
+        .collect()
 }
 
 fn calculate_cell_size(fonts: &FontSet) -> (CellSize, i32) {
@@ -1428,8 +1488,10 @@ fn image_vertices(gl_rect: GlRect) -> [ImageVertex; 6] {
 mod tests {
     use super::{
         cell_rect, embedded_font_data, is_cell_filling_separator, physical_font_size,
-        scale_change_requires_rebuild, CellSize,
+        pick_existing, scale_change_requires_rebuild, CellSize, SYSTEM_FALLBACK_BOLD,
+        SYSTEM_FALLBACK_REGULAR,
     };
+    use std::path::{Path, PathBuf};
     use std::rc::Rc;
 
     #[test]
@@ -1448,6 +1510,31 @@ mod tests {
             'A', '日',
         ] {
             assert!(!is_cell_filling_separator(ch), "{ch:?} は対象外のはず");
+        }
+    }
+
+    #[test]
+    fn system_fallback_uses_only_existing_paths_in_order() {
+        let candidates = ["/a/first.ttc", "/b/missing.ttc", "/c/third.ttf"];
+        let picked = pick_existing(&candidates, |p| p != Path::new("/b/missing.ttc"));
+        assert_eq!(
+            picked,
+            vec![PathBuf::from("/a/first.ttc"), PathBuf::from("/c/third.ttf")],
+            "実在するものだけを、書いた順で使う"
+        );
+
+        // 1つも無い環境では空。内蔵フォントだけで動く（従来と同じ）。
+        assert!(pick_existing(&candidates, |_| false).is_empty());
+    }
+
+    #[test]
+    fn system_fallback_candidates_are_absolute_and_nonempty() {
+        // 相対パスだと exe の起動場所で結果が変わってしまう。
+        for list in [SYSTEM_FALLBACK_REGULAR, SYSTEM_FALLBACK_BOLD] {
+            assert!(!list.is_empty());
+            for p in list {
+                assert!(Path::new(p).is_absolute(), "{p} は絶対パスであるべき");
+            }
         }
     }
 
