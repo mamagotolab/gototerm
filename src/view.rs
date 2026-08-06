@@ -1208,7 +1208,7 @@ fn build_font_set(font_size: u32) -> FontSet {
             continue;
         }
 
-        log::debug!("add {:?} font: {:?}", style, path.display());
+        log::info!("フォント: {:?} {:?}", style, path.display());
 
         // TODO: add config for face index
         match Font::from_file(path, 0) {
@@ -1254,8 +1254,12 @@ fn build_font_set(font_size: u32) -> FontSet {
         for path in pick_existing(candidates, |p| p.is_file()) {
             match Font::from_file(&path, 0) {
                 Ok(font) => {
-                    log::debug!("OS のフォールバックフォント: {:?}", path.display());
-                    fonts.add(style, font);
+                    log::info!(
+                        "OS のフォールバック: {:?} {:?}（私用領域には使わない）",
+                        style,
+                        path.display()
+                    );
+                    fonts.add_system_fallback(style, font);
                 }
                 Err(e) => log::debug!("フォールバック候補を使えません {:?}: {}", path.display(), e),
             }

@@ -167,14 +167,23 @@ pub(crate) fn tab_bytes(mods: Mods) -> Vec<u8> {
     }
 }
 
-/// Space。Ctrl+Space は NUL（Emacs の set-mark 等が使う）。
-pub(crate) fn space_bytes(mods: Mods) -> Vec<u8> {
-    let base: u8 = if mods.ctrl { 0x00 } else { b' ' };
-    if mods.alt {
-        vec![0x1b, base]
-    } else {
-        vec![base]
+/// Space。
+///
+/// Ctrl+Space は**何も送らない**。xterm は NUL を送るが、多くの環境で
+/// Ctrl+Space は IME の切り替えに割り当てられており、端末が NUL を送ると
+/// アプリ側に余計な入力が届く。実際 v0.6.11 で NUL を送るようにしたところ、
+/// mutt からの vim で「日本語入力に切り替えると同時に挿入モードを抜ける」
+/// 不具合になった（vim の i_CTRL-@ は「直前の挿入テキストを入れて挿入を終える」）。
+/// NUL を必要とするアプリより、IME 切り替えを壊さないことを優先する。
+pub(crate) fn space_bytes(mods: Mods) -> Option<Vec<u8>> {
+    if mods.ctrl {
+        return None;
     }
+    Some(if mods.alt {
+        vec![0x1b, b' ']
+    } else {
+        vec![b' ']
+    })
 }
 
 /// Enter。Shift+Enter は ESC+CR（Claude Code 等が「送信せず改行」に使う）。
@@ -310,11 +319,13 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_space_is_nul() {
-        assert_eq!(space_bytes(NONE), vec![b' ']);
-        // Emacs の set-mark 等が使う
-        assert_eq!(space_bytes(m(false, false, true)), vec![0x00]);
-        assert_eq!(space_bytes(m(false, true, false)), vec![0x1b, b' ']);
+    fn ctrl_space_sends_nothing_so_ime_toggle_keeps_working() {
+        assert_eq!(space_bytes(NONE), Some(vec![b' ']));
+        assert_eq!(space_bytes(m(false, true, false)), Some(vec![0x1b, b' ']));
+        // NUL を送ると vim の i_CTRL-@ が発動して挿入モードを抜けてしまう。
+        // Ctrl+Space は IME 切り替えに使われるので端末からは何も送らない。
+        assert_eq!(space_bytes(m(false, false, true)), None);
+        assert_eq!(space_bytes(m(true, false, true)), None);
     }
 
     #[test]

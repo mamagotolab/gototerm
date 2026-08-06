@@ -1095,7 +1095,11 @@ impl TerminalWindow {
                 // 渡してくることがあり、text 経由だと何も送られず Claude Code の
                 // 選択(スペースでトグル)等が効かなくなるため。ここに来る時点で
                 // preedit は空（上でガード済み）なので変換中は影響しない。
-                KeyCode::Space => self.terminal.write(&space_bytes(mods)),
+                KeyCode::Space => match space_bytes(mods) {
+                    Some(bytes) => self.terminal.write(&bytes),
+                    // Ctrl+Space は送らない（IME 切り替えを邪魔しない）
+                    None => handled = false,
+                },
 
                 KeyCode::ArrowUp => self.write_cursor_key(CursorKey::Up, mods),
                 KeyCode::ArrowDown => self.write_cursor_key(CursorKey::Down, mods),

@@ -123,13 +123,28 @@ impl FontStyle {
 
 pub struct FontSet {
     fonts: HashMap<FontStyle, Vec<Font>>,
+    /// OS のフォールバックフォントが始まる位置（style ごと）。
+    /// ここから後ろのフォントは私用領域(PUA)の文字には使わない。
+    system_fallback_from: HashMap<FontStyle, usize>,
     font_size: u32,
+}
+
+/// 私用領域（BMP の PUA）か。Nerd Font のアイコンや PowerLine の区切り記号は
+/// ここに入っている。
+///
+/// PUA の意味はフォントごとに全く違う。とくに Windows の和文フォント
+/// （MS ゴシック・遊ゴシック・メイリオ）は NEC/IBM 拡張漢字を U+E000〜U+E757 に
+/// 持っており、PowerLine の記号(U+E0B0〜)と衝突する。OS のフォールバックを
+/// PUA に使うと、区切り記号やアイコンが無関係な漢字として表示されてしまう。
+fn is_private_use(ch: char) -> bool {
+    matches!(ch, '\u{E000}'..='\u{F8FF}')
 }
 
 impl FontSet {
     pub fn new(font_size: u32) -> Self {
         FontSet {
             fonts: HashMap::new(),
+            system_fallback_from: HashMap::new(),
             font_size,
         }
     }
@@ -140,12 +155,33 @@ impl FontSet {
         list.push(font);
     }
 
+    /// OS に入っている穴埋め用フォントとして足す。PUA には使われない。
+    pub fn add_system_fallback(&mut self, style: FontStyle, font: Font) {
+        let len = self.fonts.get(&style).map_or(0, |l| l.len());
+        self.system_fallback_from.entry(style).or_insert(len);
+        self.add(style, font);
+    }
+
+    /// この文字に使ってよいフォントの範囲。PUA では OS のフォールバックを除く。
+    fn candidates(&self, ch: char, style: FontStyle) -> Option<&[Font]> {
+        let list = self.fonts.get(&style)?;
+        if !is_private_use(ch) {
+            return Some(list.as_slice());
+        }
+        let limit = self
+            .system_fallback_from
+            .get(&style)
+            .copied()
+            .unwrap_or(list.len());
+        Some(&list[..limit.min(list.len())])
+    }
+
     pub fn metrics(&self, ch: char, style: FontStyle) -> Option<GlyphMetrics> {
-        self.fonts.get(&style)?.iter().find_map(|f| f.metrics(ch))
+        self.candidates(ch, style)?.iter().find_map(|f| f.metrics(ch))
     }
 
     pub fn render(&self, ch: char, style: FontStyle) -> Option<(RawImage2d<'_, u8>, GlyphMetrics)> {
-        self.fonts.get(&style)?.iter().find_map(|f| f.render(ch))
+        self.candidates(ch, style)?.iter().find_map(|f| f.render(ch))
     }
 
     pub fn set_fontsize(&mut self, new_size: u32) {
@@ -173,6 +209,21 @@ mod tests {
 
     // PowerLine の記号が隣のセルと隙間なく繋がるかは送り幅が保たれるかで決まる。
     // ライトヒンティングを外すと実機で継ぎ目が崩れたので、外れていないことを見る。
+    #[test]
+    fn private_use_area_is_detected() {
+        // Nerd Font のアイコン・PowerLine の区切り記号はここに入る
+        assert!(is_private_use('\u{E0B0}'));
+        assert!(is_private_use('\u{E0A0}'));
+        assert!(is_private_use('\u{E000}'));
+        assert!(is_private_use('\u{F8FF}'));
+        // 通常の文字は対象外
+        assert!(!is_private_use('A'));
+        assert!(!is_private_use('日'));
+        assert!(!is_private_use('？'));
+        assert!(!is_private_use('\u{D7FF}'));
+        assert!(!is_private_use('\u{F900}'));
+    }
+
     #[test]
     fn glyphs_keep_light_hinting_on_every_platform() {
         assert!(glyph_load_flags().contains(LoadFlag::TARGET_LIGHT));

@@ -16,7 +16,9 @@ name = "gototerm"
 path = "src/main.rs"
 
 [dependencies]
-log = { version = "0.4.17", features = ["release_max_level_warn"] }
+# release_max_level_info: リリース版でも info を残す。どのフォントが読めたかが
+# 分からないと、実機でしか起きない表示崩れ（PUA の取り違え等）を追えないため。
+log = { version = "0.4.17", features = ["release_max_level_info"] }
 env_logger = "0.11"
 portable-pty = "0.8"
 unicode-width = "0.1.9"
