@@ -934,6 +934,7 @@ dependencies = [
  "pulldown-cmark",
  "raw-window-handle 0.5.2",
  "serde",
+ "serde_json",
  "syntect",
  "unicode-width 0.1.10",
  "vte",

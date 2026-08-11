@@ -399,7 +399,12 @@ fn wrap_agent_command(command: Option<Vec<String>>) -> Option<Vec<String>> {
         // Windows でも「実行後にプロンプトを残す」形にする。素の `claude` は
         // .cmd シムのことが多く CreateProcess で解決できず落ちるため、必ずシェル
         // 経由で起動する（PATHEXT 解決＋抜けてもタブが残る）。
-        let joined = cmd.join(" ");
+        // セッション名など空白を含む引数がここで分割されないよう括る。
+        let joined = cmd
+            .iter()
+            .map(|arg| win_quote(arg))
+            .collect::<Vec<_>>()
+            .join(" ");
         let lower = shell.to_ascii_lowercase();
         if lower.contains("powershell") || lower.contains("pwsh") {
             return Some(vec![
@@ -443,6 +448,17 @@ fn default_shell() -> String {
 #[cfg_attr(windows, allow(dead_code))]
 fn sh_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// cmd.exe / PowerShell 向け。空白を含む引数だけ二重引用符で括る
+/// （素の引数まで括ると cmd 側で余計な解釈が入ることがあるため）。
+#[cfg_attr(not(windows), allow(dead_code))]
+fn win_quote(s: &str) -> String {
+    if s.contains(' ') && !s.starts_with('"') {
+        format!("\"{s}\"")
+    } else {
+        s.to_owned()
+    }
 }
 
 impl Node {

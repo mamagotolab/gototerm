@@ -150,6 +150,10 @@ enum Mode {
     Recent,
     Bookmarks,
     Agent,
+    /// Claude Code を選んだ直後の起動メニュー（名前入力＋別の始め方）。
+    LaunchMenu,
+    /// 過去セッションの一覧から選んで再開する画面。
+    SessionHistory,
     /// フォルダ確定直後、gt hooks が未設定なら一度だけ挟む確認画面。
     HooksNudge,
 }
@@ -176,6 +180,23 @@ struct LauncherState {
     chosen_dir: Option<PathBuf>,
     agent_selected: usize,
     nudge_selected: usize,
+    /// 起動メニューを出している間、起動予定のコマンドを預かっておく。
+    pending_command: Option<Vec<String>>,
+    /// None＝名前欄にカーソルがある（初期状態）。Some(i)＝別の始め方の i 行目。
+    launch_row: Option<usize>,
+    session_name: String,
+    /// このフォルダの過去セッション（新しい順）。無ければ再開の行を出さない。
+    sessions: Vec<crate::claude_sessions::Session>,
+    history_selected: usize,
+}
+
+/// 起動メニューの「別の始め方」。名前入力の下に、使えるものだけ並べる。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LaunchRow {
+    /// 直前のセッションをそのまま続ける（`claude -c`）。
+    Continue,
+    /// 履歴から選んで再開する（`claude -r <id>`）。
+    History,
 }
 
 impl LauncherState {
@@ -197,6 +218,11 @@ impl LauncherState {
             chosen_dir: None,
             agent_selected: 0,
             nudge_selected: 0,
+            pending_command: None,
+            launch_row: None,
+            session_name: String::new(),
+            sessions: Vec::new(),
+            history_selected: 0,
         };
         state.reload();
         state
@@ -220,6 +246,11 @@ impl LauncherState {
             chosen_dir: None,
             agent_selected: 0,
             nudge_selected: 0,
+            pending_command: None,
+            launch_row: None,
+            session_name: String::new(),
+            sessions: Vec::new(),
+            history_selected: 0,
         };
         state.reload();
         state
@@ -242,6 +273,8 @@ impl LauncherState {
             Mode::Recent => self.handle_recent_key(code, text),
             Mode::Bookmarks => self.handle_bookmark_key(code, text),
             Mode::Agent => self.handle_agent_key(code, text),
+            Mode::LaunchMenu => self.handle_launch_menu_key(code, text),
+            Mode::SessionHistory => self.handle_history_key(code, text),
             Mode::HooksNudge => self.handle_hooks_nudge_key(code, text),
         }
     }
@@ -430,6 +463,12 @@ impl LauncherState {
                         .get(self.agent_selected - 1)
                         .map(|agent| agent.command.clone())
                 };
+                // Claude Code だけは起動メニュー（名前・再開）を挟む。
+                // 他のエージェント・シェルは従来どおりそのまま起動。
+                if command.as_deref().is_some_and(is_claude) {
+                    self.enter_launch_menu(command, &dir);
+                    return LauncherOutcome::None;
+                }
                 return LauncherOutcome::OpenIn { dir, command };
             }
             KeyCode::ArrowDown => self.move_agent(1),
@@ -441,6 +480,153 @@ impl LauncherState {
             },
         }
         LauncherOutcome::None
+    }
+
+    /// Claude Code の起動メニューを開く。カーソルは名前欄から始める
+    /// （＝毎回まず「名前は？」と聞かれる。打たずに Enter なら名前なし）。
+    fn enter_launch_menu(&mut self, command: Option<Vec<String>>, dir: &Path) {
+        self.pending_command = command;
+        self.session_name.clear();
+        self.launch_row = None;
+        self.history_selected = 0;
+        self.sessions = crate::claude_sessions::recent_for_dir(dir, HISTORY_LIMIT);
+        self.mode = Mode::LaunchMenu;
+    }
+
+    /// いま出せる「別の始め方」。過去セッションが無ければ空＝名前欄だけの画面になる。
+    fn launch_rows(&self) -> Vec<LaunchRow> {
+        match self.sessions.len() {
+            0 => Vec::new(),
+            // 1件しかないなら「続きから」と「履歴から選ぶ」は同じ意味。行を増やさない。
+            1 => vec![LaunchRow::Continue],
+            _ => vec![LaunchRow::Continue, LaunchRow::History],
+        }
+    }
+
+    fn handle_launch_menu_key(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
+        match code {
+            KeyCode::Escape => self.back_to_agent_mode(),
+            KeyCode::Enter => return self.activate_launch_selection(),
+            KeyCode::ArrowDown => self.move_launch_row(1),
+            KeyCode::ArrowUp => self.move_launch_row(-1),
+            KeyCode::Backspace if self.launch_row.is_none() => {
+                self.session_name.pop();
+            }
+            _ => {
+                // 名前欄にカーソルがある間、文字はすべて名前（"c" で始まる名前も打てる）。
+                // 行頭キーが効くのは ↓ で名前欄を出てから。
+                match (self.launch_row, text) {
+                    (None, Some(input)) if input.chars().all(|ch| !ch.is_control()) => {
+                        self.session_name.push_str(input);
+                    }
+                    (Some(_), Some("j")) => self.move_launch_row(1),
+                    (Some(_), Some("k")) => self.move_launch_row(-1),
+                    (Some(_), Some("c")) => return self.activate_row(LaunchRow::Continue),
+                    (Some(_), Some("r")) => return self.activate_row(LaunchRow::History),
+                    _ => {}
+                }
+            }
+        }
+        LauncherOutcome::None
+    }
+
+    fn activate_launch_selection(&mut self) -> LauncherOutcome {
+        match self.launch_row {
+            // 名前欄で Enter。空なら名前なしで起動。
+            None => {
+                let name = self.session_name.trim().to_owned();
+                let extra = if name.is_empty() {
+                    Vec::new()
+                } else {
+                    vec!["-n".to_owned(), name]
+                };
+                self.launch_pending(extra)
+            }
+            Some(index) => match self.launch_rows().get(index).copied() {
+                Some(row) => self.activate_row(row),
+                None => LauncherOutcome::None,
+            },
+        }
+    }
+
+    fn activate_row(&mut self, row: LaunchRow) -> LauncherOutcome {
+        if !self.launch_rows().contains(&row) {
+            return LauncherOutcome::None;
+        }
+        match row {
+            LaunchRow::Continue => self.launch_pending(vec!["-c".to_owned()]),
+            LaunchRow::History => {
+                self.history_selected = 0;
+                self.mode = Mode::SessionHistory;
+                LauncherOutcome::None
+            }
+        }
+    }
+
+    /// 名前欄（None）と行の間を上下する。行が無ければ名前欄から動かない。
+    fn move_launch_row(&mut self, delta: isize) {
+        let rows = self.launch_rows().len();
+        if rows == 0 {
+            return;
+        }
+        // 名前欄を -1 番目とみなして数える。
+        let current = self.launch_row.map_or(-1, |i| i as isize);
+        let next = (current + delta).clamp(-1, rows as isize - 1);
+        self.launch_row = if next < 0 { None } else { Some(next as usize) };
+    }
+
+    fn handle_history_key(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
+        match code {
+            KeyCode::Escape => self.mode = Mode::LaunchMenu,
+            KeyCode::Enter => {
+                if let Some(session) = self.sessions.get(self.history_selected) {
+                    let id = session.id.clone();
+                    return self.launch_pending(vec!["-r".to_owned(), id]);
+                }
+            }
+            KeyCode::ArrowDown => self.move_history(1),
+            KeyCode::ArrowUp => self.move_history(-1),
+            _ => match text {
+                Some("j") => self.move_history(1),
+                Some("k") => self.move_history(-1),
+                _ => {}
+            },
+        }
+        LauncherOutcome::None
+    }
+
+    fn move_history(&mut self, delta: isize) {
+        if self.sessions.is_empty() {
+            return;
+        }
+        let last = (self.sessions.len() - 1) as isize;
+        self.history_selected = (self.history_selected as isize + delta).clamp(0, last) as usize;
+    }
+
+    /// 預けてあったコマンドに引数を足して起動する。
+    fn launch_pending(&mut self, extra: Vec<String>) -> LauncherOutcome {
+        let Some(dir) = self.chosen_dir.clone() else {
+            self.mode = Mode::Browse;
+            return LauncherOutcome::None;
+        };
+        let Some(mut command) = self.pending_command.take() else {
+            self.mode = Mode::Browse;
+            return LauncherOutcome::None;
+        };
+        command.extend(extra);
+        LauncherOutcome::OpenIn {
+            dir,
+            command: Some(command),
+        }
+    }
+
+    /// 起動メニューをやめてエージェント選択に戻る。
+    fn back_to_agent_mode(&mut self) {
+        self.pending_command = None;
+        self.session_name.clear();
+        self.launch_row = None;
+        self.sessions = Vec::new();
+        self.mode = Mode::Agent;
     }
 
     fn start_filter(&mut self) {
@@ -702,6 +888,8 @@ impl LauncherState {
             Mode::Recent => self.render_recent(cols, rows),
             Mode::Bookmarks => self.render_bookmarks(cols, rows),
             Mode::Agent => self.render_agent(cols, rows),
+            Mode::LaunchMenu => self.render_launch_menu(cols, rows),
+            Mode::SessionHistory => self.render_history(cols, rows),
             Mode::HooksNudge => self.render_hooks_nudge(cols, rows),
         }
     }
@@ -866,6 +1054,107 @@ impl LauncherState {
         }
         content.push((String::new(), Color::White, false));
         content.push(("j/k:選択  Enter:起動  Esc:戻る".to_owned(), DIM, false));
+
+        overlay_list_popup(lines, cols, rows, &content);
+    }
+
+    fn render_launch_menu(&mut self, cols: usize, rows: usize) -> Vec<Line> {
+        let mut lines = self.render_browse(cols, rows);
+        self.overlay_launch_menu_popup(&mut lines, cols, rows);
+        lines
+    }
+
+    fn overlay_launch_menu_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+        let subtitle = self
+            .chosen_dir
+            .as_deref()
+            .map(display_path)
+            .unwrap_or_else(|| display_path(&self.dir));
+
+        let mut content: Vec<(String, Color, bool)> = Vec::new();
+        content.push((pad_to("Claude Code で開く", MENU_W), ACCENT, false));
+        content.push((fit_width(&subtitle, MENU_W), DIM, false));
+        content.push((String::new(), Color::White, false));
+
+        // 名前欄。カーソルがここにある間だけ末尾に "_" を出す。
+        let on_name = self.launch_row.is_none();
+        let cursor = if on_name { "_" } else { "" };
+        content.push((
+            pad_to(&format!(" 名前: {}{cursor}", self.session_name), MENU_W),
+            Color::BrightWhite,
+            on_name,
+        ));
+
+        let rows_list = self.launch_rows();
+        if !rows_list.is_empty() {
+            content.push((String::new(), Color::White, false));
+            content.push((pad_to(" ↓ 別の始め方", MENU_W), DIM, false));
+            for (i, row) in rows_list.iter().enumerate() {
+                content.push((
+                    pad_to(&self.launch_row_label(*row), MENU_W),
+                    Color::BrightWhite,
+                    self.launch_row == Some(i),
+                ));
+            }
+        }
+
+        content.push((String::new(), Color::White, false));
+        let footer = if on_name {
+            "Enter:開始（空なら名前なし）  ↓:別の始め方  Esc:戻る"
+        } else {
+            "Enter:決定  ↑:名前へ戻る  Esc:やめる"
+        };
+        content.push((fit_width(footer, MENU_W), DIM, false));
+
+        overlay_list_popup(lines, cols, rows, &content);
+    }
+
+    /// 「別の始め方」1行分の文字列。続きからの行には直前セッションの見出しを添える。
+    fn launch_row_label(&self, row: LaunchRow) -> String {
+        match row {
+            LaunchRow::Continue => match self.sessions.first() {
+                Some(session) => {
+                    const PREFIX: &str = "  c  続きから   ";
+                    let room = MENU_W.saturating_sub(display_width(PREFIX));
+                    format!("{PREFIX}{}", session_row(session, room))
+                }
+                None => "  c  続きから".to_owned(),
+            },
+            LaunchRow::History => format!("  r  履歴から選ぶ…（{}件）", self.sessions.len()),
+        }
+    }
+
+    fn render_history(&mut self, cols: usize, rows: usize) -> Vec<Line> {
+        let mut lines = self.render_browse(cols, rows);
+        self.overlay_history_popup(&mut lines, cols, rows);
+        lines
+    }
+
+    fn overlay_history_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+        let mut content: Vec<(String, Color, bool)> = Vec::new();
+        content.push((pad_to("続きから", MENU_W), ACCENT, false));
+        content.push((String::new(), Color::White, false));
+
+        for (i, session) in self.sessions.iter().enumerate() {
+            // 名前を付けたセッションは明るく、名前なし（最初の発言で代用）は控えめに。
+            let fg = if session.named {
+                Color::BrightWhite
+            } else {
+                Color::White
+            };
+            content.push((
+                pad_to(&format!(" {}", session_row(session, MENU_W - 1)), MENU_W),
+                fg,
+                i == self.history_selected,
+            ));
+        }
+
+        content.push((String::new(), Color::White, false));
+        content.push((
+            fit_width("j/k:選択  Enter:再開  Esc:戻る", MENU_W),
+            DIM,
+            false,
+        ));
 
         overlay_list_popup(lines, cols, rows, &content);
     }
@@ -1045,6 +1334,73 @@ fn entry_fg(e: &Entry) -> Color {
 
 fn entry_icon_fg(e: &Entry) -> (char, Color) {
     icon_and_color(&e.name, e.is_dir)
+}
+
+/// 起動メニューの内側の幅（半角換算）。全行をこの幅に揃えるので、
+/// 名前を打っても履歴の件数が変わっても枠が伸び縮みしない。
+const MENU_W: usize = 54;
+/// 履歴に出す最大件数（枠の高さが下地のブラウザを潰さない範囲）。
+const HISTORY_LIMIT: usize = 8;
+
+/// 「2時間前」。format_age は "いま" だけ助詞が付くと変になるので分ける。
+fn session_age(session: &crate::claude_sessions::Session) -> String {
+    // 時計が巻き戻っている等で経過が取れなければ、時刻表示だけ諦める。
+    let Ok(elapsed) = session.modified.elapsed() else {
+        return String::new();
+    };
+    let age = crate::timeline::format_age(elapsed);
+    if age == "いま" {
+        age
+    } else {
+        format!("{age}前")
+    }
+}
+
+/// 「見出し           2時間前」の1行。幅 `width` の中で経過時間を右端に寄せる。
+fn session_row(session: &crate::claude_sessions::Session, width: usize) -> String {
+    let age = session_age(session);
+    let room = width.saturating_sub(display_width(&age) + 2);
+    let title = fit_width(&session.label, room);
+    let gap = room.saturating_sub(display_width(&title)) + 2;
+    format!("{title}{}{age}", " ".repeat(gap))
+}
+
+/// 表示幅 w に収める。切ったら末尾に「…」を付ける。
+fn fit_width(text: &str, w: usize) -> String {
+    if display_width(text) <= w {
+        return text.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in text.chars() {
+        let cw = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + cw > w.saturating_sub(1) {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
+}
+
+/// 表示幅 w ちょうどに揃える（長ければ切る、短ければ空白で埋める）。
+fn pad_to(text: &str, w: usize) -> String {
+    let text = fit_width(text, w);
+    let pad = w.saturating_sub(display_width(&text));
+    format!("{text}{}", " ".repeat(pad))
+}
+
+/// Claude Code のコマンドか（`-n` や `-c` を足してよい相手か）。
+/// `claude` / `claude.cmd` / フルパス指定のいずれでも拾う。
+fn is_claude(command: &[String]) -> bool {
+    let Some(program) = command.first() else {
+        return false;
+    };
+    Path::new(program)
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().to_ascii_lowercase() == "claude")
+        .unwrap_or(false)
 }
 
 /// gt hooks 連携を提案してよいか。Claude Code が入っていない環境では無意味な
@@ -1743,23 +2099,213 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// テスト用の過去セッション（新しい順に並べたつもりの2件）。
+    fn fake_sessions(count: usize) -> Vec<crate::claude_sessions::Session> {
+        (0..count)
+            .map(|i| crate::claude_sessions::Session {
+                id: format!("{i}{i}{i}{i}{i}{i}{i}{i}-1111-1111-1111-111111111111"),
+                label: format!("過去の作業{i}"),
+                named: i == 0,
+                modified: std::time::SystemTime::now() - std::time::Duration::from_secs(600 * (i as u64 + 1)),
+            })
+            .collect()
+    }
+
+    /// Claude Code を選ぶと起動メニューが出て、カーソルは名前欄にある（＝先に名前を聞かれる）。
     #[test]
-    fn agent_second_entry_enters_claude_command() {
+    fn claude_opens_the_launch_menu_on_the_name_field() {
         let base = temp_tree();
         let mut state = LauncherState::with_dir(Vec::new(), base.clone());
         let expected = std::fs::canonicalize(&base).unwrap();
-        state.enter_agent_mode(expected.clone());
+        state.enter_agent_mode(expected);
         state.handle_key_parts(KeyCode::ArrowDown, None);
+
+        let outcome = state.handle_key_parts(KeyCode::Enter, None);
+        assert_eq!(outcome, LauncherOutcome::None);
+        assert_eq!(state.mode, Mode::LaunchMenu);
+        assert_eq!(state.launch_row, None, "カーソルは名前欄");
+        assert_eq!(state.pending_command, Some(vec!["claude".to_owned()]));
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 名前欄に到達するまでの共通手順。
+    fn open_launch_menu(base: &Path) -> (LauncherState, PathBuf) {
+        let mut state = LauncherState::with_dir(Vec::new(), base.to_path_buf());
+        let dir = std::fs::canonicalize(base).unwrap();
+        state.enter_agent_mode(dir.clone());
+        state.handle_key_parts(KeyCode::ArrowDown, None);
+        state.handle_key_parts(KeyCode::Enter, None);
+        (state, dir)
+    }
+
+    /// 空のまま Enter＝名前なしで起動（`-n ""` は渡さない）。
+    #[test]
+    fn empty_name_launches_plain_claude() {
+        let base = temp_tree();
+        let (mut state, dir) = open_launch_menu(&base);
+        state.handle_key_parts(KeyCode::Space, Some(" "));
 
         let outcome = state.handle_key_parts(KeyCode::Enter, None);
         assert_eq!(
             outcome,
             LauncherOutcome::OpenIn {
-                dir: expected,
+                dir,
                 command: Some(vec!["claude".to_owned()])
             }
         );
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 打った名前が `-n <名前>` になる（Backspace も効く）。
+    #[test]
+    fn typed_name_becomes_the_name_flag() {
+        let base = temp_tree();
+        let (mut state, dir) = open_launch_menu(&base);
+        for ch in ["府", "中", " ", "改", "修"] {
+            state.handle_key_parts(KeyCode::KeyA, Some(ch));
+        }
+        state.handle_key_parts(KeyCode::Backspace, None);
+
+        let outcome = state.handle_key_parts(KeyCode::Enter, None);
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenIn {
+                dir,
+                command: Some(vec![
+                    "claude".to_owned(),
+                    "-n".to_owned(),
+                    "府中 改".to_owned()
+                ])
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 名前欄にいる間は、行頭キーと同じ文字も名前として打てる
+    /// （"claude改修" のような名前が打てなくなるのを防ぐ）。
+    #[test]
+    fn letters_stay_in_the_name_field() {
+        let base = temp_tree();
+        let (mut state, _) = open_launch_menu(&base);
+        state.sessions = fake_sessions(2);
+
+        for ch in ["c", "r", "j"] {
+            state.handle_key_parts(KeyCode::KeyA, Some(ch));
+        }
+
+        assert_eq!(state.session_name, "crj");
+        assert_eq!(state.mode, Mode::LaunchMenu, "履歴画面へ飛んでいない");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 過去セッションが無いフォルダでは、名前欄だけ（↓を押しても動かない）。
+    #[test]
+    fn without_history_there_are_no_extra_rows() {
+        let base = temp_tree();
+        let (mut state, _) = open_launch_menu(&base);
+        assert!(state.launch_rows().is_empty());
+
+        state.handle_key_parts(KeyCode::ArrowDown, None);
+        assert_eq!(state.launch_row, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 履歴が1件だけなら「続きから」だけ（「履歴から選ぶ」は同じ意味なので出さない）。
+    #[test]
+    fn a_single_session_shows_only_the_continue_row() {
+        let base = temp_tree();
+        let (mut state, _) = open_launch_menu(&base);
+        state.sessions = fake_sessions(1);
+        assert_eq!(state.launch_rows(), vec![LaunchRow::Continue]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// ↓で「続きから」へ降りて Enter＝`claude -c`。
+    #[test]
+    fn continue_row_launches_with_the_continue_flag() {
+        let base = temp_tree();
+        let (mut state, dir) = open_launch_menu(&base);
+        state.sessions = fake_sessions(2);
+
+        state.handle_key_parts(KeyCode::ArrowDown, None);
+        assert_eq!(state.launch_row, Some(0));
+        let outcome = state.handle_key_parts(KeyCode::Enter, None);
+
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenIn {
+                dir,
+                command: Some(vec!["claude".to_owned(), "-c".to_owned()])
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 名前欄を出たあとは行頭キーが効く（r で履歴へ）。選んだセッションは `-r <id>`。
+    #[test]
+    fn history_resumes_the_selected_session_by_id() {
+        let base = temp_tree();
+        let (mut state, dir) = open_launch_menu(&base);
+        state.sessions = fake_sessions(3);
+
+        state.handle_key_parts(KeyCode::ArrowDown, None); // 名前欄を出る
+        state.handle_key_parts(KeyCode::KeyR, Some("r")); // 行頭キー
+        assert_eq!(state.mode, Mode::SessionHistory);
+
+        state.handle_key_parts(KeyCode::KeyJ, Some("j")); // 2件目を選ぶ
+        let outcome = state.handle_key_parts(KeyCode::Enter, None);
+
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenIn {
+                dir,
+                command: Some(vec![
+                    "claude".to_owned(),
+                    "-r".to_owned(),
+                    fake_sessions(3)[1].id.clone()
+                ])
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Esc は一段ずつ：履歴→起動メニュー→エージェント選択。
+    #[test]
+    fn escape_walks_back_one_step() {
+        let base = temp_tree();
+        let (mut state, _) = open_launch_menu(&base);
+        state.sessions = fake_sessions(2);
+        state.handle_key_parts(KeyCode::ArrowDown, None);
+        state.handle_key_parts(KeyCode::KeyR, Some("r"));
+
+        state.handle_key_parts(KeyCode::Escape, None);
+        assert_eq!(state.mode, Mode::LaunchMenu);
+
+        state.handle_key_parts(KeyCode::Escape, None);
+        assert_eq!(state.mode, Mode::Agent);
+        assert_eq!(state.pending_command, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 起動メニューを出すのは Claude Code だけ（Codex やシェルは即起動）。
+    #[test]
+    fn only_claude_gets_the_launch_menu() {
+        assert!(is_claude(&["claude".to_owned()]));
+        assert!(is_claude(&["/usr/bin/claude".to_owned()]));
+        assert!(is_claude(&["claude.cmd".to_owned()]));
+        assert!(!is_claude(&["codex".to_owned()]));
+        assert!(!is_claude(&[]));
+    }
+
+    /// 枠が伸び縮みしないよう、全行を同じ表示幅に揃える（日本語は2セル）。
+    #[test]
+    fn rows_are_padded_to_the_same_display_width() {
+        assert_eq!(display_width(&pad_to("府中", 10)), 10);
+        assert_eq!(display_width(&pad_to("abc", 10)), 10);
+        // 長すぎる見出しは「…」を付けて切る。
+        let cut = fit_width("府中コンパスの改修作業", 10);
+        assert!(cut.ends_with('…'));
+        assert!(display_width(&cut) <= 10);
     }
 
     #[test]

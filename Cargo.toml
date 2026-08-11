@@ -29,6 +29,9 @@ glutin-winit = "0.4"
 raw-window-handle = "0.5"
 freetype-rs = "0.26.0"
 serde = { version = "1", features = ["derive"] }
+# Claude Code の会話ログ(jsonl)を読むだけに使う。日本語の見出しに \uXXXX が
+# 入るので、自前の文字列切り出しではなく正しいJSONパーサを通す。
+serde_json = "1"
 config = { version = "0.13.1", default-features = false, features = ["toml"] }
 lazy_static = "1.4.0"
 lru = { version = "0.7.8", default-features = false }

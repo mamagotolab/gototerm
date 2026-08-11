@@ -1,5 +1,6 @@
 mod bookmarks;
 mod cache;
+mod claude_sessions;
 mod config;
 mod font;
 mod gt;
