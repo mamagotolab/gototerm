@@ -1,8 +1,10 @@
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use unicode_width::UnicodeWidthChar;
 use winit::{
-    event::{ElementState, KeyEvent},
+    dpi::{PhysicalPosition, PhysicalSize},
+    event::{ElementState, Ime, KeyEvent},
     keyboard::{KeyCode, ModifiersState, PhysicalKey},
 };
 
@@ -115,6 +117,25 @@ impl Launcher {
         outcome
     }
 
+    /// IME（日本語入力）のイベント。ランチャーが出ている間は裏のペインへ
+    /// 流さず、ここで受けて入力欄へ入れる。
+    pub fn handle_ime(&mut self, ime: &Ime) {
+        self.state.handle_ime(ime);
+        self.rebuild();
+    }
+
+    /// 変換候補ウィンドウを出す位置（入力欄のカーソルセル）。
+    /// 文字を受け付けていない画面では None。
+    pub fn ime_cursor_area(&self) -> Option<(PhysicalPosition<u32>, PhysicalSize<u32>)> {
+        let (row, col) = self.state.ime_cursor?;
+        let cell = self.view.cell_size();
+        let vp = self.view.viewport();
+        Some((
+            PhysicalPosition::new(vp.x + col as u32 * cell.w, vp.y + row as u32 * cell.h),
+            PhysicalSize::new(cell.w, cell.h),
+        ))
+    }
+
     pub fn needs_redraw(&self) -> bool {
         self.view.needs_redraw()
     }
@@ -188,6 +209,12 @@ struct LauncherState {
     /// このフォルダの過去セッション（新しい順）。無ければ再開の行を出さない。
     sessions: Vec<crate::claude_sessions::Session>,
     history_selected: usize,
+    /// IME で変換中の未確定文字列。確定すると入力欄へ移って空になる。
+    preedit: String,
+    /// 直前に IME が確定した時刻。確定の Enter を「決定」と取り違えないため。
+    last_ime_commit: Instant,
+    /// 変換候補ウィンドウを出すセル (row, col)。描画のたびに更新する。
+    ime_cursor: Option<(usize, usize)>,
 }
 
 /// 起動メニューの「別の始め方」。名前入力の下に、使えるものだけ並べる。
@@ -223,6 +250,9 @@ impl LauncherState {
             session_name: String::new(),
             sessions: Vec::new(),
             history_selected: 0,
+            preedit: String::new(),
+            last_ime_commit: Instant::now() - Duration::from_secs(10),
+            ime_cursor: None,
         };
         state.reload();
         state
@@ -251,6 +281,9 @@ impl LauncherState {
             session_name: String::new(),
             sessions: Vec::new(),
             history_selected: 0,
+            preedit: String::new(),
+            last_ime_commit: Instant::now() - Duration::from_secs(10),
+            ime_cursor: None,
         };
         state.reload();
         state
@@ -267,7 +300,41 @@ impl LauncherState {
         self.handle_key_parts(code, event.text.as_deref())
     }
 
+    /// IME（日本語入力）のイベント。確定した文字だけが入力欄に入る。
+    fn handle_ime(&mut self, ime: &Ime) {
+        match ime {
+            // 変換中の文字列。確定するまで入力欄に仮表示する。
+            Ime::Preedit(text, _) => self.preedit = text.clone(),
+            Ime::Commit(text) => {
+                self.preedit.clear();
+                self.last_ime_commit = Instant::now();
+                self.insert_text(text);
+            }
+            Ime::Enabled | Ime::Disabled => self.preedit.clear(),
+        }
+    }
+
+    /// 確定した文字列の行き先。文字を受け付ける画面だけが受け取る。
+    fn insert_text(&mut self, text: &str) {
+        match self.mode {
+            // 名前欄にカーソルがあるときだけ（行を選んでいる間は入れない）。
+            Mode::LaunchMenu if self.launch_row.is_none() => self.session_name.push_str(text),
+            // 絞り込み中の `/` 検索。日本語のファイル名もここで打てる。
+            Mode::Browse if self.filter.is_some() => self.push_filter_text(text),
+            _ => {}
+        }
+    }
+
     fn handle_key_parts(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
+        // 変換中のキーは IME のもの。ランチャーは手を出さない。
+        if !self.preedit.is_empty() {
+            return LauncherOutcome::None;
+        }
+        // 変換を確定した Enter が、確定(Commit)の直後にキーとしても届くこと
+        // がある。そのまま決定に使うと、変換しただけで起動してしまう。
+        if code == KeyCode::Enter && self.last_ime_commit.elapsed() < Duration::from_millis(50) {
+            return LauncherOutcome::None;
+        }
         match self.mode {
             Mode::Browse => self.handle_browse_key(code, text),
             Mode::Recent => self.handle_recent_key(code, text),
@@ -883,6 +950,8 @@ impl LauncherState {
     }
 
     fn render(&mut self, cols: usize, rows: usize) -> Vec<Line> {
+        // 変換候補の位置は描くたびに置き直す（入力欄の無い画面では出さない）。
+        self.ime_cursor = None;
         match self.mode {
             Mode::Browse => self.render_browse(cols, rows),
             Mode::Recent => self.render_recent(cols, rows),
@@ -955,6 +1024,11 @@ impl LauncherState {
             }
         };
         lines.push(text_line(cols, &footer, DIM));
+        // 絞り込み中は変換候補を検索欄の下に出す。
+        if let Some(query) = self.filter.as_deref() {
+            let col = display_width("検索: ") + display_width(query);
+            self.ime_cursor = Some((lines.len() - 1, col));
+        }
         lines.resize_with(rows, || text_line(cols, "", Color::White));
         lines.truncate(rows);
         lines
@@ -1064,7 +1138,7 @@ impl LauncherState {
         lines
     }
 
-    fn overlay_launch_menu_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+    fn overlay_launch_menu_popup(&mut self, lines: &mut [Line], cols: usize, rows: usize) {
         let subtitle = self
             .chosen_dir
             .as_deref()
@@ -1077,13 +1151,17 @@ impl LauncherState {
         content.push((String::new(), Color::White, false));
 
         // 名前欄。カーソルがここにある間だけ末尾に "_" を出す。
+        // 変換中の文字（preedit）は確定前でも見えるよう、そのまま欄に並べる。
         let on_name = self.launch_row.is_none();
         let cursor = if on_name { "_" } else { "" };
+        let name_index = content.len();
+        let typed = format!(" 名前: {}{}", self.session_name, self.preedit);
         content.push((
-            pad_to(&format!(" 名前: {}{cursor}", self.session_name), MENU_W),
+            pad_to(&format!("{typed}{cursor}"), MENU_W),
             Color::BrightWhite,
             on_name,
         ));
+        let name_cursor = (name_index, display_width(&typed));
 
         let rows_list = self.launch_rows();
         if !rows_list.is_empty() {
@@ -1106,7 +1184,13 @@ impl LauncherState {
         };
         content.push((fit_width(footer, MENU_W), DIM, false));
 
-        overlay_list_popup(lines, cols, rows, &content);
+        let (x0, y0) = overlay_list_popup(lines, cols, rows, &content);
+        // 変換候補ウィンドウは名前欄のカーソル位置に出す。
+        // 中身の行は「枠+左パディング」の分だけ右にずれている。
+        if on_name {
+            let (row, col) = name_cursor;
+            self.ime_cursor = Some((y0 + 1 + row, x0 + 2 + col));
+        }
     }
 
     /// 「別の始め方」1行分の文字列。続きからの行には直前セッションの見出しを添える。
@@ -1193,7 +1277,14 @@ impl LauncherState {
 
 /// 中央寄せの罫線ボックスとして、選択可能な項目リストを stamp する。
 /// エージェント選択・hooks 連携確認など、複数のポップアップで共通の描画。
-fn overlay_list_popup(lines: &mut [Line], cols: usize, rows: usize, content: &[(String, Color, bool)]) {
+/// 画面中央にポップアップを重ねる。返り値は枠の左上セル (x0, y0)
+/// （中の入力欄の位置を呼び出し側で求めるために使う）。
+fn overlay_list_popup(
+    lines: &mut [Line],
+    cols: usize,
+    rows: usize,
+    content: &[(String, Color, bool)],
+) -> (usize, usize) {
     let inner_w = content
         .iter()
         .map(|(t, _, _)| display_width(t))
@@ -1230,6 +1321,7 @@ fn overlay_list_popup(lines: &mut [Line], cols: usize, rows: usize, content: &[(
     }
     // 下ボーダー
     stamp(lines, y0 + box_h - 1, x0, border_row('╰', '╯', dash));
+    (x0, y0)
 }
 
 fn display_width(s: &str) -> usize {
@@ -2284,6 +2376,93 @@ mod tests {
         state.handle_key_parts(KeyCode::Escape, None);
         assert_eq!(state.mode, Mode::Agent);
         assert_eq!(state.pending_command, None);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// IME で確定した日本語が名前欄に入る（変換中は仮表示のまま）。
+    #[test]
+    fn ime_text_goes_into_the_name_field() {
+        let base = temp_tree();
+        let (mut state, dir) = open_launch_menu(&base);
+
+        // 変換中（未確定）。欄には出るが、名前としてはまだ確定していない。
+        state.handle_ime(&Ime::Preedit("ふちゅう".to_owned(), None));
+        assert_eq!(state.preedit, "ふちゅう");
+        assert_eq!(state.session_name, "");
+
+        state.handle_ime(&Ime::Commit("府中".to_owned()));
+        assert_eq!(state.preedit, "", "確定したら仮表示は消える");
+        assert_eq!(state.session_name, "府中");
+
+        // 確定 Enter と紛れないよう時間を空けてから決定する。
+        state.last_ime_commit = Instant::now() - Duration::from_secs(1);
+        let outcome = state.handle_key_parts(KeyCode::Enter, None);
+        assert_eq!(
+            outcome,
+            LauncherOutcome::OpenIn {
+                dir,
+                command: Some(vec![
+                    "claude".to_owned(),
+                    "-n".to_owned(),
+                    "府中".to_owned()
+                ])
+            }
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 変換中のキーは IME のもの。ランチャーは反応しない
+    /// （変換確定の Enter でそのまま起動してしまうのを防ぐ）。
+    #[test]
+    fn keys_during_conversion_do_not_launch() {
+        let base = temp_tree();
+        let (mut state, _) = open_launch_menu(&base);
+
+        state.handle_ime(&Ime::Preedit("ふちゅう".to_owned(), None));
+        assert_eq!(
+            state.handle_key_parts(KeyCode::Enter, None),
+            LauncherOutcome::None
+        );
+        assert_eq!(
+            state.handle_key_parts(KeyCode::Escape, None),
+            LauncherOutcome::None
+        );
+        assert_eq!(state.mode, Mode::LaunchMenu, "Esc でも画面は変わらない");
+
+        // 確定の直後に届く Enter（Windows で二重に来る）も決定にしない。
+        state.handle_ime(&Ime::Commit("府中".to_owned()));
+        assert_eq!(
+            state.handle_key_parts(KeyCode::Enter, None),
+            LauncherOutcome::None
+        );
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 行を選んでいる間は、確定した文字を名前欄に入れない。
+    #[test]
+    fn ime_text_is_ignored_while_a_row_is_selected() {
+        let base = temp_tree();
+        let (mut state, _) = open_launch_menu(&base);
+        state.sessions = fake_sessions(2);
+        state.handle_key_parts(KeyCode::ArrowDown, None);
+
+        state.handle_ime(&Ime::Commit("府中".to_owned()));
+        assert_eq!(state.session_name, "");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// `/` の絞り込みでも日本語で打てる（日本語のファイル名を探せる）。
+    #[test]
+    fn ime_text_goes_into_the_filter() {
+        let base = temp_tree();
+        std::fs::write(base.join("府中の資料.md"), "x").unwrap();
+        let mut state = LauncherState::with_dir(Vec::new(), base.clone());
+        state.handle_key_parts(KeyCode::Slash, Some("/"));
+
+        state.handle_ime(&Ime::Commit("府中".to_owned()));
+        assert_eq!(state.filter.as_deref(), Some("府中"));
+        let hit = state.current_entry().map(|e| e.name.clone());
+        assert_eq!(hit.as_deref(), Some("府中の資料.md"));
         let _ = std::fs::remove_dir_all(&base);
     }
 

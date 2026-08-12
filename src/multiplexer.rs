@@ -1935,6 +1935,16 @@ impl Multiplexer {
         self.window.request_redraw();
     }
 
+    /// 変換候補ウィンドウを、ランチャーの入力欄の位置へ動かす（over-the-spot）。
+    fn sync_launcher_ime_area(&self) {
+        let Some(launcher) = self.launcher.as_ref() else {
+            return;
+        };
+        if let Some((pos, size)) = launcher.ime_cursor_area() {
+            self.window.set_ime_cursor_area(pos, size);
+        }
+    }
+
     fn handle_launcher_outcome(&mut self, outcome: LauncherOutcome) {
         match outcome {
             LauncherOutcome::OpenIn { dir, command } => {
@@ -2434,6 +2444,9 @@ impl Multiplexer {
                     if let Some(launcher) = self.launcher.as_mut() {
                         let outcome = launcher.handle_key(key, self.modifiers);
                         self.handle_launcher_outcome(outcome);
+                        // 入力欄に入った直後に変換候補の位置を合わせる
+                        // （起動メニューを開いた時点で候補が正しい場所に出る）。
+                        self.sync_launcher_ime_area();
                         return;
                     }
                     if let Some(action) = self.parse_shortcut(key) {
@@ -2553,6 +2566,15 @@ impl Multiplexer {
                     if self.sidebar.contains(self.cursor_pos)
                         || (self.sidebar.is_visible()
                             && self.preview_slot.contains(self.cursor_pos)) => {}
+
+                // ランチャー表示中の日本語入力はランチャーの入力欄へ。
+                // ここで受けないと、確定した文字が裏のシェルに打ち込まれる。
+                WindowEvent::Ime(ime) if self.launcher.is_some() => {
+                    if let Some(launcher) = self.launcher.as_mut() {
+                        launcher.handle_ime(ime);
+                    }
+                    self.sync_launcher_ime_area();
+                }
 
                 WindowEvent::Ime(_) if self.sidebar_focused || self.reader_focused => {}
 
