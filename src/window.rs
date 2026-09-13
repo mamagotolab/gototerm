@@ -14,6 +14,7 @@ use crate::input::{
     function_key_bytes, space_bytes, tab_bytes, tilde_key_bytes, CursorKey, Mods, TildeKey,
 };
 use crate::keybindings::{self, ShortcutAction};
+use crate::task_activity::{PaneActivity, PaneId};
 use crate::terminal::TerminalSize;
 use crate::view::{Selection, TerminalView, Viewport};
 use crate::vt::{GridSelection, ShellLocation, VtTerminal};
@@ -332,6 +333,8 @@ fn get_clipboard() -> String {
 pub struct TerminalWindow {
     window: Rc<Window>,
     terminal: VtTerminal,
+    pane_id: PaneId,
+    activity: PaneActivity,
 
     view: TerminalView,
     focused: bool,
@@ -421,6 +424,8 @@ impl TerminalWindow {
         TerminalWindow {
             window,
             terminal,
+            pane_id: PaneId::allocate(),
+            activity: PaneActivity::default(),
 
             view,
             focused: true,
@@ -543,12 +548,31 @@ impl TerminalWindow {
             .unwrap_or_else(|| ShellLocation::Local(PathBuf::from(".")))
     }
 
+    pub(crate) fn pane_id(&self) -> PaneId {
+        self.pane_id
+    }
+
+    pub(crate) fn activity(&self) -> &PaneActivity {
+        &self.activity
+    }
+
+    pub(crate) fn observed_location(&self) -> Option<ShellLocation> {
+        self.terminal
+            .location()
+            .or_else(|| self.terminal.cwd().map(ShellLocation::Local))
+    }
+
     pub fn take_clicked_file(&mut self) -> Option<PathBuf> {
         self.clicked_file.take()
     }
 
     pub fn take_gt_messages(&mut self) -> Vec<GtMessage> {
-        self.terminal.take_gt_messages()
+        let messages = self.terminal.take_gt_messages();
+        let now = std::time::Instant::now();
+        for message in &messages {
+            self.activity.apply(message, now);
+        }
+        messages
     }
 
     pub fn set_viewport(&mut self, new_viewport: Viewport) {

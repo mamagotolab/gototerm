@@ -145,6 +145,15 @@ impl FilePreview {
         };
     }
 
+    pub fn clear_memory_content(&mut self) {
+        if self.target_abs.is_none() {
+            self.target = None;
+            self.pending = None;
+            self.queued = None;
+            self.content = PreviewContent::Empty;
+        }
+    }
+
     pub fn refresh_current(&mut self) {
         if let (Some(abs_path), Some(display_path)) = (&self.target_abs, &self.target) {
             self.request_read(abs_path.clone(), display_path.clone(), true);

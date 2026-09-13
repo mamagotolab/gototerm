@@ -36,6 +36,10 @@ preview_ratio = 0.50
 # 例: ["target"] は target/foo.obj と crates/app/target/foo.obj の両方を無視します。
 watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 
+# アプリ側キーバインド。書いた項目だけ既定値を上書きします。
+# [keybindings]
+# open_task_overview = "Ctrl+Shift+A"
+
 # フォント（先頭=主フォント、2番目以降=フォールバック）。
 #
 # ■ 迷ったら: この節を丸ごと消してもOK。内蔵フォント＋OSの日本語フォント（遊ゴシック等）

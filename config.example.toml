@@ -48,6 +48,7 @@ watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 
 # アプリ側キーバインド。書いた項目だけ既定値を上書きします。
 # [keybindings]
+# open_task_overview = "Ctrl+Shift+A"
 # focus_left = "Ctrl+Alt+H"
 # toggle_sidebar = "Ctrl+Shift+Space"
 # new_tab = "Ctrl+Shift+N"

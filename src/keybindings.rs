@@ -14,6 +14,7 @@ const MOD_SUPER: u8 = 1 << 3;
 pub(crate) enum ShortcutAction {
     NewTab,
     OpenLauncher,
+    OpenTaskOverview,
     ClosePane,
     NextTab,
     PrevTab,
@@ -337,6 +338,11 @@ fn default_bindings() -> &'static [(&'static str, &'static str, ShortcutAction)]
             "Ctrl+Shift+N",
             ShortcutAction::OpenLauncher,
         ),
+        (
+            "open_task_overview",
+            "Ctrl+Shift+A",
+            ShortcutAction::OpenTaskOverview,
+        ),
         ("close_pane", "Ctrl+Shift+W", ShortcutAction::ClosePane),
         ("next_tab", "Ctrl+Tab", ShortcutAction::NextTab),
         ("prev_tab", "Ctrl+Shift+Tab", ShortcutAction::PrevTab),
@@ -382,4 +388,30 @@ fn default_bindings() -> &'static [(&'static str, &'static str, ShortcutAction)]
             ShortcutAction::ClearHistory,
         ),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn task_overview_has_unique_default_binding() {
+        let overview = default_bindings()
+            .iter()
+            .find(|(name, _, _)| *name == "open_task_overview")
+            .expect("task overview binding");
+        assert_eq!(overview.1, "Ctrl+Shift+A");
+        assert_eq!(overview.2, ShortcutAction::OpenTaskOverview);
+
+        let parsed = parse_keybinding(overview.0, overview.1).unwrap();
+        assert_eq!(
+            default_bindings()
+                .iter()
+                .filter(|(name, value, _)| {
+                    *name != overview.0 && parse_keybinding(name, value).unwrap() == parsed
+                })
+                .count(),
+            0
+        );
+    }
 }

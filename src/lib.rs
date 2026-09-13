@@ -15,6 +15,8 @@ mod recent;
 mod session_review;
 mod sidebar;
 mod sixel;
+mod task_activity;
+mod task_overview;
 mod terminal;
 mod timeline;
 mod utils;

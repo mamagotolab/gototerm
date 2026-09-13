@@ -302,6 +302,18 @@ impl ReaderPane {
         self.rebuild();
     }
 
+    pub fn clear_remote_content(&mut self) {
+        if self.reader_notice.as_deref() != Some(" (remote)") {
+            return;
+        }
+        self.pinned = false;
+        self.reader_scroll = 0;
+        self.reader_notice = None;
+        self.preview.clear_memory_content();
+        self.refresh_reader_document();
+        self.rebuild();
+    }
+
     pub fn refresh_current(&mut self) {
         self.preview.refresh_current();
         self.reader_notice = None;

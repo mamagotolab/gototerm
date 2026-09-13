@@ -525,6 +525,15 @@ impl Sidebar {
         self.follow_target.take()
     }
 
+    pub fn reset_pane_observations(&mut self) {
+        self.changes.clear();
+        self.ai_activity = None;
+        self.timeline.clear();
+        self.log_scroll = 0;
+        self.follow_target = None;
+        self.rebuild();
+    }
+
     pub fn apply_gt_event(
         &mut self,
         root: Option<&Path>,

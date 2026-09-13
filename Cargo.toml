@@ -1,6 +1,6 @@
 [package]
 name = "gototerm"
-version = "0.6.15"
+version = "0.6.16-rc.1"
 authors = ["mamagotolab"]
 edition = "2021"
 description = "日本語入力のストレスが少ない、AI開発ワークベンチ付き軽量ターミナル（Sixel 画像対応）"
@@ -22,6 +22,7 @@ log = { version = "0.4.17", features = ["release_max_level_info"] }
 env_logger = "0.11"
 portable-pty = "0.8"
 unicode-width = "0.1.9"
+unicode-normalization = "0.1"
 glium = "0.34"
 winit = "0.29"
 glutin = "0.31"

@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use unicode_normalization::UnicodeNormalization;
 use unicode_width::UnicodeWidthChar;
 use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
@@ -1659,9 +1660,14 @@ fn two_pane_row(
 pub(crate) fn column_cells(text: &str, fg: Color, bg: Color, width: usize) -> Vec<Cell> {
     let mut cells = Vec::new();
     let mut used = 0usize;
-    for ch in text.chars() {
+    for ch in text.nfc() {
         let w = UnicodeWidthChar::width(ch).unwrap_or(0);
-        if w == 0 || used + w > width {
+        // NFCで合成できない幅0文字には独立セルを割り当てられないが、
+        // そこで打ち切らず後続文字の描画は続ける。
+        if w == 0 {
+            continue;
+        }
+        if used + w > width {
             break;
         }
         let mut attr = GraphicAttribute::default();
@@ -2485,6 +2491,18 @@ mod tests {
         let cut = fit_width("府中コンパスの改修作業", 10);
         assert!(cut.ends_with('…'));
         assert!(display_width(&cut) <= 10);
+    }
+
+    #[test]
+    fn column_cells_preserve_combined_glyphs_and_keep_following_text() {
+        let cells = column_cells("e\u{301}か\u{3099}状態", Color::White, Color::Background, 10);
+        let text: String = cells
+            .iter()
+            .filter(|cell| cell.width > 0)
+            .map(|cell| cell.ch)
+            .collect();
+        assert!(text.contains("éが"));
+        assert!(text.contains("状態"));
     }
 
     #[test]

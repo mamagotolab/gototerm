@@ -13,7 +13,7 @@ use winit::{
     dpi::{PhysicalPosition, PhysicalSize},
     event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent},
     event_loop::{ControlFlow, EventLoopWindowTarget},
-    keyboard::{ModifiersState, PhysicalKey},
+    keyboard::{KeyCode, ModifiersState, PhysicalKey},
     window::Window,
 };
 
@@ -25,6 +25,8 @@ use crate::session_review::{SessionReview, SessionReviewOutcome, SessionSummary}
 use crate::reader::{ReaderHeaderAction, ReaderKeyResult, ReaderPane, ReaderRequest};
 use crate::recent::RecentProjects;
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
+use crate::task_activity::{sanitize_display_text, PaneId};
+use crate::task_overview::{OverviewOutcome, TaskOverview, TaskRow};
 use crate::terminal::{Cell, Color, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::vt::ShellLocation;
@@ -131,6 +133,7 @@ enum Dir {
 enum Action {
     NewTab,
     OpenLauncher,
+    OpenTaskOverview,
     CloseFocused,
     NextTab,
     PrevTab,
@@ -144,12 +147,99 @@ enum Action {
     ChangeFont(i32),
 }
 
+#[derive(Clone, Copy)]
+enum OverviewFocusRegion {
+    Terminal,
+    Sidebar,
+    Reader,
+    Editor,
+}
+
+#[derive(Clone, Copy)]
+struct OverviewReturnFocus {
+    pane: PaneId,
+    region: OverviewFocusRegion,
+}
+
 /// タブ内のペイン木。葉が端末、節が分割。
 enum Node {
     Leaf(Box<TerminalWindow>),
     Split(SplitNode),
     /// `mem::replace` の一時退避にだけ使う番兵。通常は出現しない。
     Empty,
+}
+
+trait PaneTreeNode: Sized {
+    fn leaf_id(&self) -> Option<PaneId>;
+    fn children(&self) -> Option<(&Self, &Self)>;
+    fn children_mut(&mut self) -> Option<(&mut bool, &mut Self, &mut Self)>;
+}
+
+fn tree_contains_pane<T: PaneTreeNode>(tree: &T, id: PaneId) -> bool {
+    if tree.leaf_id() == Some(id) {
+        return true;
+    }
+    tree.children().is_some_and(|(first, second)| {
+        tree_contains_pane(first, id) || tree_contains_pane(second, id)
+    })
+}
+
+fn focus_pane_in_tree<T: PaneTreeNode>(tree: &mut T, id: PaneId) -> bool {
+    if tree.leaf_id() == Some(id) {
+        return true;
+    }
+    let target_first = match tree.children() {
+        Some((first, _)) if tree_contains_pane(first, id) => Some(true),
+        Some((_, second)) if tree_contains_pane(second, id) => Some(false),
+        _ => None,
+    };
+    let Some(target_first) = target_first else {
+        return false;
+    };
+    let Some((focus_first, first, second)) = tree.children_mut() else {
+        return false;
+    };
+    let found = if target_first {
+        focus_pane_in_tree(first, id)
+    } else {
+        focus_pane_in_tree(second, id)
+    };
+    if found {
+        *focus_first = target_first;
+    }
+    found
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GtRoute {
+    apply_panel: bool,
+    notify: bool,
+    review: bool,
+}
+
+fn route_gt(
+    source: PaneId,
+    focused: PaneId,
+    signal: Option<AgentSignal>,
+    window_focused: bool,
+    modal_open: bool,
+) -> GtRoute {
+    let source_focused = source == focused;
+    let done = signal == Some(AgentSignal::Done);
+    GtRoute {
+        apply_panel: source_focused,
+        notify: done && !window_focused,
+        review: done && source_focused && window_focused && !modal_open,
+    }
+}
+
+fn terminal_focus_allowed(task_overview_open: bool) -> bool {
+    !task_overview_open
+}
+
+fn overview_key_is_consumed(pending: Option<KeyCode>, state: ElementState, physical: PhysicalKey) -> bool {
+    state == ElementState::Pressed
+        && matches!(physical, PhysicalKey::Code(code) if pending == Some(code))
 }
 
 struct Tab<T = Node> {
@@ -462,6 +552,20 @@ fn win_quote(s: &str) -> String {
 }
 
 impl Node {
+    fn focused_leaf(&self) -> &TerminalWindow {
+        match self {
+            Node::Leaf(w) => w,
+            Node::Split(s) => {
+                if s.focus_first {
+                    s.first.focused_leaf()
+                } else {
+                    s.second.focused_leaf()
+                }
+            }
+            Node::Empty => unreachable!("Empty node"),
+        }
+    }
+
     fn focused_leaf_mut(&mut self) -> &mut TerminalWindow {
         match self {
             Node::Leaf(w) => w,
@@ -538,8 +642,42 @@ impl Node {
         }
     }
 
-    fn take_gt_messages(&mut self, out: &mut Vec<GtMessage>) {
-        self.for_each_leaf(&mut |w| out.extend(w.take_gt_messages()));
+    fn for_each_leaf_ref(&self, f: &mut dyn FnMut(&TerminalWindow)) {
+        match self {
+            Node::Leaf(w) => f(w),
+            Node::Split(s) => {
+                s.first.for_each_leaf_ref(f);
+                s.second.for_each_leaf_ref(f);
+            }
+            Node::Empty => {}
+        }
+    }
+
+    fn take_gt_messages(&mut self, out: &mut Vec<(PaneId, GtMessage)>) {
+        self.for_each_leaf(&mut |w| {
+            let id = w.pane_id();
+            out.extend(
+                w.take_gt_messages()
+                    .into_iter()
+                    .map(|message| (id, message)),
+            );
+        });
+    }
+
+    fn contains_pane(&self, id: PaneId) -> bool {
+        tree_contains_pane(self, id)
+    }
+
+    fn focus_pane(&mut self, id: PaneId) -> bool {
+        focus_pane_in_tree(self, id)
+    }
+
+    fn pane(&self, id: PaneId) -> Option<&TerminalWindow> {
+        match self {
+            Node::Leaf(win) => (win.pane_id() == id).then_some(win),
+            Node::Split(split) => split.first.pane(id).or_else(|| split.second.pane(id)),
+            Node::Empty => None,
+        }
     }
 
     fn needs_redraw(&self) -> bool {
@@ -749,9 +887,182 @@ impl Node {
     }
 }
 
+impl PaneTreeNode for Node {
+    fn leaf_id(&self) -> Option<PaneId> {
+        match self {
+            Node::Leaf(win) => Some(win.pane_id()),
+            Node::Split(_) | Node::Empty => None,
+        }
+    }
+
+    fn children(&self) -> Option<(&Self, &Self)> {
+        match self {
+            Node::Split(split) => Some((&split.first, &split.second)),
+            Node::Leaf(_) | Node::Empty => None,
+        }
+    }
+
+    fn children_mut(&mut self) -> Option<(&mut bool, &mut Self, &mut Self)> {
+        match self {
+            Node::Split(split) => {
+                Some((&mut split.focus_first, &mut split.first, &mut split.second))
+            }
+            Node::Leaf(_) | Node::Empty => None,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn background_done_never_opens_focused_review() {
+        let route = route_gt(PaneId(2), PaneId(1), Some(AgentSignal::Done), true, false);
+        assert!(!route.apply_panel);
+        assert!(!route.review);
+        assert!(!route.notify);
+
+        let away = route_gt(PaneId(2), PaneId(1), Some(AgentSignal::Done), false, false);
+        assert!(away.notify);
+        assert!(!away.review);
+    }
+
+    #[test]
+    fn focused_messages_apply_only_when_modal_allows_review() {
+        let event = route_gt(PaneId(4), PaneId(4), None, true, false);
+        assert!(event.apply_panel);
+        assert!(!event.notify);
+        assert!(!event.review);
+
+        let done = route_gt(PaneId(4), PaneId(4), Some(AgentSignal::Done), true, false);
+        assert!(done.apply_panel);
+        assert!(done.review);
+
+        let modal = route_gt(PaneId(4), PaneId(4), Some(AgentSignal::Done), true, true);
+        assert!(modal.apply_panel);
+        assert!(!modal.review);
+    }
+
+    #[test]
+    fn background_lifecycle_cannot_restore_terminal_focus_under_overview() {
+        assert!(!terminal_focus_allowed(true));
+        assert!(terminal_focus_allowed(false));
+    }
+
+    #[test]
+    fn overview_release_guard_consumes_same_key_until_release() {
+        assert!(overview_key_is_consumed(
+            Some(KeyCode::Escape),
+            ElementState::Pressed,
+            PhysicalKey::Code(KeyCode::Escape)
+        ));
+        assert!(!overview_key_is_consumed(
+            Some(KeyCode::Escape),
+            ElementState::Released,
+            PhysicalKey::Code(KeyCode::Escape)
+        ));
+        assert!(!overview_key_is_consumed(
+            Some(KeyCode::Escape),
+            ElementState::Pressed,
+            PhysicalKey::Code(KeyCode::Enter)
+        ));
+    }
+
+    enum TestPaneTree {
+        Leaf(PaneId),
+        Split {
+            focus_first: bool,
+            first: Box<TestPaneTree>,
+            second: Box<TestPaneTree>,
+        },
+    }
+
+    impl PaneTreeNode for TestPaneTree {
+        fn leaf_id(&self) -> Option<PaneId> {
+            match self {
+                Self::Leaf(id) => Some(*id),
+                Self::Split { .. } => None,
+            }
+        }
+
+        fn children(&self) -> Option<(&Self, &Self)> {
+            match self {
+                Self::Split { first, second, .. } => Some((first, second)),
+                Self::Leaf(_) => None,
+            }
+        }
+
+        fn children_mut(&mut self) -> Option<(&mut bool, &mut Self, &mut Self)> {
+            match self {
+                Self::Split {
+                    focus_first,
+                    first,
+                    second,
+                } => Some((focus_first, first, second)),
+                Self::Leaf(_) => None,
+            }
+        }
+    }
+
+    fn test_tree() -> TestPaneTree {
+        TestPaneTree::Split {
+            focus_first: true,
+            first: Box::new(TestPaneTree::Leaf(PaneId(1))),
+            second: Box::new(TestPaneTree::Split {
+                focus_first: true,
+                first: Box::new(TestPaneTree::Leaf(PaneId(2))),
+                second: Box::new(TestPaneTree::Leaf(PaneId(3))),
+            }),
+        }
+    }
+
+    #[test]
+    fn pane_focus_changes_only_after_target_is_found() {
+        let mut tree = test_tree();
+        assert!(focus_pane_in_tree(&mut tree, PaneId(3)));
+        let TestPaneTree::Split {
+            focus_first,
+            second,
+            ..
+        } = &tree
+        else {
+            panic!("expected split");
+        };
+        assert!(!focus_first);
+        let TestPaneTree::Split { focus_first, .. } = second.as_ref() else {
+            panic!("expected nested split");
+        };
+        assert!(!focus_first);
+
+        assert!(!focus_pane_in_tree(&mut tree, PaneId(99)));
+        let TestPaneTree::Split {
+            focus_first,
+            second,
+            ..
+        } = &tree
+        else {
+            panic!("expected split");
+        };
+        assert!(!focus_first);
+        let TestPaneTree::Split { focus_first, .. } = second.as_ref() else {
+            panic!("expected nested split");
+        };
+        assert!(!focus_first);
+    }
+
+    #[test]
+    fn pane_membership_survives_tree_collapse_and_reordering() {
+        let mut tree = test_tree();
+        assert!(tree_contains_pane(&tree, PaneId(2)));
+        tree = TestPaneTree::Split {
+            focus_first: false,
+            first: Box::new(TestPaneTree::Leaf(PaneId(3))),
+            second: Box::new(TestPaneTree::Leaf(PaneId(2))),
+        };
+        assert!(focus_pane_in_tree(&mut tree, PaneId(2)));
+        assert!(!tree_contains_pane(&tree, PaneId(1)));
+    }
 
     #[test]
     fn dpi_scale_then_resize_syncs_surface_and_pty_once() {
@@ -1320,9 +1631,9 @@ impl PreviewSlot {
         win.check_update()
     }
 
-    fn take_gt_messages(&mut self, out: &mut Vec<GtMessage>) {
+    fn drain_gt_messages(&mut self) {
         if let PreviewSlot::Editor { win, .. } = self {
-            out.extend(win.take_gt_messages());
+            let _ = win.take_gt_messages();
         }
     }
 }
@@ -1350,12 +1661,17 @@ pub struct Multiplexer {
     launcher: Option<Launcher>,
     /// Stop hook（AI 応答完了）受信時に出す変更点の要約ポップアップ。
     session_review: Option<SessionReview>,
+    task_overview: Option<TaskOverview>,
+    overview_return_focus: Option<OverviewReturnFocus>,
+    overview_release_key: Option<winit::keyboard::KeyCode>,
+    overview_last_refresh: Instant,
     recent: RecentProjects,
     /// 起動時に自動で開いたランチャーか（true の間に選ぶと最初の空タブを畳む）。
     startup_launcher: bool,
     editor_focused: bool,
     reader_focused: bool,
     gt_file_assembler: GtFileAssembler,
+    observed_pane: PaneId,
     tabs: Vec<Tab>,
     focus: usize,
     modifiers: ModifiersState,
@@ -1419,6 +1735,7 @@ impl Multiplexer {
         )));
         recent.record(&initial_cwd);
 
+        let observed_pane = first.focused_leaf().pane_id();
         let mut mux = Multiplexer {
             window,
             display,
@@ -1429,11 +1746,16 @@ impl Multiplexer {
             preview_slot,
             launcher: None,
             session_review: None,
+            task_overview: None,
+            overview_return_focus: None,
+            overview_release_key: None,
+            overview_last_refresh: Instant::now(),
             recent,
             startup_launcher: false,
             editor_focused: false,
             reader_focused: false,
             gt_file_assembler: GtFileAssembler::default(),
+            observed_pane,
             tabs: vec![Tab::new(first)],
             focus: 0,
             modifiers: ModifiersState::empty(),
@@ -1468,6 +1790,165 @@ impl Multiplexer {
 
     fn focused_location(&mut self) -> ShellLocation {
         self.focused_root().focused_leaf_mut().pane_location()
+    }
+
+    fn collect_task_rows(&self) -> Vec<TaskRow> {
+        let mut rows = Vec::new();
+        for (tab_index, tab) in self.tabs.iter().enumerate() {
+            let mut pane_number = 0;
+            tab.root.for_each_leaf_ref(&mut |window| {
+                pane_number += 1;
+                let location = window.observed_location().map(|location| match location {
+                    ShellLocation::Local(path) => {
+                        sanitize_display_text(&path.to_string_lossy(), usize::MAX)
+                    }
+                    ShellLocation::Remote { host, path } => sanitize_display_text(
+                        &format!("{}:{}", host, path.to_string_lossy()),
+                        usize::MAX,
+                    ),
+                });
+                rows.push(TaskRow {
+                    id: window.pane_id(),
+                    tab_number: tab_index + 1,
+                    pane_number,
+                    location,
+                    activity: window.activity().clone(),
+                });
+            });
+        }
+        rows
+    }
+
+    fn activate_pane_by_id(&mut self, id: PaneId) -> bool {
+        let Some(tab_index) = self.tabs.iter().position(|tab| tab.root.contains_pane(id)) else {
+            return false;
+        };
+
+        self.focused_root().focused_leaf_mut().focus_changed(false);
+        if self.sidebar_focused {
+            self.sidebar.set_focused(false);
+        }
+        if self.reader_focused {
+            self.unfocus_reader();
+        }
+        if self.editor_focused {
+            if let Some(editor) = self.preview_slot.editor_mut() {
+                editor.focus_changed(false);
+            }
+        }
+        self.sidebar_focused = false;
+        self.reader_focused = false;
+        self.editor_focused = false;
+        self.focus = tab_index;
+        let found = self.tabs[tab_index].root.focus_pane(id);
+        debug_assert!(found);
+        self.apply_focused_tab_workbench();
+        self.update_status_bar();
+        self.window.set_ime_allowed(true);
+        true
+    }
+
+    fn open_task_overview(&mut self) {
+        if self.launcher.is_some() || self.session_review.is_some() || self.task_overview.is_some()
+        {
+            return;
+        }
+        let current = self.tabs[self.focus].root.focused_leaf().pane_id();
+        let region = if self.sidebar_focused {
+            OverviewFocusRegion::Sidebar
+        } else if self.reader_focused {
+            OverviewFocusRegion::Reader
+        } else if self.editor_focused {
+            OverviewFocusRegion::Editor
+        } else {
+            OverviewFocusRegion::Terminal
+        };
+        self.overview_return_focus = Some(OverviewReturnFocus {
+            pane: current,
+            region,
+        });
+
+        self.suspend_focus_for_overview();
+
+        let rows = self.collect_task_rows();
+        let mut overview = TaskOverview::new(
+            self.display.clone(),
+            self.viewport,
+            self.dpi_transition.scale_factor(),
+            rows,
+            current,
+        );
+        if self.font_diff != 0 {
+            overview.change_font_size(self.font_diff);
+        }
+        self.task_overview = Some(overview);
+        self.overview_last_refresh = Instant::now();
+        self.window.request_redraw();
+    }
+
+    fn suspend_focus_for_overview(&mut self) {
+        self.focused_root().focused_leaf_mut().focus_changed(false);
+        self.sidebar.set_focused(false);
+        if let Some(reader) = self.preview_slot.reader_mut() {
+            reader.set_focused(false);
+        }
+        if let Some(editor) = self.preview_slot.editor_mut() {
+            editor.focus_changed(false);
+        }
+        self.window.set_ime_allowed(false);
+    }
+
+    fn dismiss_task_overview(&mut self) {
+        self.task_overview = None;
+        let restore = self.overview_return_focus.take();
+        let restored_pane = restore.is_some_and(|restore| self.activate_pane_by_id(restore.pane));
+        if !restored_pane {
+            self.focused_root().focused_leaf_mut().focus_changed(true);
+            self.window.set_ime_allowed(true);
+        }
+        if let Some(restore) = restore {
+            match restore.region {
+                OverviewFocusRegion::Terminal => {}
+                OverviewFocusRegion::Sidebar if self.sidebar.is_visible() => self.focus_sidebar(),
+                OverviewFocusRegion::Reader
+                    if self.sidebar.is_visible()
+                        && self.preview_slot.visible_reader_mut().is_some() =>
+                {
+                    self.focus_reader()
+                }
+                OverviewFocusRegion::Editor
+                    if self.sidebar.is_visible() && self.preview_slot.editor_mut().is_some() =>
+                {
+                    self.focus_editor()
+                }
+                _ => {}
+            }
+        }
+        self.window.request_redraw();
+    }
+
+    fn handle_overview_outcome(&mut self, outcome: OverviewOutcome, key: KeyCode) {
+        match outcome {
+            OverviewOutcome::None => {}
+            OverviewOutcome::Dismissed => {
+                self.overview_release_key = Some(key);
+                self.dismiss_task_overview();
+            }
+            OverviewOutcome::Activate(id) => {
+                if self.activate_pane_by_id(id) {
+                    self.overview_release_key = Some(key);
+                    self.task_overview = None;
+                    self.overview_return_focus = None;
+                    self.window.request_redraw();
+                } else {
+                    let rows = self.collect_task_rows();
+                    if let Some(overview) = self.task_overview.as_mut() {
+                        overview.update_rows(rows, Instant::now());
+                        overview.set_notice("選択した作業は終了しました");
+                    }
+                }
+            }
+        }
     }
 
     fn apply_focused_tab_workbench(&mut self) {
@@ -1683,6 +2164,7 @@ impl Multiplexer {
         match keybindings::lookup(self.modifiers, code)? {
             ShortcutAction::NewTab => Some(Action::NewTab),
             ShortcutAction::OpenLauncher => Some(Action::OpenLauncher),
+            ShortcutAction::OpenTaskOverview => Some(Action::OpenTaskOverview),
             ShortcutAction::ClosePane => Some(Action::CloseFocused),
             ShortcutAction::NextTab => Some(Action::NextTab),
             ShortcutAction::PrevTab => Some(Action::PrevTab),
@@ -1723,6 +2205,8 @@ impl Multiplexer {
                 self.launcher = Some(launcher);
                 self.window.request_redraw();
             }
+
+            Action::OpenTaskOverview => self.open_task_overview(),
 
             Action::CloseFocused => {
                 let tab_empty = self.tabs[self.focus].root.close_focused();
@@ -1822,6 +2306,9 @@ impl Multiplexer {
         if let Some(review) = self.session_review.as_mut() {
             review.change_font_size(applied);
         }
+        if let Some(overview) = self.task_overview.as_mut() {
+            overview.change_font_size(applied);
+        }
         self.window.request_redraw();
     }
 
@@ -1849,6 +2336,9 @@ impl Multiplexer {
         if let Some(review) = self.session_review.as_mut() {
             review.set_scale_factor(scale_factor);
         }
+        if let Some(overview) = self.task_overview.as_mut() {
+            overview.set_scale_factor(scale_factor);
+        }
         metrics_changed
     }
 
@@ -1872,6 +2362,9 @@ impl Multiplexer {
             }
             if let Some(review) = self.session_review.as_mut() {
                 review.set_viewport(self.viewport);
+            }
+            if let Some(overview) = self.task_overview.as_mut() {
+                overview.set_viewport(self.viewport);
             }
             self.update_status_bar();
         }
@@ -2235,16 +2728,48 @@ impl Multiplexer {
         for tab in &mut self.tabs {
             tab.root.take_gt_messages(&mut messages);
         }
-        self.preview_slot.take_gt_messages(&mut messages);
+        self.preview_slot.drain_gt_messages();
+
+        let focused = self.tabs[self.focus].root.focused_leaf().pane_id();
+        if focused != self.observed_pane {
+            self.observed_pane = focused;
+            self.gt_file_assembler = GtFileAssembler::default();
+            self.sidebar.reset_pane_observations();
+            if let Some(reader) = self.preview_slot.reader_mut() {
+                reader.clear_remote_content();
+            }
+        }
 
         if messages.is_empty() {
             return;
         }
 
-        for message in messages {
+        for (source, message) in messages {
+            let signal = match &message {
+                GtMessage::State { signal, .. } => Some(*signal),
+                GtMessage::Event { .. } | GtMessage::FileChunk { .. } => None,
+            };
+            let modal_open = self.launcher.is_some()
+                || self.session_review.is_some()
+                || self.task_overview.is_some();
+            let route = route_gt(source, focused, signal, self.window_focused, modal_open);
+            if route.notify {
+                crate::window::notify_completion();
+            }
+            if !route.apply_panel {
+                continue;
+            }
             match message {
                 GtMessage::Event { kind, path, tool } => {
-                    let root = self.sidebar.root().map(Path::to_path_buf);
+                    let root = self
+                        .tabs
+                        .iter()
+                        .find_map(|tab| tab.root.pane(source))
+                        .and_then(TerminalWindow::observed_location)
+                        .and_then(|location| match location {
+                            ShellLocation::Local(path) => Some(path),
+                            ShellLocation::Remote { .. } => None,
+                        });
                     self.sidebar
                         .apply_gt_event(root.as_deref(), kind, path, tool);
                 }
@@ -2266,14 +2791,8 @@ impl Multiplexer {
                     signal,
                     detail,
                 } => {
-                    // 画面を見ていない（非フォーカス）ときだけ通知する。見ているなら
-                    // サイドバーの表示で十分で、通知はむしろ邪魔になる。
-                    if signal == AgentSignal::Done && !self.window_focused {
-                        crate::window::notify_completion();
-                    }
-                    let show_review = signal == AgentSignal::Done;
                     self.sidebar.apply_gt_state(agent, signal, detail);
-                    if show_review {
+                    if route.review {
                         self.open_session_review();
                     }
                 }
@@ -2341,9 +2860,13 @@ impl Multiplexer {
                         self.occluded = false;
                         self.window.request_redraw();
                     }
-                    self.focused_root()
-                        .focused_leaf_mut()
-                        .process_window_event(wev);
+                    if self.task_overview.is_none() {
+                        self.focused_root()
+                            .focused_leaf_mut()
+                            .process_window_event(wev);
+                    } else {
+                        self.window.set_ime_allowed(false);
+                    }
                 }
 
                 &WindowEvent::Occluded(occluded) => {
@@ -2394,6 +2917,9 @@ impl Multiplexer {
                     if let Some(review) = self.session_review.as_mut() {
                         review.draw(&mut surface);
                     }
+                    if let Some(overview) = self.task_overview.as_mut() {
+                        overview.draw(&mut surface);
+                    }
 
                     surface.finish().expect("finish");
                 }
@@ -2419,6 +2945,24 @@ impl Multiplexer {
                     if *is_synthetic {
                         return;
                     }
+                    if key.state == ElementState::Released {
+                        if let PhysicalKey::Code(code) = key.physical_key {
+                            if self.overview_release_key == Some(code) {
+                                self.overview_release_key = None;
+                                return;
+                            }
+                        }
+                    }
+                    // 一覧を閉じた直後の同一キーの自動リピートを、キー解放まで消費する。
+                    // 起動キーを押し続けても一覧の開閉が繰り返されず、Enter/Esc の
+                    // リピートも背後の端末へ流れない。
+                    if overview_key_is_consumed(
+                        self.overview_release_key,
+                        key.state,
+                        key.physical_key,
+                    ) {
+                        return;
+                    }
                     // 入力中はカーソルを点いたままにする（押した瞬間に点滅で
                     // 消えていると打ちにくい）。点滅の起点をリセットする。
                     if key.state == ElementState::Pressed {
@@ -2436,6 +2980,24 @@ impl Multiplexer {
                         self.handle_action(action);
                         return;
                     }
+                    if self.task_overview.is_some() {
+                        let code = match key.physical_key {
+                            PhysicalKey::Code(code) => code,
+                            PhysicalKey::Unidentified(_) => return,
+                        };
+                        if matches!(self.parse_shortcut(key), Some(Action::OpenTaskOverview)) {
+                            self.overview_release_key = Some(code);
+                            self.dismiss_task_overview();
+                            return;
+                        }
+                        let outcome = self
+                            .task_overview
+                            .as_mut()
+                            .map(|overview| overview.handle_key(key))
+                            .unwrap_or(OverviewOutcome::None);
+                        self.handle_overview_outcome(outcome, code);
+                        return;
+                    }
                     if let Some(review) = self.session_review.as_mut() {
                         let outcome = review.handle_key(key);
                         self.handle_session_review_outcome(outcome);
@@ -2450,6 +3012,13 @@ impl Multiplexer {
                         return;
                     }
                     if let Some(action) = self.parse_shortcut(key) {
+                        if let (Action::OpenTaskOverview, PhysicalKey::Code(code)) =
+                            (action, key.physical_key)
+                        {
+                            self.overview_release_key = Some(code);
+                            self.handle_action(Action::OpenTaskOverview);
+                            return;
+                        }
                         self.handle_action(action);
                         if self.sidebar_focused && !matches!(action, Action::ToggleSidebar) {
                             self.focused_root().focused_leaf_mut().focus_changed(false);
@@ -2472,6 +3041,11 @@ impl Multiplexer {
                             .process_window_event(wev);
                     }
                 }
+
+                WindowEvent::CursorMoved { .. }
+                | WindowEvent::MouseInput { .. }
+                | WindowEvent::MouseWheel { .. }
+                    if self.task_overview.is_some() => {}
 
                 WindowEvent::CursorMoved { position, .. } => {
                     self.cursor_pos = *position;
@@ -2569,6 +3143,9 @@ impl Multiplexer {
 
                 // ランチャー表示中の日本語入力はランチャーの入力欄へ。
                 // ここで受けないと、確定した文字が裏のシェルに打ち込まれる。
+                WindowEvent::Ime(_)
+                    if self.task_overview.is_some() || self.overview_release_key.is_some() => {}
+
                 WindowEvent::Ime(ime) if self.launcher.is_some() => {
                     if let Some(launcher) = self.launcher.as_mut() {
                         launcher.handle_ime(ime);
@@ -2641,8 +3218,24 @@ impl Multiplexer {
                     self.refresh_layout();
                     self.update_status_bar();
                 }
+                if (tab_removed || changed)
+                    && !terminal_focus_allowed(self.task_overview.is_some())
+                {
+                    self.suspend_focus_for_overview();
+                }
 
                 self.handle_gt_messages();
+
+                if self.task_overview.is_some()
+                    && self.overview_last_refresh.elapsed() >= Duration::from_secs(1)
+                {
+                    let now = Instant::now();
+                    let rows = self.collect_task_rows();
+                    if let Some(overview) = self.task_overview.as_mut() {
+                        overview.update_rows(rows, now);
+                    }
+                    self.overview_last_refresh = now;
+                }
 
                 if self.sidebar.is_visible() && self.preview_slot.check_update() {
                     if let PreviewSlot::Editor { mut saved, .. } =
@@ -2651,7 +3244,9 @@ impl Multiplexer {
                         saved.refresh_current();
                         self.preview_slot = PreviewSlot::Reader(*saved);
                         self.editor_focused = false;
-                        self.focused_root().focused_leaf_mut().focus_changed(true);
+                        if terminal_focus_allowed(self.task_overview.is_some()) {
+                            self.focused_root().focused_leaf_mut().focus_changed(true);
+                        }
                         self.refresh_layout();
                     }
                 }
@@ -2700,7 +3295,11 @@ impl Multiplexer {
                     || self
                         .session_review
                         .as_ref()
-                        .is_some_and(|review| review.needs_redraw());
+                        .is_some_and(|review| review.needs_redraw())
+                    || self
+                        .task_overview
+                        .as_ref()
+                        .is_some_and(|overview| overview.needs_redraw());
                 if need && !self.occluded && self.drawable() {
                     self.window.request_redraw();
                 }
