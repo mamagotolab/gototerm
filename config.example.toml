@@ -50,7 +50,7 @@ watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 # [keybindings]
 # open_task_overview = "Ctrl+Shift+A"
 # focus_left = "Ctrl+Alt+H"
-# toggle_sidebar = "Ctrl+Shift+Space"
+# toggle_sidebar = "Ctrl+Alt+Space"
 # new_tab = "Ctrl+Shift+N"
 
 # [編集] で使うエディタ。空なら $EDITOR → nvim の順で決まる。
@@ -64,3 +64,8 @@ watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 # CC = 204/255 = 0.80（80%不透明＝20%透過）。コンポジタ側のブラーと併用すると綺麗。
 # 完全不透明にするなら末尾を FF（0x1A1B26FF）にする。
 color_background = 0x1A1B26CC
+
+# copy_mode = "Ctrl+Shift+Space"
+# link_hints = "Ctrl+Shift+R"
+# select_tab_1 = "Ctrl+1"
+# select_tab_10 = "Ctrl+0"

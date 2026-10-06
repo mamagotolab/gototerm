@@ -51,3 +51,11 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Upload Windows development build
+        uses: actions/upload-artifact@v4
+        with:
+          name: gototerm-windows-x64
+          path: |
+            target/release/gototerm.exe
+            target/release/gototerm-hook.exe

@@ -1,4 +1,7 @@
 mod bookmarks;
+pub mod agent_hooks;
+#[cfg(windows)]
+mod state_pipe;
 mod cache;
 mod claude_sessions;
 mod config;
@@ -9,6 +12,7 @@ mod input;
 mod keybindings;
 mod file_style;
 mod launcher;
+mod link_hints;
 mod preview;
 mod reader;
 mod recent;
@@ -25,6 +29,7 @@ mod vt;
 mod watcher;
 pub mod window;
 mod workspace;
+mod workspace_sets;
 
 pub mod multiplexer;
 

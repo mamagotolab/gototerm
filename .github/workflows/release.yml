@@ -26,12 +26,16 @@ jobs:
       - name: Build
         run: cargo build --release
       - name: Rename artifact
-        run: Copy-Item target/release/gototerm.exe gototerm-windows-x64.exe
+        run: |
+          Copy-Item target/release/gototerm.exe gototerm-windows-x64.exe
+          Copy-Item target/release/gototerm-hook.exe gototerm-hook.exe
       - name: Attach to release
         uses: softprops/action-gh-release@v2
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
-          files: gototerm-windows-x64.exe
+          files: |
+            gototerm-windows-x64.exe
+            gototerm-hook.exe
 
   linux:
     runs-on: ubuntu-latest

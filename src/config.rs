@@ -191,7 +191,7 @@ pub fn build() -> Config {
         .expect("Failed to build config")
 }
 
-fn find_config_file() -> Option<PathBuf> {
+pub(crate) fn find_config_file() -> Option<PathBuf> {
     // Windows: %APPDATA%\gototerm\config.toml
     #[cfg(windows)]
     let mut base = PathBuf::from(std::env::var_os("APPDATA")?);

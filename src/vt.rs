@@ -383,6 +383,8 @@ impl Dimensions for GridSize {
 
 /// alacritty_terminal ベースの端末。`term` を描画側と共有する。
 pub struct VtTerminal {
+    #[cfg(windows)]
+    _state_pipe: Option<crate::state_pipe::StatePipe>,
     pub term: Arc<Mutex<Term<EventProxy>>>,
     writer: SharedWriter,
     master: Box<dyn MasterPty + Send>,
@@ -920,6 +922,45 @@ impl Utf8Diagnostic {
     }
 }
 
+fn advance_terminal(processor: &mut Processor, term: &mut Term<EventProxy>, bytes: &[u8]) {
+    use alacritty_terminal::grid::Scroll;
+    use alacritty_terminal::term::TermMode;
+    if !term.mode().contains(TermMode::VI) {
+        processor.advance(term, bytes);
+        return;
+    }
+    let cursor = term.vi_mode_cursor;
+    let offset = term.grid().display_offset();
+    let history = term.history_size();
+    let selection = term
+        .selection
+        .as_ref()
+        .and_then(|selection| selection.to_range(term));
+    let alt = term.mode().contains(TermMode::ALT_SCREEN);
+    processor.advance(term, bytes);
+    if alt != term.mode().contains(TermMode::ALT_SCREEN) || !term.mode().contains(TermMode::VI) {
+        return;
+    }
+    let moved = match (
+        selection,
+        term.selection
+            .as_ref()
+            .and_then(|selection| selection.to_range(term)),
+    ) {
+        (Some(before), Some(after)) => before.start.line.0 - after.start.line.0,
+        _ => term.history_size().saturating_sub(history) as i32,
+    };
+    if moved > 0 {
+        let desired = (offset + moved as usize).min(term.history_size());
+        let delta = desired as i32 - term.grid().display_offset() as i32;
+        term.grid_mut().scroll_display(Scroll::Delta(delta));
+        term.vi_mode_cursor = cursor;
+        term.vi_mode_cursor.point.line = Line(
+            (cursor.point.line.0 - moved).clamp(term.topmost_line().0, term.bottommost_line().0),
+        );
+    }
+}
+
 fn advance_pass(
     processor: &mut Processor,
     term: &mut Term<EventProxy>,
@@ -928,7 +969,7 @@ fn advance_pass(
     diagnostic: &mut Utf8Diagnostic,
 ) -> Vec<Utf8Issue> {
     if !diagnostic.enabled {
-        processor.advance(term, bytes);
+        advance_terminal(processor, term, bytes);
         return Vec::new();
     }
 
@@ -940,7 +981,7 @@ fn advance_pass(
             std::slice::from_ref(byte),
             modes,
         ));
-        processor.advance(term, std::slice::from_ref(byte));
+        advance_terminal(processor, term, std::slice::from_ref(byte));
     }
     issues
 }
@@ -1103,6 +1144,9 @@ impl VtTerminal {
         command: Option<&[String]>,
     ) -> Self {
         let _ = local_hostname();
+        let gt_messages: Arc<Mutex<Vec<GtMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        #[cfg(windows)]
+        let state_pipe = crate::state_pipe::StatePipe::new(gt_messages.clone());
 
         let pty_system = portable_pty::native_pty_system();
         let pair = pty_system
@@ -1146,6 +1190,7 @@ impl VtTerminal {
                 "WEZTERM_PANE",
                 "WEZTERM_UNIX_SOCKET",
                 "WEZTERM_CONFIG_FILE",
+                "GOTOTERM_STATE_PIPE",
             ];
             for (key, val) in std::env::vars() {
                 if STRIP_ENV.contains(&key.as_str()) {
@@ -1157,6 +1202,10 @@ impl VtTerminal {
             cmd.env("TERM", "xterm-256color");
             // 自分の正体を伝える（画像対応端末と誤認させない）
             cmd.env("TERM_PROGRAM", "gototerm");
+            #[cfg(windows)]
+            if let Some(pipe) = &state_pipe {
+                cmd.env("GOTOTERM_STATE_PIPE", &pipe.name);
+            }
             cmd.cwd(cwd);
             cmd
         };
@@ -1197,7 +1246,6 @@ impl VtTerminal {
         let exited = Arc::new(AtomicBool::new(false));
         let dirty = Arc::new(AtomicBool::new(true));
         let images: Arc<Mutex<Vec<PositionedImage>>> = Arc::new(Mutex::new(Vec::new()));
-        let gt_messages: Arc<Mutex<Vec<GtMessage>>> = Arc::new(Mutex::new(Vec::new()));
         let last_alt = Arc::new(AtomicBool::new(false));
         let shell_location = Arc::new(Mutex::new(None));
 
@@ -1286,6 +1334,8 @@ impl VtTerminal {
         }
 
         VtTerminal {
+            #[cfg(windows)]
+            _state_pipe: state_pipe,
             term,
             writer,
             master,
@@ -1331,6 +1381,10 @@ impl VtTerminal {
     }
 
     /// 前回以降に画面内容が変わったか（変わっていれば true を返し、フラグを下げる）。
+    pub(crate) fn mark_dirty(&self) {
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::SeqCst)
     }
@@ -1400,10 +1454,76 @@ impl VtTerminal {
     /// スクロールバック表示を delta 行ぶん動かす（正で過去方向＝上）。
     pub fn scroll(&self, delta: i32) {
         use alacritty_terminal::grid::Scroll;
+        let mut term = self.term.lock().unwrap();
+        let cursor = term.vi_mode_cursor;
+        let selection = term.selection.clone();
+        term.scroll_display(Scroll::Delta(delta));
+        if term.mode().contains(alacritty_terminal::term::TermMode::VI) {
+            term.vi_mode_cursor = cursor;
+            term.selection = selection;
+        }
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn copy_mode_active(&self) -> bool {
         self.term
             .lock()
             .unwrap()
-            .scroll_display(Scroll::Delta(delta));
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::VI)
+    }
+
+    pub(crate) fn toggle_copy_mode(&self) {
+        let mut term = self.term.lock().unwrap();
+        term.toggle_vi_mode();
+        if term.mode().contains(alacritty_terminal::term::TermMode::VI) {
+            term.selection = None;
+        }
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn copy_mode_motion(&self, motion: alacritty_terminal::vi_mode::ViMotion) {
+        self.term.lock().unwrap().vi_motion(motion);
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn copy_mode_edge(&self, oldest: bool) {
+        let mut term = self.term.lock().unwrap();
+        let line = if oldest {
+            term.topmost_line()
+        } else {
+            term.bottommost_line()
+        };
+        let column = term.vi_mode_cursor.point.column;
+        term.vi_goto_point(Point::new(line, column));
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) fn copy_mode_page(&self, up: bool) {
+        let rows = self.size().1 / 2;
+        let motion = if up {
+            alacritty_terminal::vi_mode::ViMotion::Up
+        } else {
+            alacritty_terminal::vi_mode::ViMotion::Down
+        };
+        for _ in 0..rows.max(1) {
+            self.copy_mode_motion(motion);
+        }
+    }
+
+    pub(crate) fn copy_mode_select(&self, kind: SelectionType) {
+        let mut term = self.term.lock().unwrap();
+        if term
+            .selection
+            .as_ref()
+            .is_some_and(|selection| selection.ty == kind)
+        {
+            term.selection = None;
+        } else {
+            let mut selection = AlacSelection::new(kind, term.vi_mode_cursor.point, Side::Left);
+            selection.include_all();
+            term.selection = Some(selection);
+        }
         self.dirty.store(true, Ordering::SeqCst);
     }
 
@@ -1546,6 +1666,79 @@ use crate::terminal::{
 use alacritty_terminal::term::cell::Flags;
 use vte::ansi::{Color as AColor, CursorShape, NamedColor};
 
+/// 表示位置のリンクを端末グリッドから取得する。OSC 8 と自動折り返しを保持する。
+fn url_at(term: &Term<EventProxy>, row: usize, col: usize) -> Option<String> {
+    if row >= term.screen_lines() || col >= term.columns() {
+        return None;
+    }
+    let grid = term.grid();
+    let line = Line(row as i32 - grid.display_offset() as i32);
+    let mut point = Point::new(line, Column(col));
+    if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
+        point.column = Column(col - 1);
+    }
+    let is_web_url = |url: &str| {
+        (url.starts_with("https://") || url.starts_with("http://"))
+            && !url.chars().any(char::is_control)
+    };
+    if let Some(link) = grid[point].hyperlink() {
+        return is_web_url(link.uri()).then(|| link.uri().to_owned());
+    }
+
+    let last_col = Column(term.columns() - 1);
+    let mut first = line;
+    while first > term.topmost_line()
+        && grid[Line(first.0 - 1)][last_col]
+            .flags
+            .contains(Flags::WRAPLINE)
+    {
+        first -= 1;
+    }
+    let mut last = line;
+    while last < term.bottommost_line() && grid[last][last_col].flags.contains(Flags::WRAPLINE) {
+        last += 1;
+    }
+    // 1要素＝画面の1列。全角後半は文字列化するときだけ除外する。
+    let mut chars = Vec::new();
+    for row in first.0..=last.0 {
+        for col in 0..term.columns() {
+            let cell = &grid[Line(row)][Column(col)];
+            chars.push(
+                if cell
+                    .flags
+                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                {
+                    '\0'
+                } else {
+                    cell.c
+                },
+            );
+        }
+    }
+    let index = (line.0 - first.0) as usize * term.columns() + point.column.0;
+    let is_token = |c: char| {
+        !c.is_whitespace()
+            && !matches!(
+                c,
+                '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '│'
+            )
+    };
+    if !is_token(chars[index]) {
+        return None;
+    }
+    let mut start = index;
+    while start > 0 && is_token(chars[start - 1]) {
+        start -= 1;
+    }
+    let mut end = index + 1;
+    while end < chars.len() && is_token(chars[end]) {
+        end += 1;
+    }
+    let token: String = chars[start..end].iter().filter(|c| **c != '\0').collect();
+    let token = token.trim_end_matches(['.', ',', ';', ':', '!', '?', '。', '、']);
+    is_web_url(token).then(|| token.to_owned())
+}
+
 /// 1フレーム分の描画スナップショット。
 pub struct Snapshot {
     pub lines: Vec<TLine>,
@@ -1554,6 +1747,10 @@ pub struct Snapshot {
 }
 
 impl VtTerminal {
+    pub fn url_at(&self, row: usize, col: usize) -> Option<String> {
+        url_at(&self.term.lock().unwrap(), row, col)
+    }
+
     /// 現在の画面内容を既存描画形式に変換して取り出す。
     pub fn snapshot(&self) -> Snapshot {
         let term = self.term.lock().unwrap();
@@ -1798,6 +1995,84 @@ mod tests {
         (writer, buf)
     }
 
+    fn link_test_term(cols: usize, input: &str) -> Term<EventProxy> {
+        let (writer, _) = dummy_writer();
+        let proxy = EventProxy {
+            writer,
+            winsize: Arc::new(Mutex::new(window_size(cols, 4, 9, 18))),
+        };
+        let mut term = Term::new(Config::default(), &GridSize { cols, lines: 4 }, proxy);
+        let mut processor: Processor = Processor::new();
+        processor.advance(&mut term, input.as_bytes());
+        term
+    }
+
+    #[test]
+    fn url_at_plain_mail_text_with_japanese_prefix() {
+        let term = link_test_term(80, "本文 <https://example.com/path?q=1&lang=ja> 後続");
+        assert_eq!(
+            url_at(&term, 0, 6).as_deref(),
+            Some("https://example.com/path?q=1&lang=ja")
+        );
+        assert_eq!(url_at(&term, 0, 3), None);
+    }
+
+    #[test]
+    fn url_at_in_alternate_screen_with_app_mouse_mode() {
+        let term = link_test_term(80, "\x1b[?1049h\x1b[?1000hhttps://example.com");
+        assert_eq!(url_at(&term, 0, 5).as_deref(), Some("https://example.com"));
+    }
+
+    #[test]
+    fn url_at_osc8_label_and_wide_character() {
+        let term = link_test_term(
+            40,
+            "\x1b]8;;https://example.com/path\x1b\\日本語リンク\x1b]8;;\x1b\\ tail",
+        );
+        for col in 0..12 {
+            assert_eq!(
+                url_at(&term, 0, col).as_deref(),
+                Some("https://example.com/path")
+            );
+        }
+        assert_eq!(url_at(&term, 0, 13), None);
+    }
+
+    #[test]
+    fn url_at_soft_wrapped_plain_url() {
+        let term = link_test_term(16, "https://example.com/long/path");
+        assert_eq!(
+            url_at(&term, 0, 0).as_deref(),
+            Some("https://example.com/long/path")
+        );
+        assert_eq!(
+            url_at(&term, 1, 5).as_deref(),
+            Some("https://example.com/long/path")
+        );
+    }
+
+    #[test]
+    fn url_at_does_not_join_hard_newlines() {
+        let term = link_test_term(40, "https://example.com\r\n/unrelated");
+        assert_eq!(url_at(&term, 0, 0).as_deref(), Some("https://example.com"));
+        assert_eq!(url_at(&term, 1, 0), None);
+    }
+
+    #[test]
+    fn url_at_uses_scrollback_and_rejects_outside_viewport() {
+        let mut term = link_test_term(40, "https://example.com\r\n1\r\n2\r\n3\r\n4");
+        term.scroll_display(alacritty_terminal::grid::Scroll::Top);
+        assert_eq!(url_at(&term, 0, 5).as_deref(), Some("https://example.com"));
+        assert_eq!(url_at(&term, 4, 0), None);
+        assert_eq!(url_at(&term, 0, 40), None);
+    }
+
+    #[test]
+    fn url_at_does_not_open_non_web_osc8_targets() {
+        let term = link_test_term(40, "\x1b]8;;file:///tmp/example\x1b\\label\x1b]8;;\x1b\\");
+        assert_eq!(url_at(&term, 0, 0), None);
+    }
+
     fn render_split_input(input: &[u8], split: usize) -> String {
         let (writer, _buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
@@ -2014,6 +2289,71 @@ mod tests {
         terminal.scroll(3);
         let after = terminal.selection_text(selection);
         assert_eq!(after, before);
+    }
+
+    #[test]
+    fn copy_mode_selection_crosses_scrollback_without_moving_anchor() {
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        for n in 0..10 {
+            processor.advance(
+                &mut *terminal.term.lock().unwrap(),
+                format!("L{n}\r\n").as_bytes(),
+            );
+        }
+        terminal.toggle_copy_mode();
+        terminal.copy_mode_edge(true);
+        terminal.copy_mode_select(SelectionType::Lines);
+        for _ in 0..7 {
+            terminal.copy_mode_motion(alacritty_terminal::vi_mode::ViMotion::Down);
+        }
+        assert_eq!(
+            terminal.tracked_selection_text().unwrap().1,
+            "L0\nL1\nL2\nL3\nL4\nL5\nL6\nL7"
+        );
+        terminal.scroll(2);
+        assert_eq!(
+            terminal.tracked_selection_text().unwrap().1,
+            "L0\nL1\nL2\nL3\nL4\nL5\nL6\nL7"
+        );
+        terminal.toggle_copy_mode();
+        assert!(!terminal.copy_mode_active());
+    }
+
+    #[test]
+    fn copy_mode_wide_characters_and_new_output_preserve_selected_text() {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        processor.advance(
+            &mut *terminal.term.lock().unwrap(),
+            "日本語\r\nsecond\r\nthird\r\nfourth".as_bytes(),
+        );
+        terminal.toggle_copy_mode();
+        terminal.copy_mode_edge(true);
+        terminal.copy_mode_motion(ViMotion::First);
+        terminal.copy_mode_select(SelectionType::Simple);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "日");
+        terminal.copy_mode_motion(ViMotion::Right);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "日本");
+        advance_pass(
+            &mut processor,
+            &mut terminal.term.lock().unwrap(),
+            0,
+            b"\r\nmore\r\noutput",
+            &mut Utf8Diagnostic::new(false),
+        );
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "日本");
+        terminal.copy_mode_motion(ViMotion::Right);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "日本語");
+        terminal.copy_mode_select(SelectionType::Block);
+        terminal.copy_mode_motion(ViMotion::Left);
+        terminal.copy_mode_motion(ViMotion::Down);
+        let selection = terminal.tracked_selection_text().unwrap();
+        assert!(selection.0.block);
+        assert_eq!(selection.1, "本語\non");
     }
 
     #[test]
