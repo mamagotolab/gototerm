@@ -19,15 +19,22 @@ use crate::file_style::{icon_and_color, ACCENT, DIM, DIR_FG, SEL_BG, SEL_FG};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum LauncherOutcome {
+    SaveWorkspace(String),
+    OpenWorkspace(String),
     /// このディレクトリでターミナルを開く。
     OpenIn {
         dir: PathBuf,
         command: Option<Vec<String>>,
     },
     /// このファイルをエディタで開く（新タブ、cwd=親フォルダ）。
-    OpenFile { file: PathBuf, dir: PathBuf },
+    OpenFile {
+        file: PathBuf,
+        dir: PathBuf,
+    },
     /// OS の既定アプリで開く。ランチャーは開いたまま（続けて選べる）。
-    OpenExternal { file: PathBuf },
+    OpenExternal {
+        file: PathBuf,
+    },
     /// 何もせず閉じる。
     Cancelled,
     /// まだ操作中。
@@ -67,6 +74,12 @@ pub struct Launcher {
 }
 
 impl Launcher {
+    pub(crate) fn workspace_notice(&mut self, notice: String) {
+        self.state.workspace_notice = notice;
+        self.state.mode = Mode::Workspaces;
+        self.state.reload_workspaces();
+        self.rebuild();
+    }
     pub fn new(
         display: Display,
         viewport: Viewport,
@@ -168,6 +181,8 @@ struct Entry {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
+    Workspaces,
+    WorkspaceName,
     Browse,
     Recent,
     Bookmarks,
@@ -182,6 +197,10 @@ enum Mode {
 
 #[derive(Clone, Debug)]
 struct LauncherState {
+    workspaces: Vec<crate::workspace_sets::WorkspaceSet>,
+    workspace_selected: usize,
+    workspace_name: String,
+    workspace_notice: String,
     /// いま中身を見せているディレクトリ。
     dir: PathBuf,
     /// dir の中身（親があれば先頭に ".."）。
@@ -228,9 +247,127 @@ enum LaunchRow {
 }
 
 impl LauncherState {
+    fn reload_workspaces(&mut self) {
+        match crate::workspace_sets::load_all() {
+            Ok(sets) => self.workspaces = sets,
+            Err(error) => {
+                self.workspaces.clear();
+                self.workspace_notice = error;
+            }
+        }
+        self.workspace_selected = self
+            .workspace_selected
+            .min(self.workspaces.len().saturating_sub(1));
+    }
+
+    fn enter_workspaces(&mut self) {
+        self.workspace_notice.clear();
+        self.reload_workspaces();
+        self.mode = Mode::Workspaces;
+    }
+
+    fn handle_workspace_key(&mut self, code: KeyCode, text: Option<&str>) -> LauncherOutcome {
+        if self.mode == Mode::WorkspaceName {
+            match code {
+                KeyCode::Escape => self.mode = Mode::Workspaces,
+                KeyCode::Backspace => {
+                    self.workspace_name.pop();
+                }
+                KeyCode::Enter => {
+                    let name = self.workspace_name.trim().to_owned();
+                    match crate::workspace_sets::validate_name(&name) {
+                        Ok(()) => return LauncherOutcome::SaveWorkspace(name),
+                        Err(error) => self.workspace_notice = error,
+                    }
+                }
+                _ => {
+                    if let Some(text) = text {
+                        self.workspace_name.push_str(text);
+                    }
+                }
+            }
+        } else {
+            match code {
+                KeyCode::Escape => self.mode = Mode::Browse,
+                KeyCode::ArrowUp => {
+                    self.workspace_selected = self.workspace_selected.saturating_sub(1)
+                }
+                KeyCode::ArrowDown => {
+                    self.workspace_selected =
+                        (self.workspace_selected + 1).min(self.workspaces.len().saturating_sub(1))
+                }
+                KeyCode::Enter => {
+                    if let Some(set) = self.workspaces.get(self.workspace_selected) {
+                        return LauncherOutcome::OpenWorkspace(set.name.clone());
+                    }
+                }
+                _ => match text {
+                    Some("s") => {
+                        self.workspace_name.clear();
+                        self.workspace_notice.clear();
+                        self.mode = Mode::WorkspaceName;
+                    }
+                    Some("d") => {
+                        if let Some(set) = self.workspaces.get(self.workspace_selected) {
+                            self.workspace_notice = match crate::workspace_sets::delete(&set.name) {
+                                Ok(()) => "作業セットを削除しました".into(),
+                                Err(error) => error,
+                            };
+                            self.reload_workspaces();
+                        }
+                    }
+                    _ => {}
+                },
+            }
+        }
+        LauncherOutcome::None
+    }
+
+    fn render_workspaces(&mut self, cols: usize, rows: usize) -> Vec<Line> {
+        let mut lines = vec![text_line(
+            cols,
+            "作業セット  Enter:新しいタブに復元  s:現在の配置を保存  d:削除  Esc:戻る",
+            DIR_FG,
+        )];
+        if self.mode == Mode::WorkspaceName {
+            let input = format!("名前: {}{}", self.workspace_name, self.preedit);
+            lines.push(text_line(cols, &input, Color::White));
+            self.ime_cursor = Some((
+                1.min(rows.saturating_sub(1)),
+                display_width(&input).min(cols.saturating_sub(1)),
+            ));
+            lines.push(text_line(cols, "Enter:保存  Esc:戻る", DIM));
+        } else {
+            let body = rows.saturating_sub(3).max(1);
+            let offset = self.workspace_selected.saturating_sub(body - 1);
+            for (i, set) in self.workspaces.iter().enumerate().skip(offset).take(body) {
+                lines.push(bar_line(
+                    cols,
+                    &format!("  {}  ({}タブ)", set.name, set.tabs.len()),
+                    Color::White,
+                    i == self.workspace_selected,
+                ));
+            }
+            if self.workspaces.is_empty() {
+                lines.push(text_line(
+                    cols,
+                    "保存済みセットはありません。sで現在の配置を保存できます",
+                    DIM,
+                ));
+            }
+        }
+        lines.push(text_line(cols, &self.workspace_notice, Color::Yellow));
+        lines.resize_with(rows, || text_line(cols, "", Color::White));
+        lines.truncate(rows);
+        lines
+    }
     fn new(recent: Vec<PathBuf>) -> Self {
         let dir = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
         let mut state = Self {
+            workspaces: Vec::new(),
+            workspace_selected: 0,
+            workspace_name: String::new(),
+            workspace_notice: String::new(),
             entries: Vec::new(),
             canonical_dir: dir.clone(),
             dir,
@@ -262,6 +399,10 @@ impl LauncherState {
     #[cfg(test)]
     fn with_dir(recent: Vec<PathBuf>, dir: PathBuf) -> Self {
         let mut state = Self {
+            workspaces: Vec::new(),
+            workspace_selected: 0,
+            workspace_name: String::new(),
+            workspace_notice: String::new(),
             entries: Vec::new(),
             canonical_dir: dir.clone(),
             dir,
@@ -318,6 +459,7 @@ impl LauncherState {
     /// 確定した文字列の行き先。文字を受け付ける画面だけが受け取る。
     fn insert_text(&mut self, text: &str) {
         match self.mode {
+            Mode::WorkspaceName => self.workspace_name.push_str(text),
             // 名前欄にカーソルがあるときだけ（行を選んでいる間は入れない）。
             Mode::LaunchMenu if self.launch_row.is_none() => self.session_name.push_str(text),
             // 絞り込み中の `/` 検索。日本語のファイル名もここで打てる。
@@ -337,6 +479,7 @@ impl LauncherState {
             return LauncherOutcome::None;
         }
         match self.mode {
+            Mode::Workspaces | Mode::WorkspaceName => self.handle_workspace_key(code, text),
             Mode::Browse => self.handle_browse_key(code, text),
             Mode::Recent => self.handle_recent_key(code, text),
             Mode::Bookmarks => self.handle_bookmark_key(code, text),
@@ -359,6 +502,7 @@ impl LauncherState {
             KeyCode::ArrowRight => self.descend(),
             KeyCode::ArrowLeft => self.ascend(),
             _ => match text {
+                Some("w") => self.enter_workspaces(),
                 Some("j") => self.move_sel(1),
                 Some("k") => self.move_sel(-1),
                 Some("l") => self.descend(),
@@ -450,17 +594,28 @@ impl LauncherState {
     }
 
     fn selected_bookmark(&self) -> Option<PathBuf> {
-        self.bookmarks.entries().get(self.bookmark_selected).cloned()
+        self.bookmarks
+            .entries()
+            .get(self.bookmark_selected)
+            .cloned()
     }
 
     fn open_selected_bookmark(&mut self) {
-        if let Some(dir) = self.selected_bookmark().as_deref().and_then(resolve_existing_dir) {
+        if let Some(dir) = self
+            .selected_bookmark()
+            .as_deref()
+            .and_then(resolve_existing_dir)
+        {
             self.confirm_dir(dir);
         }
     }
 
     fn browse_selected_bookmark(&mut self) {
-        if let Some(dir) = self.selected_bookmark().as_deref().and_then(resolve_existing_dir) {
+        if let Some(dir) = self
+            .selected_bookmark()
+            .as_deref()
+            .and_then(resolve_existing_dir)
+        {
             self.dir = dir;
             self.filter = None;
             self.mode = Mode::Browse;
@@ -488,8 +643,7 @@ impl LauncherState {
             return;
         }
         let last = (len - 1) as isize;
-        self.bookmark_selected =
-            (self.bookmark_selected as isize + delta).clamp(0, last) as usize;
+        self.bookmark_selected = (self.bookmark_selected as isize + delta).clamp(0, last) as usize;
     }
 
     /// 一覧の行頭に出す印。ブックマーク済みのフォルダなら "★"、それ以外は同じ幅の空白。
@@ -497,7 +651,10 @@ impl LauncherState {
         if entry.name == ".." || !entry.is_dir {
             return " ";
         }
-        if self.bookmarks.contains(&self.canonical_dir.join(&entry.name)) {
+        if self
+            .bookmarks
+            .contains(&self.canonical_dir.join(&entry.name))
+        {
             "★"
         } else {
             " "
@@ -954,6 +1111,7 @@ impl LauncherState {
         // 変換候補の位置は描くたびに置き直す（入力欄の無い画面では出さない）。
         self.ime_cursor = None;
         match self.mode {
+            Mode::Workspaces | Mode::WorkspaceName => self.render_workspaces(cols, rows),
             Mode::Browse => self.render_browse(cols, rows),
             Mode::Recent => self.render_recent(cols, rows),
             Mode::Bookmarks => self.render_bookmarks(cols, rows),
@@ -1020,7 +1178,7 @@ impl LauncherState {
                 query
             ),
             None => {
-                "j/k:移動  l:入る  h:上へ  Enter:開く  o:既定アプリ  m:★登録  b:★一覧  .:隠し  r:最近  Esc:閉じる"
+                "j/k:移動  l:入る  h:上へ  Enter:開く  o:既定アプリ  m:★登録  b:★一覧  w:作業セット  .:隠し  r:最近  Esc:閉じる"
                     .to_owned()
             }
         };
@@ -1270,7 +1428,11 @@ impl LauncherState {
             self.nudge_selected == 1,
         ));
         content.push((String::new(), Color::White, false));
-        content.push(("j/k:選択  Enter:決定  Esc:今回はしない".to_owned(), DIM, false));
+        content.push((
+            "j/k:選択  Enter:決定  Esc:今回はしない".to_owned(),
+            DIM,
+            false,
+        ));
 
         overlay_list_popup(lines, cols, rows, &content);
     }
@@ -1500,11 +1662,20 @@ fn is_claude(command: &[String]) -> bool {
 /// 提案になるので出さない。既に `.claude/settings.local.json` があるなら
 /// （gt hooks 済みでも、他の設定でも）触れない＝提案自体を出さない。
 fn hooks_nudge_applicable(dir: &Path) -> bool {
-    crate::multiplexer::command_exists("claude") && !dir.join(".claude/settings.local.json").exists()
+    #[cfg(windows)]
+    if !std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| exe.with_file_name("gototerm-hook.exe").is_file())
+    {
+        return false;
+    }
+    crate::multiplexer::command_exists("claude")
+        && !dir.join(".claude/settings.local.json").exists()
 }
 
 /// `assets/bin/gt` の `hook_snippet()` と同じ内容。gt が未導入の環境でも
 /// 導線が成立するよう、シェルアウトせず直接書き込む（keep in sync with gt script）。
+#[cfg(not(windows))]
 const HOOK_SNIPPET: &str = r#"{
   "hooks": {
     "PostToolUse": [
@@ -1534,10 +1705,17 @@ const HOOK_SNIPPET: &str = r#"{
 }
 "#;
 
+#[cfg(not(windows))]
 fn write_hooks_config(dir: &Path) -> std::io::Result<()> {
     let claude_dir = dir.join(".claude");
     std::fs::create_dir_all(&claude_dir)?;
     std::fs::write(claude_dir.join("settings.local.json"), HOOK_SNIPPET)
+}
+
+#[cfg(windows)]
+fn write_hooks_config(dir: &Path) -> std::io::Result<()> {
+    let exe = std::env::current_exe()?.with_file_name("gototerm-hook.exe");
+    crate::agent_hooks::setup(dir, &exe, &["claude"], false).map_err(std::io::Error::other)
 }
 
 fn resolve_existing_dir(path: &Path) -> Option<PathBuf> {
@@ -1698,6 +1876,33 @@ fn fill_cells(text: &str, fg: Color, bg: Color, cols: usize) -> Vec<Cell> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn workspace_name_accepts_ime_without_submitting_commit_enter() {
+        let mut state = LauncherState::with_dir(vec![], std::env::temp_dir());
+        state.mode = Mode::WorkspaceName;
+        state.handle_ime(&Ime::Commit("開発用".into()));
+        assert_eq!(
+            state.handle_key_parts(KeyCode::Enter, None),
+            LauncherOutcome::None
+        );
+        state.last_ime_commit = Instant::now() - Duration::from_secs(1);
+        assert_eq!(
+            state.handle_key_parts(KeyCode::Enter, None),
+            LauncherOutcome::SaveWorkspace("開発用".into())
+        );
+        state.mode = Mode::Workspaces;
+        state.workspaces = vec![crate::workspace_sets::WorkspaceSet {
+            name: "開発用".into(),
+            tabs: vec![],
+        }];
+        assert_eq!(
+            state.handle_key_parts(KeyCode::Enter, None),
+            LauncherOutcome::OpenWorkspace("開発用".into())
+        );
+        state.handle_key_parts(KeyCode::Escape, None);
+        assert_eq!(state.mode, Mode::Browse);
+    }
+
     fn temp_tree() -> PathBuf {
         // テストは並列実行されるので、呼び出しごとに一意なディレクトリにする。
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -1822,7 +2027,11 @@ mod tests {
         );
 
         // フォルダでは何もしない。
-        let idx = state.entries.iter().position(|e| e.name == "apple").unwrap();
+        let idx = state
+            .entries
+            .iter()
+            .position(|e| e.name == "apple")
+            .unwrap();
         state.selected = idx;
         assert_eq!(state.open_selected_external(), LauncherOutcome::None);
 
@@ -1911,7 +2120,10 @@ mod tests {
         state.handle_key_parts(KeyCode::KeyM, Some("m"));
 
         let apple = std::fs::canonicalize(base.join("apple")).unwrap();
-        assert!(state.bookmarks.contains(&apple), "選択中フォルダが登録される");
+        assert!(
+            state.bookmarks.contains(&apple),
+            "選択中フォルダが登録される"
+        );
         let entry = state.entries[state.selected].clone();
         assert_eq!(state.bookmark_mark(&entry), "★", "一覧に印が出る");
 
@@ -1938,7 +2150,10 @@ mod tests {
         state.handle_key_parts(KeyCode::KeyM, Some("m"));
 
         let apple = std::fs::canonicalize(base.join("apple")).unwrap();
-        assert!(state.bookmarks.contains(&apple), "親ではなく apple が登録される");
+        assert!(
+            state.bookmarks.contains(&apple),
+            "親ではなく apple が登録される"
+        );
 
         let _ = std::fs::remove_dir_all(&base);
     }
@@ -2027,7 +2242,10 @@ mod tests {
             .position(|e| e.name == "apple")
             .unwrap();
         state.descend();
-        assert_eq!(state.entries[state.selected].name, "..", "入った直後は .. が選択");
+        assert_eq!(
+            state.entries[state.selected].name, "..",
+            "入った直後は .. が選択"
+        );
 
         let outcome = state.handle_key_parts(KeyCode::Enter, None);
         let expected = std::fs::canonicalize(base.join("apple")).unwrap();
@@ -2118,7 +2336,10 @@ mod tests {
         assert_eq!(state.mode, Mode::Agent);
         assert_eq!(state.chosen_dir, Some(base.clone()));
         let written = std::fs::read_to_string(&settings).unwrap();
+        #[cfg(not(windows))]
         assert!(written.contains("PostToolUse"));
+        #[cfg(windows)]
+        assert!(written.contains("gototerm-hook.exe"));
         assert!(written.contains("Notification"));
         assert!(written.contains("Stop"));
         assert!(written.contains("SessionStart"));
@@ -2204,7 +2425,8 @@ mod tests {
                 id: format!("{i}{i}{i}{i}{i}{i}{i}{i}-1111-1111-1111-111111111111"),
                 label: format!("過去の作業{i}"),
                 named: i == 0,
-                modified: std::time::SystemTime::now() - std::time::Duration::from_secs(600 * (i as u64 + 1)),
+                modified: std::time::SystemTime::now()
+                    - std::time::Duration::from_secs(600 * (i as u64 + 1)),
             })
             .collect()
     }
@@ -2495,7 +2717,12 @@ mod tests {
 
     #[test]
     fn column_cells_preserve_combined_glyphs_and_keep_following_text() {
-        let cells = column_cells("e\u{301}か\u{3099}状態", Color::White, Color::Background, 10);
+        let cells = column_cells(
+            "e\u{301}か\u{3099}状態",
+            Color::White,
+            Color::Background,
+            10,
+        );
         let text: String = cells
             .iter()
             .filter(|cell| cell.width > 0)

@@ -13,6 +13,36 @@ alacritty に渡す前段（SixelSplitter と同じ位置）で抽出する。
 
 ## メッセージ一覧
 
+### Windowsネイティブの状態フック
+
+WindowsのClaude Code/Codexには`gototerm-hook.exe`を使う。
+`gototerm-hook.exe init-hooks <project> all`は、Claudeの`.claude/settings.local.json`と
+Codexの`.codex/hooks.json`に定義を追加する。既存のJSONキー・フックと
+`config.toml`は保持し、変更前のJSONを`.json.gototerm-backup`へ一度保存する。
+不正なJSONや安全に結合できない形式なら書き込み前にエラーにする。
+Codexは追加後に`/hooks`で定義を確認・信頼する必要がある。
+`remove-hooks <project> all`は同じhelperへの定義だけを取り除く。
+
+gototermはPTYごとにローカルの名前付きパイプを作り、子プロセスへ
+`GOTOTERM_STATE_PIPE`を渡す。helperはフックのstdinを256KBまで読み、
+イベント名だけから次のJSONを送る。会話、ツール入力、コマンド本文、理由は送らない。
+
+```json
+{"agent":"codex","state":"blocked"}
+```
+
+agentは`claude`/`codex`、stateは`session_start`/`blocked`/`done`/`session_end`だけ。
+親は128バイトを超えるメッセージや未知のキーを破棄し、対応するPTYの
+既存`GtMessage::State`に変換する。UIスレッドは受信待ちをしない。
+PTY破棄時に受信を終了し、パイプを閉じる。
+PermissionRequestでは許可・拒否・継続停止の判断を返さない。
+Codexへの標準出力は空のJSONオブジェクトだけとし、通常の承認フローを維持する。
+パイプが無いgototerm外では通知を行わず終了する。
+Claude Notificationは承認・入力待ちだけを対象にし、認証成功等を待機状態にしない。
+
+フック定義は[Claude CodeのPowerShellフック](https://code.claude.com/docs/en/hooks#windows-powershell-tool)と
+[Codexのフック仕様](https://learn.chatgpt.com/docs/hooks)に従う。
+
 ### 1. cwd 通知 — 標準 OSC 7（新規発明しない）
 
 ```

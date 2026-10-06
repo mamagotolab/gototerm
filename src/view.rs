@@ -1,14 +1,14 @@
 use crate::Display;
 use glium::{index, texture, uniform, uniforms};
-use winit::dpi::{PhysicalPosition, PhysicalSize};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 use crate::cache::GlyphCache;
 use crate::font::{Font, FontSet, FontStyle};
-use crate::terminal::{CellSize, Color, Cursor, CursorStyle, Line, PositionedImage};
+use crate::terminal::{Cell, CellSize, Color, Cursor, CursorStyle, Line, PositionedImage};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct Viewport {
@@ -431,6 +431,7 @@ mod lazy_tests {
 }
 
 pub struct TerminalView {
+    pub(crate) hint_labels: Vec<(usize, usize, String)>,
     fonts: FontSet,
     cache: GlyphCache,
     logical_font_size: u32,
@@ -549,6 +550,7 @@ impl TerminalView {
             cursor: None,
             preedit: String::new(),
             selection_range: None,
+            hint_labels: Vec::new(),
             scroll_bar,
             bg_color: Color::Black,
             skip_default_bg: false,
@@ -748,8 +750,40 @@ impl TerminalView {
 
         let texture = self.cache.texture();
 
+        // Paint a temporary copy, leaving terminal text and selections untouched.
+        let mut overlay_lines;
+        let lines = if self.hint_labels.is_empty() {
+            &self.lines
+        } else {
+            overlay_lines = self.lines.clone();
+            for (row, col, text) in &self.hint_labels {
+                let Some(line) = overlay_lines.get_mut(*row) else {
+                    continue;
+                };
+                let cells = line.cells_mut();
+                let end = (col + text.len()).min(cells.len());
+                let mut clear = Vec::new();
+                for (i, cell) in cells.iter().enumerate() {
+                    let glyph_end = i + cell.width as usize;
+                    if cell.width > 0 && i < end && glyph_end > *col {
+                        clear.extend(i..glyph_end.min(cells.len()));
+                    }
+                }
+                for i in clear {
+                    cells[i] = Cell::new_ascii(' ');
+                }
+                for (i, ch) in text.chars().enumerate() {
+                    if let Some(cell) = cells.get_mut(col + i) {
+                        *cell = Cell::new_ascii(ch);
+                        cell.attr.fg = Color::Black;
+                        cell.attr.bg = Color::Yellow;
+                    }
+                }
+            }
+            &overlay_lines
+        };
         let mut baseline: u32 = self.cell_max_over as u32;
-        for (i, row) in self.lines.iter().enumerate() {
+        for (i, row) in lines.iter().enumerate() {
             let cols = row.columns();
             let mut leftline: u32 = 0;
             for (j, cell) in row.iter().enumerate() {

@@ -18,6 +18,7 @@ pub(crate) enum ShortcutAction {
     ClosePane,
     NextTab,
     PrevTab,
+    SelectTab(usize),
     SplitVertical,
     SplitHorizontal,
     ToggleSidebar,
@@ -35,6 +36,8 @@ pub(crate) enum ShortcutAction {
     Copy,
     Paste,
     ClearHistory,
+    CopyMode,
+    LinkHints,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -346,6 +349,16 @@ fn default_bindings() -> &'static [(&'static str, &'static str, ShortcutAction)]
         ("close_pane", "Ctrl+Shift+W", ShortcutAction::ClosePane),
         ("next_tab", "Ctrl+Tab", ShortcutAction::NextTab),
         ("prev_tab", "Ctrl+Shift+Tab", ShortcutAction::PrevTab),
+        ("select_tab_1", "Ctrl+1", ShortcutAction::SelectTab(0)),
+        ("select_tab_2", "Ctrl+2", ShortcutAction::SelectTab(1)),
+        ("select_tab_3", "Ctrl+3", ShortcutAction::SelectTab(2)),
+        ("select_tab_4", "Ctrl+4", ShortcutAction::SelectTab(3)),
+        ("select_tab_5", "Ctrl+5", ShortcutAction::SelectTab(4)),
+        ("select_tab_6", "Ctrl+6", ShortcutAction::SelectTab(5)),
+        ("select_tab_7", "Ctrl+7", ShortcutAction::SelectTab(6)),
+        ("select_tab_8", "Ctrl+8", ShortcutAction::SelectTab(7)),
+        ("select_tab_9", "Ctrl+9", ShortcutAction::SelectTab(8)),
+        ("select_tab_10", "Ctrl+0", ShortcutAction::SelectTab(9)),
         (
             "split_vertical",
             "Ctrl+Shift+E",
@@ -381,6 +394,8 @@ fn default_bindings() -> &'static [(&'static str, &'static str, ShortcutAction)]
         ("increase_font", "Ctrl+Equal", ShortcutAction::IncreaseFont),
         ("decrease_font", "Ctrl+Minus", ShortcutAction::DecreaseFont),
         ("copy", "Ctrl+Shift+C", ShortcutAction::Copy),
+        ("copy_mode", "Ctrl+Shift+Space", ShortcutAction::CopyMode),
+        ("link_hints", "Ctrl+Shift+R", ShortcutAction::LinkHints),
         ("paste", "Ctrl+Shift+V", ShortcutAction::Paste),
         (
             "clear_history",
@@ -393,6 +408,37 @@ fn default_bindings() -> &'static [(&'static str, &'static str, ShortcutAction)]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ctrl_numbers_select_tabs_without_stealing_modified_digits() {
+        let bindings: HashMap<_, _> = default_bindings()
+            .iter()
+            .map(|(name, key, action)| (parse_keybinding(name, key).unwrap(), *action))
+            .collect();
+        for (key, tab) in [
+            (KeyCode::Digit1, 0),
+            (KeyCode::Digit2, 1),
+            (KeyCode::Digit9, 8),
+            (KeyCode::Digit0, 9),
+        ] {
+            assert_eq!(
+                bindings.get(&KeyBinding::from_event(ModifiersState::CONTROL, key)),
+                Some(&ShortcutAction::SelectTab(tab))
+            );
+            assert_eq!(
+                bindings.get(&KeyBinding::from_event(ModifiersState::empty(), key)),
+                None
+            );
+            assert_eq!(
+                bindings.get(&KeyBinding::from_event(
+                    ModifiersState::CONTROL | ModifiersState::ALT,
+                    key
+                )),
+                None
+            );
+        }
+        assert_eq!(bindings.len(), default_bindings().len());
+    }
 
     #[test]
     fn task_overview_has_unique_default_binding() {

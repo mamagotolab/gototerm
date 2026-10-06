@@ -141,8 +141,8 @@ AIツールを選ぶと、そのフォルダで起動し、**抜けるとその�
 切り替えた時点で仕切り直し、背景ペインで届いた履歴を後から再生しません。
 プレビュー枠で一時的に開いたエディタは一覧対象外です。
 
-Windowsネイティブ環境では、既存の `gt` フック連携が未対応のツールは「状態通知なし」になります。
-ペインの一覧と移動は利用できます。WSL内では、[下記の `gt` 導入手順](#claude-code-と連携する)に従ってください。
+WindowsネイティブのClaude Code/Codexは、[helperの設定](#windowsのclaude-code--codex状態通知)で状態通知を使えます。
+WSL内では、[下記の `gt` 導入手順](#claude-code-と連携する)に従ってください。
 
 ---
 
@@ -288,7 +288,7 @@ AI に任せた作業を、あとから時系列で追えるモードです。
 |---|---|
 | Linux ローカル | `install -m 755 assets/bin/gt ~/.local/bin/gt` |
 | Windows の **WSL 内** | WSL の中で同上 |
-| Windows ネイティブ（PowerShell 上の Claude Code） | 現状**未対応**（sh スクリプトのため）。ファイル監視ベースの changes 表示は gt なしでも動きます |
+| Windows ネイティブ（Claude Code / Codex） | 状態通知は `gototerm-hook.exe` で対応。`gt` のファイル変更フックはPOSIX用。ローカルのファイル監視はhelperなしでも動きます |
 
 （`~/.local/bin` が PATH に入っていることを確認してください）
 
@@ -516,9 +516,11 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 |---|---|
 | `Ctrl + Shift + T` | 新しいタブ |
 | `Ctrl + Tab` / `Ctrl + Shift + Tab` | 次 / 前のタブ |
+| `Ctrl + 1` 〜 `Ctrl + 9` / `Ctrl + 0` | 左から1〜9番目 / 10番目のタブ（存在しない番号は何もしない） |
 | `Ctrl + Shift + W` | 現在のペイン（最後の1つならタブ）を閉じる |
 
-> タブが 2 枚以上のときだけ画面上部にタブバーが出ます（1 枚なら全面が端末）。
+> タブが2枚以上のときだけ、番号とフォーカス中ペインの作業フォルダ名を表示します。
+> 選択中のタブはアクセントと背景色で示し、狭い画面では名前を省略します（1枚なら全面が端末）。
 
 ### 画面分割
 
@@ -531,9 +533,69 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 | クリック | クリックしたペインにフォーカス |
 
 > ワークベンチ表示中の `Ctrl + Shift + 矢印` は、左右でサイドバー幅・上下でプレビュー高さを調整します。
-> ターミナルのファイルパス／URL を開くのは **`Ctrl + クリック`** です（素のクリックはカーソル移動・選択）。
+> ファイルパスは **`Ctrl + クリック`** でプレビューします。
+> HTTP/HTTPS のURLも **`Ctrl + クリック`** で既定のブラウザに開けます。
+> muttやClaude Codeなど、マウス入力を使うアプリ内でもこの操作が使えます。
+> URL上でCtrlを押すと、マウスを動かさなくても手のカーソルに変わります。
+> マウス入力を使わない通常のシェル出力では、URLは通常クリックでも開けます。
+> 表示名にリンク先が埋め込まれたリンク（OSC 8）と、端末の画面幅による自動折り返しにも対応します。
+> メール本文やアプリ自身が改行・省略したURLは、自動では復元しません。
 
 > 新しいペインは、元のペインのシェルが居た場所（cwd）で開きます。
+
+### 長文のコピー（Vim風の操作）
+
+`Ctrl+Shift+Space`でコピー専用モードに入ります。マウス入力を使うTUIでも、
+履歴を移動して選択できます。選択の始点はスクロールバック内に固定されます。
+
+| 操作 | キー |
+|---|---|
+| カーソル移動 | `h/j/k/l`、矢印 |
+| 半画面移動 | `Ctrl+U` / `Ctrl+D` |
+| 履歴の先頭 / 最下部 | `g` / `G` |
+| 文字 / 行 / 矩形を選択 | `v` / `V` / `Ctrl+V`（同じキーでもう一度解除） |
+| 選択をコピーして終了 | `y` |
+| コピーせず終了 | `Esc` |
+
+コピー中のキーとIME入力は端末アプリへ送りません。終了後の通常入力で最新画面に戻ります。
+履歴の保持行数を超えて消えた内容や、TUI自身が画面を描き直して消した内容はコピーできません。
+
+### リンクヒント
+
+`Ctrl+Shift+R`で表示中のHTTP/HTTPSリンクと既存のローカルファイルに、英字のラベルを表示します。
+ラベルの文字を入力するとブラウザまたはファイルプレビューで開き、`Esc`でキャンセルできます。
+候補が多いときは2文字です。画面更新・スクロール・フォーカス変更で候補は取り消されます。
+作業フォルダを取得できない場合、ファイルの候補は出しません。Windowsでは[OSC 7](#cwd-追従osc-7)を設定してください。
+
+### 作業セット
+
+`Ctrl+Shift+N`でランチャーを開いて`w`を押すと、作業セット一覧へ移ります。
+`s`で現在の配置に名前を付けて保存し、一覧の`Enter`で新しいタブとして復元、`d`で削除します。
+既存のタブは保持します。同名の保存は拒否するので、別名にするか既存セットを削除してください。
+
+保存するのはローカルの作業フォルダ・タブ・分割方向・分割比率だけです。
+実行中のプロセス、端末出力、シェル履歴、メールやAI会話は保存せず、復元時には新しいシェルを起動します。
+リモート接続を含む配置や、作業フォルダを取得できないペインは保存できません。
+Windowsでは[OSC 7](#cwd-追従osc-7)の設定が必要です。復元先のフォルダが無い場合は表示し、残りの配置を開きます。
+保存先はWindowsが`%APPDATA%\gototerm\workspace-sets.json`、Linuxが
+`$XDG_CONFIG_HOME/gototerm/workspace-sets.json`（未設定なら`~/.config/gototerm/`）です。
+
+### WindowsのClaude Code / Codex状態通知
+
+`gototerm-hook.exe`をgototermの実行ファイルと同じフォルダに置きます。
+連携したいプロジェクトのPowerShellで、明示的に次を実行します（パスは配置先に合わせてください）。
+
+```powershell
+& 'C:\Tools\gototerm\gototerm-hook.exe' init-hooks . all
+```
+
+`all`の代わりに`claude`または`codex`も指定できます。既存のJSON設定とユーザーフックを保持して追加し、
+初回の変更前には`.json.gototerm-backup`を残します。Codexは`/hooks`で追加したフックを確認・信頼してください。
+再起動したClaude Code/Codexをgototerm内で使うと、開始・承認待ち・応答完了・終了がペイン状態一覧に反映されます。
+会話やコマンド本文は通知・保存せず、承認待ちでも許可や拒否を代行しません。
+
+解除は同じ配置のhelperで`remove-hooks . all`を実行します。他のユーザーフックは残ります。
+Windowsネイティブ用の操作です。WSL/Linuxでは従来の`gt hook`を使います。
 
 ### キーバインド設定
 
@@ -543,7 +605,7 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 ```toml
 [keybindings]
 focus_left = "Ctrl+Alt+H"
-toggle_sidebar = "Ctrl+Shift+Space"
+toggle_sidebar = "Ctrl+Alt+Space"
 new_tab = "Ctrl+Shift+N"
 ```
 
@@ -554,6 +616,7 @@ new_tab = "Ctrl+Shift+N"
 | `close_pane` | `Ctrl+Shift+W` |
 | `next_tab` | `Ctrl+Tab` |
 | `prev_tab` | `Ctrl+Shift+Tab` |
+| `select_tab_1` 〜 `select_tab_9` / `select_tab_10` | `Ctrl+1` 〜 `Ctrl+9` / `Ctrl+0` |
 | `split_vertical` | `Ctrl+Shift+E` |
 | `split_horizontal` | `Ctrl+Shift+O` |
 | `toggle_sidebar` | `Ctrl+Shift+F` |
@@ -562,6 +625,8 @@ new_tab = "Ctrl+Shift+N"
 | `increase_font` / `decrease_font` | `Ctrl+=` / `Ctrl+-` |
 | `copy` / `paste` | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
 | `clear_history` | `Ctrl+Shift+Delete` |
+| `copy_mode` | `Ctrl+Shift+Space` |
+| `link_hints` | `Ctrl+Shift+R` |
 
 ## Windows 実機での確認手順
 

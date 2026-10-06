@@ -223,6 +223,21 @@ fn meta_prefixed(text: &str, alt: bool, ctrl: bool) -> Vec<u8> {
     }
 }
 
+fn report_mouse_to_app(mouse_mode: bool, shift: bool, ctrl_url: bool) -> bool {
+    mouse_mode && !shift && !ctrl_url
+}
+
+fn known_local_cwd(location: Option<ShellLocation>) -> Option<PathBuf> {
+    match location {
+        Some(ShellLocation::Local(cwd)) => Some(cwd),
+        _ => None,
+    }
+}
+
+fn resolve_hint_file(token: &str, location: Option<ShellLocation>) -> Option<PathBuf> {
+    resolve_existing_file_token(token, &known_local_cwd(location)?)
+}
+
 fn is_link_token_char(c: char) -> bool {
     // 空白を含むパスは端末上のトークン境界が曖昧なので、Phase 4 では扱わない。
     !c.is_whitespace()
@@ -331,6 +346,7 @@ fn get_clipboard() -> String {
 }
 
 pub struct TerminalWindow {
+    link_hints: Option<crate::link_hints::LinkHints>,
     window: Rc<Window>,
     terminal: VtTerminal,
     pane_id: PaneId,
@@ -441,6 +457,7 @@ impl TerminalWindow {
             },
             last_ime_commit: std::time::Instant::now() - std::time::Duration::from_secs(10),
             clicked_file: None,
+            link_hints: None,
         }
     }
 
@@ -480,6 +497,7 @@ impl TerminalWindow {
 
         // 画面が変わったときだけ alacritty のグリッドを取り込んで描画を更新する。
         if self.terminal.take_dirty() {
+            self.cancel_link_hints();
             let snapshot = self.terminal.snapshot();
 
             if let Some(cursor) = snapshot.cursor.filter(|_| self.focused) {
@@ -625,27 +643,65 @@ impl TerminalWindow {
     /// ホバー時に手カーソルを出すか（stat しない軽い判定）。
     /// URL は常に。ファイルパスは Ctrl+クリックで開くので Ctrl 押下時だけ。
     fn should_show_link_pointer(&self, row: usize, col: usize) -> bool {
-        let Some(token) = self.token_at(row, col) else {
-            return false;
-        };
-        if token.starts_with("http://") || token.starts_with("https://") {
+        if self.terminal.url_at(row, col).is_some() {
             return true;
         }
-        looks_like_path(&token) && self.modifiers.control_key()
+        self.modifiers.control_key()
+            && self
+                .token_at(row, col)
+                .is_some_and(|token| looks_like_path(&token))
+    }
+
+    fn mouse_cell(&self) -> Option<(usize, usize)> {
+        let CursorPosition { x, y } = self.mouse.cursor_pos;
+        let viewport = self.viewport();
+        if x < 0.0 || y < 0.0 || x >= viewport.w as f64 || y >= viewport.h as f64 {
+            return None;
+        }
+        let cs = self.view.cell_size();
+        Some((
+            (y / cs.h.max(1) as f64) as usize,
+            (x / cs.w.max(1) as f64) as usize,
+        ))
+    }
+
+    fn ctrl_url_under_mouse(&self) -> bool {
+        self.modifiers.control_key()
+            && self
+                .mouse_cell()
+                .is_some_and(|(row, col)| self.terminal.url_at(row, col).is_some())
+    }
+
+    pub(crate) fn update_link_cursor(&self) {
+        // 全ペインへ座標が届くため、ポインタがあるペインだけがカーソルを更新する。
+        let Some((row, col)) = self.mouse_cell() else {
+            return;
+        };
+        let local = !report_mouse_to_app(
+            self.terminal.mouse_mode(),
+            self.modifiers.shift_key(),
+            self.ctrl_url_under_mouse(),
+        );
+        self.window
+            .set_cursor_icon(if local && self.should_show_link_pointer(row, col) {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Text
+            });
     }
 
     /// クリックでリンクを開く。URL は素のクリックで、ファイルは Ctrl+クリックのとき
     /// だけ（画面上のパスを普通にクリックしてプレビューが誤爆で開くのを防ぐ）。
     /// URL 判定を先にして、素のクリックでは stat しない。
     fn handle_link_click(&mut self, row: usize, col: usize, ctrl: bool) {
-        let Some(token) = self.token_at(row, col) else {
-            return;
-        };
-        if token.starts_with("http://") || token.starts_with("https://") {
-            open_url(&token);
+        if let Some(url) = self.terminal.url_at(row, col) {
+            open_url(&url);
             return;
         }
         if ctrl {
+            let Some(token) = self.token_at(row, col) else {
+                return;
+            };
             let cwd = self
                 .terminal
                 .cwd()
@@ -693,6 +749,9 @@ impl TerminalWindow {
     }
 
     pub fn focus_changed(&mut self, gain: bool) {
+        if !gain {
+            self.cancel_link_hints();
+        }
         self.focused = gain;
 
         // Update cursor
@@ -701,6 +760,7 @@ impl TerminalWindow {
         });
 
         if gain {
+            self.window.set_ime_allowed(!self.local_input_mode());
             self.refresh_cursor_icon();
         }
     }
@@ -724,6 +784,18 @@ impl TerminalWindow {
     /// CloseRequested / Resized / RedrawRequested / AboutToWait といった
     /// ウィンドウ全体の制御はマネージャ側が持ち、ここでは扱わない。
     pub fn process_window_event(&mut self, event: &WindowEvent) {
+        if self.local_input_mode() && matches!(event, WindowEvent::Ime(_)) {
+            self.view.update_contents(|view| view.preedit.clear());
+            return;
+        }
+        if self.terminal.copy_mode_active()
+            && matches!(
+                event,
+                WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. }
+            )
+        {
+            return;
+        }
         match event {
             &WindowEvent::Focused(gain) => self.focus_changed(gain),
 
@@ -767,22 +839,7 @@ impl TerminalWindow {
                     self.update_mouse_selection();
                 }
 
-                // リンクの上ではポインタ（手）カーソルにして「クリックできる」と
-                // 分かるようにする。URL は常に、ファイルパスは Ctrl 押下時のみ。
-                // mouse_mode のアプリにはマウスを渡すので変えない。
-                if !self.terminal.mouse_mode() {
-                    let cs = self.view.cell_size();
-                    let col = (x / cs.w.max(1) as f64) as i64;
-                    let row = (y / cs.h.max(1) as f64) as i64;
-                    let on_link = col >= 0
-                        && row >= 0
-                        && self.should_show_link_pointer(row as usize, col as usize);
-                    self.window.set_cursor_icon(if on_link {
-                        CursorIcon::Pointer
-                    } else {
-                        CursorIcon::Text
-                    });
-                }
+                self.update_link_cursor();
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
@@ -805,13 +862,19 @@ impl TerminalWindow {
                 // Released は「ドラッグ開始時にローカル選択だったか(selecting)」も見る。
                 // 途中で Shift を離してもボタンを離すまでローカル選択を続け、
                 // 選択範囲を固定する。
-                let report_to_app = self.terminal.mouse_mode() && !self.modifiers.shift_key();
+                let report_to_app = report_mouse_to_app(
+                    self.terminal.mouse_mode(),
+                    self.modifiers.shift_key(),
+                    *button == MouseButton::Left && self.ctrl_url_under_mouse(),
+                );
                 let report = match state {
                     ElementState::Pressed => report_to_app,
-                    ElementState::Released => report_to_app && !self.mouse.selecting,
+                    // 押下をアプリへ送った後にCtrlを押しても、解放は同じ相手へ送る。
+                    ElementState::Released => self.terminal.mouse_mode() && !self.mouse.selecting,
                 };
                 if report {
                     self.mouse.selecting = false;
+                    self.mouse.pressed_pos = None;
                     let button = match state {
                         ElementState::Released if !self.terminal.sgr_mouse() => 3,
                         _ => match button {
@@ -878,9 +941,9 @@ impl TerminalWindow {
 
                             // ドラッグ（選択）でない単純な左クリック。URL は素のクリックで
                             // 開き、ファイルは Ctrl+クリックのときだけ開く（handle_link_click
-                            // 内で判定）。mouse_mode が ON のアプリ（nvim 等）はここに来ない。
+                            // 内で判定）。マウス対応アプリでも Ctrl+URL はローカル処理する。
                             if *button == MouseButton::Left {
-                                if let Some(press) = self.mouse.pressed_pos {
+                                if let Some(press) = self.mouse.pressed_pos.take() {
                                     let cs = self.view.cell_size();
                                     let to_cell = |p: CursorPosition| {
                                         (
@@ -939,7 +1002,7 @@ impl TerminalWindow {
                 //     誤解してページが動かなかった）
                 //  ・代替画面(マウス非対応の less 等) → 矢印キー
                 //  ・通常画面 → ローカル履歴スクロール
-                if self.modifiers.shift_key() {
+                if self.modifiers.shift_key() || self.terminal.copy_mode_active() {
                     self.terminal.scroll(vertical as i32);
                 } else if self.terminal.mouse_mode() {
                     let cell_size = self.view.cell_size();
@@ -1055,6 +1118,26 @@ impl TerminalWindow {
             PhysicalKey::Unidentified(_) => return,
         };
 
+        if self.link_hints.is_some() {
+            self.handle_link_hint_key(key_event);
+            return;
+        }
+        if keybindings::lookup(self.modifiers, keycode) == Some(ShortcutAction::LinkHints) {
+            self.start_link_hints();
+            return;
+        }
+
+        if self.terminal.copy_mode_active() {
+            self.handle_copy_mode_key(keycode);
+            return;
+        }
+        if keybindings::lookup(self.modifiers, keycode) == Some(ShortcutAction::CopyMode) {
+            self.terminal.toggle_copy_mode();
+            self.view.update_contents(|view| view.preedit.clear());
+            self.window.set_ime_allowed(false);
+            return;
+        }
+
         // IME 変換中のキーは IME に任せ、端末へ送らない。
         if !self.view.preedit.is_empty() {
             return;
@@ -1132,12 +1215,18 @@ impl TerminalWindow {
                 KeyCode::Home => self.write_cursor_key(CursorKey::Home, mods),
                 KeyCode::End => self.write_cursor_key(CursorKey::End, mods),
 
-                KeyCode::Insert => self.terminal.write(&tilde_key_bytes(TildeKey::Insert, mods)),
-                KeyCode::Delete => self.terminal.write(&tilde_key_bytes(TildeKey::Delete, mods)),
-                KeyCode::PageUp => self.terminal.write(&tilde_key_bytes(TildeKey::PageUp, mods)),
-                KeyCode::PageDown => {
-                    self.terminal.write(&tilde_key_bytes(TildeKey::PageDown, mods))
-                }
+                KeyCode::Insert => self
+                    .terminal
+                    .write(&tilde_key_bytes(TildeKey::Insert, mods)),
+                KeyCode::Delete => self
+                    .terminal
+                    .write(&tilde_key_bytes(TildeKey::Delete, mods)),
+                KeyCode::PageUp => self
+                    .terminal
+                    .write(&tilde_key_bytes(TildeKey::PageUp, mods)),
+                KeyCode::PageDown => self
+                    .terminal
+                    .write(&tilde_key_bytes(TildeKey::PageDown, mods)),
 
                 KeyCode::F1 => self.write_function_key(1, mods),
                 KeyCode::F2 => self.write_function_key(2, mods),
@@ -1206,6 +1295,136 @@ impl TerminalWindow {
 
         log::info!("copy: {:?}", text);
         set_clipboard(&text);
+    }
+
+    pub(crate) fn copy_mode_active(&self) -> bool {
+        self.terminal.copy_mode_active()
+    }
+
+    pub(crate) fn local_input_mode(&self) -> bool {
+        self.copy_mode_active() || self.link_hints.is_some()
+    }
+
+    fn cancel_link_hints(&mut self) {
+        if self.link_hints.take().is_some() {
+            self.view.update_contents(|view| view.hint_labels.clear());
+            if self.focused {
+                self.window.set_ime_allowed(!self.copy_mode_active());
+            }
+        }
+    }
+
+    fn start_link_hints(&mut self) {
+        use crate::link_hints::{LinkHints, Target};
+        self.check_update();
+        let location = self.observed_location();
+        let mut targets = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for row in 0..self.view.lines.len() {
+            for col in 0..self.view.lines[row].columns() {
+                if let Some(url) = self.terminal.url_at(row, col) {
+                    if seen.insert(format!("url:{url}")) {
+                        targets.push((row, col, Target::Url(url)));
+                    }
+                } else if let Some(token) = self.token_at(row, col) {
+                    if looks_like_path(&token) && seen.insert(format!("file:{token}")) {
+                        if let Some(file) = resolve_hint_file(&token, location.clone()) {
+                            targets.push((row, col, Target::File(file)));
+                        }
+                    }
+                }
+            }
+        }
+        self.link_hints = LinkHints::new(targets);
+        if let Some(state) = &self.link_hints {
+            let labels = state
+                .hints
+                .iter()
+                .map(|hint| {
+                    (
+                        hint.row,
+                        hint.col.saturating_sub(
+                            (hint.col + hint.label.len())
+                                .saturating_sub(self.view.lines[hint.row].columns()),
+                        ),
+                        hint.label.clone(),
+                    )
+                })
+                .collect();
+            self.view.update_contents(|view| view.hint_labels = labels);
+            self.window.set_ime_allowed(false);
+        }
+    }
+
+    fn handle_link_hint_key(&mut self, key: &KeyEvent) {
+        // Cancel before execution when output changed between the last frame and this key.
+        if self.terminal.take_dirty() {
+            self.cancel_link_hints();
+            self.terminal.mark_dirty();
+            return;
+        }
+        if key.physical_key == PhysicalKey::Code(KeyCode::Escape) {
+            self.cancel_link_hints();
+            return;
+        }
+        if key.repeat {
+            return;
+        }
+        let Some(ch) = key
+            .text
+            .as_ref()
+            .and_then(|text| text.chars().next())
+            .filter(|ch| ch.is_ascii_alphabetic())
+        else {
+            self.cancel_link_hints();
+            return;
+        };
+        match self.link_hints.as_mut().unwrap().input(ch) {
+            Ok(Some(target)) => {
+                self.cancel_link_hints();
+                match target {
+                    crate::link_hints::Target::Url(url) => open_url(&url),
+                    crate::link_hints::Target::File(file) => self.clicked_file = Some(file),
+                }
+            }
+            Ok(None) => {}
+            Err(()) => self.cancel_link_hints(),
+        }
+    }
+
+    fn handle_copy_mode_key(&mut self, key: KeyCode) {
+        use alacritty_terminal::vi_mode::ViMotion;
+        use KeyCode::*;
+        let ctrl = self.modifiers.control_key();
+        let shift = self.modifiers.shift_key();
+        match (ctrl, key) {
+            (_, Escape) | (true, Space) => {
+                self.terminal.toggle_copy_mode();
+                self.window.set_ime_allowed(true);
+            }
+            (false, KeyY) => {
+                if let Some((_, text)) = self.terminal.tracked_selection_text() {
+                    set_clipboard(&text);
+                }
+                self.terminal.toggle_copy_mode();
+                self.window.set_ime_allowed(true);
+            }
+            (true, KeyU) => self.terminal.copy_mode_page(true),
+            (true, KeyD) => self.terminal.copy_mode_page(false),
+            (false, KeyG) => self.terminal.copy_mode_edge(!shift),
+            (_, KeyV) => self.terminal.copy_mode_select(if ctrl {
+                SelectionType::Block
+            } else if shift {
+                SelectionType::Lines
+            } else {
+                SelectionType::Simple
+            }),
+            (false, KeyH | ArrowLeft) => self.terminal.copy_mode_motion(ViMotion::Left),
+            (false, KeyJ | ArrowDown) => self.terminal.copy_mode_motion(ViMotion::Down),
+            (false, KeyK | ArrowUp) => self.terminal.copy_mode_motion(ViMotion::Up),
+            (false, KeyL | ArrowRight) => self.terminal.copy_mode_motion(ViMotion::Right),
+            _ => {}
+        }
     }
 
     fn paste_clipboard(&mut self) {
@@ -1288,15 +1507,62 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_hints_require_observed_local_cwd() {
+        let dir = std::env::temp_dir().join(format!("gototerm-hint-cwd-{}", std::process::id()));
+        let first = dir.join("first");
+        let second = dir.join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("same.txt"), "test").unwrap();
+        }
+        assert!(super::resolve_hint_file("same.txt", None).is_none());
+        assert!(super::resolve_hint_file(
+            "same.txt",
+            Some(crate::vt::ShellLocation::Remote {
+                host: "server".into(),
+                path: first.clone()
+            })
+        )
+        .is_none());
+        let a = super::resolve_hint_file(
+            "same.txt",
+            Some(crate::vt::ShellLocation::Local(first.clone())),
+        )
+        .unwrap();
+        let b = super::resolve_hint_file(
+            "same.txt",
+            Some(crate::vt::ShellLocation::Local(second.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::canonicalize(&a).unwrap(),
+            std::fs::canonicalize(first.join("same.txt")).unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&b).unwrap(),
+            std::fs::canonicalize(second.join("same.txt")).unwrap()
+        );
+        assert_ne!(a, b);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use super::{
-        dedent_common_indent, meta_prefixed, resolve_existing_file_token, resolve_path_token,
-        selection_type_for_click, visible_selection,
+        dedent_common_indent, meta_prefixed, report_mouse_to_app, resolve_existing_file_token,
+        resolve_path_token, selection_type_for_click, visible_selection,
     };
     use crate::view::Selection;
     use crate::vt::GridSelection;
     use alacritty_terminal::index::{Column, Line, Point};
     use alacritty_terminal::selection::SelectionType;
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn ctrl_url_click_overrides_app_mouse_reporting() {
+        assert!(!report_mouse_to_app(true, false, true));
+        assert!(report_mouse_to_app(true, false, false));
+        assert!(!report_mouse_to_app(true, true, false));
+        assert!(!report_mouse_to_app(false, false, false));
+    }
 
     fn linear_grid_selection(start: (i32, usize), end: (i32, usize)) -> GridSelection {
         GridSelection {

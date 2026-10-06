@@ -21,13 +21,13 @@ use crate::config::{resolve_editor, resolve_file_open, OpenMethod};
 use crate::gt::{AgentSignal, GtFileAssembler, GtMessage};
 use crate::keybindings::{self, ShortcutAction};
 use crate::launcher::{Launcher, LauncherOutcome};
-use crate::session_review::{SessionReview, SessionReviewOutcome, SessionSummary};
 use crate::reader::{ReaderHeaderAction, ReaderKeyResult, ReaderPane, ReaderRequest};
 use crate::recent::RecentProjects;
+use crate::session_review::{SessionReview, SessionReviewOutcome, SessionSummary};
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::task_activity::{sanitize_display_text, PaneId};
 use crate::task_overview::{OverviewOutcome, TaskOverview, TaskRow};
-use crate::terminal::{Cell, Color, Line};
+use crate::terminal::{Color, Line};
 use crate::view::{TerminalView, Viewport};
 use crate::vt::ShellLocation;
 use crate::window::TerminalWindow;
@@ -137,6 +137,7 @@ enum Action {
     CloseFocused,
     NextTab,
     PrevTab,
+    SelectTab(usize),
     SplitVertical,
     SplitHorizontal,
     ToggleSidebar,
@@ -237,7 +238,11 @@ fn terminal_focus_allowed(task_overview_open: bool) -> bool {
     !task_overview_open
 }
 
-fn overview_key_is_consumed(pending: Option<KeyCode>, state: ElementState, physical: PhysicalKey) -> bool {
+fn overview_key_is_consumed(
+    pending: Option<KeyCode>,
+    state: ElementState,
+    physical: PhysicalKey,
+) -> bool {
     state == ElementState::Pressed
         && matches!(physical, PhysicalKey::Code(code) if pending == Some(code))
 }
@@ -338,6 +343,33 @@ struct SplitNode {
     focus_first: bool,
     first: Box<Node>,
     second: Box<Node>,
+}
+
+fn capture_workspace_node(node: &mut Node) -> Result<crate::workspace_sets::SavedNode, String> {
+    use crate::workspace_sets::SavedNode;
+    match node {
+        Node::Leaf(pane) => capture_workspace_location(pane.observed_location()),
+        Node::Split(split) => Ok(SavedNode::Split {
+            vertical: matches!(split.partition, Partition::Vertical),
+            ratio: split.ratio,
+            first: Box::new(capture_workspace_node(&mut split.first)?),
+            second: Box::new(capture_workspace_node(&mut split.second)?),
+        }),
+        Node::Empty => Err("空のペインは保存できません".into()),
+    }
+}
+
+fn capture_workspace_location(
+    observed: Option<ShellLocation>,
+) -> Result<crate::workspace_sets::SavedNode, String> {
+    use crate::workspace_sets::SavedNode;
+    match observed {
+            Some(ShellLocation::Local(cwd)) => Ok(SavedNode::Pane { cwd }),
+            Some(ShellLocation::Remote { .. }) => Err(
+                "リモート接続の配置は保存できません。ローカルの作業セットを保存してください".into(),
+            ),
+            None => Err("作業フォルダを取得できません。WindowsではOSC 7のシェル統合を設定してから保存してください".into()),
+    }
 }
 
 /// 親ビューポートを比率で2分割する（GAP 分の隙間を空ける）。
@@ -914,6 +946,32 @@ impl PaneTreeNode for Node {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_capture_requires_observed_location_and_keeps_distinct_cwds() {
+        use crate::workspace_sets::SavedNode;
+        assert!(super::capture_workspace_location(None).is_err());
+        let first = std::env::temp_dir().join("project-a");
+        let second = std::env::temp_dir().join("project-b");
+        assert_eq!(
+            super::capture_workspace_location(Some(crate::vt::ShellLocation::Local(first.clone())))
+                .unwrap(),
+            SavedNode::Pane { cwd: first }
+        );
+        assert_eq!(
+            super::capture_workspace_location(Some(crate::vt::ShellLocation::Local(
+                second.clone()
+            )))
+            .unwrap(),
+            SavedNode::Pane { cwd: second }
+        );
+        assert!(
+            super::capture_workspace_location(Some(crate::vt::ShellLocation::Remote {
+                host: "server".into(),
+                path: "/project".into()
+            }))
+            .is_err()
+        );
+    }
     use super::*;
 
     #[test]
@@ -1655,6 +1713,7 @@ pub struct Multiplexer {
     display: Display,
     viewport: Viewport,
     status_view: TerminalView,
+    status_signature: String,
     sidebar: Sidebar,
     sidebar_focused: bool,
     preview_slot: PreviewSlot,
@@ -1741,6 +1800,7 @@ impl Multiplexer {
             display,
             viewport,
             status_view,
+            status_signature: String::new(),
             sidebar,
             sidebar_focused: false,
             preview_slot,
@@ -2112,36 +2172,67 @@ impl Multiplexer {
             return;
         }
 
-        const BAR_BG: Color = Color::BrightBlack;
-
-        let blank = {
-            let mut c = Cell::new_ascii(' ');
-            c.attr.fg = Color::White;
-            c.attr.bg = BAR_BG;
-            c
-        };
-
+        const BAR_BG: Color = Color::Background;
         let cols = (self.viewport.w / self.status_view.cell_size().w).max(1) as usize;
-        let mut cells: Vec<Cell> = Vec::new();
-
-        for i in 0..self.tabs.len() {
-            let focused = i == self.focus;
-            let label = format!(" {} ", i + 1);
-            for ch in label.chars() {
-                let mut c = Cell::new_ascii(ch);
-                if focused {
-                    c.attr.fg = Color::Black;
-                    c.attr.bg = Color::White;
-                } else {
-                    c.attr.fg = Color::White;
-                    c.attr.bg = BAR_BG;
-                }
-                cells.push(c);
-            }
+        let mut titles = Vec::new();
+        for tab in &mut self.tabs {
+            let path = match tab.root.focused_leaf_mut().pane_location() {
+                ShellLocation::Local(path) | ShellLocation::Remote { path, .. } => path,
+            };
+            titles.push(
+                path.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .filter(|name| !name.is_empty())
+                    .unwrap_or_else(|| "shell".into()),
+            );
         }
-
+        let signature = format!("{cols}:{}:{titles:?}", self.focus);
+        if signature == self.status_signature {
+            return;
+        }
+        self.status_signature = signature;
+        let visible = (cols / 4).max(1).min(self.tabs.len());
+        let first = if self.tabs.len() > visible {
+            self.focus.saturating_sub(visible - 1)
+        } else {
+            0
+        };
+        let width = (cols / visible).clamp(1, 26);
+        let mut cells = Vec::new();
+        for (i, title) in titles.iter().enumerate().skip(first).take(visible) {
+            let active = i == self.focus;
+            let bg = if active { Color::BrightBlack } else { BAR_BG };
+            let prefix = if width >= 4 {
+                format!("{}{:02} ", if active { "›" } else { " " }, i + 1)
+            } else {
+                format!("{:02}", i + 1)
+            };
+            let prefix_width = width.min(if width >= 4 { 4 } else { 2 });
+            let mut header = crate::launcher::column_cells(
+                &prefix,
+                if active { Color::Cyan } else { Color::White },
+                bg,
+                prefix_width,
+            );
+            if width > prefix_width {
+                header.extend(crate::launcher::column_cells(
+                    title,
+                    Color::White,
+                    bg,
+                    width - prefix_width,
+                ));
+            }
+            if !active {
+                for cell in &mut header {
+                    cell.attr.bold = -1;
+                }
+            }
+            cells.extend(header);
+        }
         cells.truncate(cols);
-        cells.resize(cols, blank);
+        cells.resize_with(cols, || {
+            crate::launcher::column_cells(" ", Color::White, BAR_BG, 1)[0]
+        });
 
         self.status_view.update_contents(|view| {
             view.bg_color = BAR_BG;
@@ -2168,6 +2259,7 @@ impl Multiplexer {
             ShortcutAction::ClosePane => Some(Action::CloseFocused),
             ShortcutAction::NextTab => Some(Action::NextTab),
             ShortcutAction::PrevTab => Some(Action::PrevTab),
+            ShortcutAction::SelectTab(index) => Some(Action::SelectTab(index)),
             ShortcutAction::SplitVertical => Some(Action::SplitVertical),
             ShortcutAction::SplitHorizontal => Some(Action::SplitHorizontal),
             ShortcutAction::ToggleSidebar => Some(Action::ToggleSidebar),
@@ -2182,7 +2274,11 @@ impl Multiplexer {
             ShortcutAction::ResizeRight => Some(Action::Resize(Dir::Right)),
             ShortcutAction::IncreaseFont => Some(Action::ChangeFont(1)),
             ShortcutAction::DecreaseFont => Some(Action::ChangeFont(-1)),
-            ShortcutAction::Copy | ShortcutAction::Paste | ShortcutAction::ClearHistory => None,
+            ShortcutAction::Copy
+            | ShortcutAction::Paste
+            | ShortcutAction::ClearHistory
+            | ShortcutAction::CopyMode
+            | ShortcutAction::LinkHints => None,
         }
     }
 
@@ -2225,16 +2321,20 @@ impl Multiplexer {
                 self.update_status_bar();
             }
 
-            Action::NextTab | Action::PrevTab => {
-                if self.tabs.len() <= 1 {
+            Action::NextTab | Action::PrevTab | Action::SelectTab(_) => {
+                let target = match action {
+                    Action::SelectTab(index) => index,
+                    _ => adjacent_tab_index(
+                        self.focus,
+                        self.tabs.len(),
+                        matches!(action, Action::NextTab),
+                    ),
+                };
+                if target >= self.tabs.len() || target == self.focus {
                     return;
                 }
                 self.focused_root().focused_leaf_mut().focus_changed(false);
-                self.focus = adjacent_tab_index(
-                    self.focus,
-                    self.tabs.len(),
-                    matches!(action, Action::NextTab),
-                );
+                self.focus = target;
                 self.apply_focused_tab_workbench();
                 self.update_status_bar();
             }
@@ -2440,6 +2540,63 @@ impl Multiplexer {
 
     fn handle_launcher_outcome(&mut self, outcome: LauncherOutcome) {
         match outcome {
+            LauncherOutcome::SaveWorkspace(name) => {
+                let captured = self
+                    .tabs
+                    .iter_mut()
+                    .map(|tab| capture_workspace_node(&mut tab.root))
+                    .collect::<Result<Vec<_>, _>>();
+                let result = captured.and_then(|tabs| {
+                    crate::workspace_sets::save(crate::workspace_sets::WorkspaceSet { name, tabs })
+                });
+                if let Some(launcher) = &mut self.launcher {
+                    launcher.workspace_notice(match result {
+                        Ok(()) => "配置を保存しました".into(),
+                        Err(error) => error,
+                    });
+                }
+                self.window.request_redraw();
+            }
+            LauncherOutcome::OpenWorkspace(name) => {
+                let result = crate::workspace_sets::load_all().and_then(|sets| {
+                    sets.into_iter()
+                        .find(|set| set.name == name)
+                        .ok_or_else(|| "作業セットが見つかりません".into())
+                });
+                let notice = match result {
+                    Ok(set) => {
+                        let mut missing = Vec::new();
+                        let mut roots = Vec::new();
+                        for node in &set.tabs {
+                            if let Some(root) = self.restore_workspace_node(node, &mut missing) {
+                                roots.push(root);
+                            }
+                        }
+                        let count = roots.len();
+                        if count > 0 {
+                            self.focused_root().focused_leaf_mut().focus_changed(false);
+                            self.tabs.extend(roots.into_iter().map(Tab::new));
+                            self.focus = self.tabs.len() - count;
+                            self.startup_launcher = false;
+                            self.apply_focused_tab_workbench();
+                            self.update_status_bar();
+                        }
+                        if missing.is_empty() {
+                            format!("{count}タブを追加しました。Escで戻れます")
+                        } else {
+                            format!(
+                                "{count}タブを追加。見つからないフォルダ: {}",
+                                missing.join(", ")
+                            )
+                        }
+                    }
+                    Err(error) => error,
+                };
+                if let Some(launcher) = &mut self.launcher {
+                    launcher.workspace_notice(notice);
+                }
+                self.window.request_redraw();
+            }
             LauncherOutcome::OpenIn { dir, command } => {
                 // エージェントは「抜けたらそのフォルダのシェルへ戻る」形で起動する
                 // （直接 exec だと exit でタブごと閉じてしまう）。シェル選択は None のまま。
@@ -2503,6 +2660,56 @@ impl Multiplexer {
             self.update_status_bar();
         }
         self.window.request_redraw();
+    }
+
+    fn restore_workspace_node(
+        &mut self,
+        saved: &crate::workspace_sets::SavedNode,
+        missing: &mut Vec<String>,
+    ) -> Option<Node> {
+        use crate::workspace_sets::SavedNode;
+        match saved {
+            SavedNode::Pane { cwd } => {
+                if !cwd.is_dir() {
+                    missing.push(cwd.display().to_string());
+                    return None;
+                }
+                let mut pane = Box::new(TerminalWindow::with_viewport_command(
+                    self.window.clone(),
+                    self.display.clone(),
+                    self.content_viewport(),
+                    self.dpi_transition.scale_factor(),
+                    Some(cwd),
+                    None,
+                ));
+                self.apply_current_font(&mut pane);
+                pane.focus_changed(false);
+                Some(Node::Leaf(pane))
+            }
+            SavedNode::Split {
+                vertical,
+                ratio,
+                first,
+                second,
+            } => {
+                let first = self.restore_workspace_node(first, missing);
+                let second = self.restore_workspace_node(second, missing);
+                match (first, second) {
+                    (Some(first), Some(second)) => Some(Node::Split(SplitNode {
+                        partition: if *vertical {
+                            Partition::Vertical
+                        } else {
+                            Partition::Horizontal
+                        },
+                        ratio: ratio.clamp(0.1, 0.9),
+                        focus_first: true,
+                        first: Box::new(first),
+                        second: Box::new(second),
+                    })),
+                    (first, second) => first.or(second),
+                }
+            }
+        }
     }
 
     fn focus_sidebar(&mut self) {
@@ -2930,6 +3137,10 @@ impl Multiplexer {
                     for tab in &mut self.tabs {
                         tab.root.for_each_leaf(&mut |w| w.process_window_event(wev));
                     }
+                    // 非表示タブの古い座標でカーソルを上書きしない。
+                    self.tabs[self.focus]
+                        .root
+                        .for_each_leaf(&mut |w| w.update_link_cursor());
                 }
 
                 WindowEvent::KeyboardInput {
@@ -3009,6 +3220,17 @@ impl Multiplexer {
                         // 入力欄に入った直後に変換候補の位置を合わせる
                         // （起動メニューを開いた時点で候補が正しい場所に出る）。
                         self.sync_launcher_ime_area();
+                        return;
+                    }
+                    if !self.sidebar_focused
+                        && !self.reader_focused
+                        && !self.editor_focused
+                        && self.focused_root().focused_leaf().local_input_mode()
+                    {
+                        self.focused_root()
+                            .focused_leaf_mut()
+                            .process_window_event(wev);
+                        self.handle_clicked_file();
                         return;
                     }
                     if let Some(action) = self.parse_shortcut(key) {
@@ -3218,13 +3440,13 @@ impl Multiplexer {
                     self.refresh_layout();
                     self.update_status_bar();
                 }
-                if (tab_removed || changed)
-                    && !terminal_focus_allowed(self.task_overview.is_some())
+                if (tab_removed || changed) && !terminal_focus_allowed(self.task_overview.is_some())
                 {
                     self.suspend_focus_for_overview();
                 }
 
                 self.handle_gt_messages();
+                self.update_status_bar();
 
                 if self.task_overview.is_some()
                     && self.overview_last_refresh.elapsed() >= Duration::from_secs(1)
