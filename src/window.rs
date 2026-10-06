@@ -227,6 +227,17 @@ fn report_mouse_to_app(mouse_mode: bool, shift: bool, ctrl_url: bool) -> bool {
     mouse_mode && !shift && !ctrl_url
 }
 
+fn known_local_cwd(location: Option<ShellLocation>) -> Option<PathBuf> {
+    match location {
+        Some(ShellLocation::Local(cwd)) => Some(cwd),
+        _ => None,
+    }
+}
+
+fn resolve_hint_file(token: &str, location: Option<ShellLocation>) -> Option<PathBuf> {
+    resolve_existing_file_token(token, &known_local_cwd(location)?)
+}
+
 fn is_link_token_char(c: char) -> bool {
     // 空白を含むパスは端末上のトークン境界が曖昧なので、Phase 4 では扱わない。
     !c.is_whitespace()
@@ -1306,10 +1317,7 @@ impl TerminalWindow {
     fn start_link_hints(&mut self) {
         use crate::link_hints::{LinkHints, Target};
         self.check_update();
-        let cwd = match self.pane_location() {
-            ShellLocation::Local(path) => Some(path),
-            _ => None,
-        };
+        let location = self.observed_location();
         let mut targets = Vec::new();
         let mut seen = std::collections::HashSet::new();
         for row in 0..self.view.lines.len() {
@@ -1318,9 +1326,9 @@ impl TerminalWindow {
                     if seen.insert(format!("url:{url}")) {
                         targets.push((row, col, Target::Url(url)));
                     }
-                } else if let (Some(cwd), Some(token)) = (cwd.as_ref(), self.token_at(row, col)) {
+                } else if let Some(token) = self.token_at(row, col) {
                     if looks_like_path(&token) && seen.insert(format!("file:{token}")) {
-                        if let Some(file) = resolve_existing_file_token(&token, cwd) {
+                        if let Some(file) = resolve_hint_file(&token, location.clone()) {
                             targets.push((row, col, Target::File(file)));
                         }
                     }
@@ -1499,6 +1507,39 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn file_hints_require_observed_local_cwd() {
+        let dir = std::env::temp_dir().join(format!("gototerm-hint-cwd-{}", std::process::id()));
+        let first = dir.join("first");
+        let second = dir.join("second");
+        for path in [&first, &second] {
+            std::fs::create_dir_all(path).unwrap();
+            std::fs::write(path.join("same.txt"), "test").unwrap();
+        }
+        assert!(super::resolve_hint_file("same.txt", None).is_none());
+        assert!(super::resolve_hint_file(
+            "same.txt",
+            Some(crate::vt::ShellLocation::Remote {
+                host: "server".into(),
+                path: first.clone()
+            })
+        )
+        .is_none());
+        let a = super::resolve_hint_file(
+            "same.txt",
+            Some(crate::vt::ShellLocation::Local(first.clone())),
+        )
+        .unwrap();
+        let b = super::resolve_hint_file(
+            "same.txt",
+            Some(crate::vt::ShellLocation::Local(second.clone())),
+        )
+        .unwrap();
+        assert_eq!(a, std::fs::canonicalize(first.join("same.txt")).unwrap());
+        assert_eq!(b, std::fs::canonicalize(second.join("same.txt")).unwrap());
+        assert_ne!(a, b);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
     use super::{
         dedent_common_indent, meta_prefixed, report_mouse_to_app, resolve_existing_file_token,
         resolve_path_token, selection_type_for_click, visible_selection,

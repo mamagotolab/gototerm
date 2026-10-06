@@ -932,6 +932,15 @@ fn advance_terminal(processor: &mut Processor, term: &mut Term<EventProxy>, byte
     let cursor = term.vi_mode_cursor;
     let offset = term.grid().display_offset();
     let history = term.history_size();
+    // Track a cursor through grid rotation even before the user starts selecting.
+    // An ephemeral selection uses the core's rotation rules, independent of the
+    // history capacity. It is removed before the grid lock is released.
+    let tracking_cursor = term.selection.is_none();
+    if tracking_cursor {
+        let mut marker = AlacSelection::new(SelectionType::Simple, cursor.point, Side::Left);
+        marker.include_all();
+        term.selection = Some(marker);
+    }
     let selection = term
         .selection
         .as_ref()
@@ -939,6 +948,9 @@ fn advance_terminal(processor: &mut Processor, term: &mut Term<EventProxy>, byte
     let alt = term.mode().contains(TermMode::ALT_SCREEN);
     processor.advance(term, bytes);
     if alt != term.mode().contains(TermMode::ALT_SCREEN) || !term.mode().contains(TermMode::VI) {
+        if tracking_cursor {
+            term.selection = None;
+        }
         return;
     }
     let moved = match (
@@ -950,6 +962,9 @@ fn advance_terminal(processor: &mut Processor, term: &mut Term<EventProxy>, byte
         (Some(before), Some(after)) => before.start.line.0 - after.start.line.0,
         _ => term.history_size().saturating_sub(history) as i32,
     };
+    if tracking_cursor {
+        term.selection = None;
+    }
     if moved > 0 {
         let desired = (offset + moved as usize).min(term.history_size());
         let delta = desired as i32 - term.grid().display_offset() as i32;
@@ -2354,6 +2369,39 @@ mod tests {
         let selection = terminal.tracked_selection_text().unwrap();
         assert!(selection.0.block);
         assert_eq!(selection.1, "本語\non");
+    }
+
+    #[test]
+    fn copy_cursor_tracks_output_with_full_history_before_selection() {
+        use alacritty_terminal::vi_mode::ViMotion;
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal = VtTerminal::new(10, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        terminal.term.lock().unwrap().set_options(Config {
+            scrolling_history: 2,
+            ..Config::default()
+        });
+        processor.advance(
+            &mut *terminal.term.lock().unwrap(),
+            b"one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix",
+        );
+        assert_eq!(terminal.term.lock().unwrap().history_size(), 2);
+        terminal.toggle_copy_mode();
+        terminal.copy_mode_motion(ViMotion::High);
+        advance_pass(
+            &mut processor,
+            &mut terminal.term.lock().unwrap(),
+            0,
+            b"\r\nseven",
+            &mut Utf8Diagnostic::new(false),
+        );
+        assert!(terminal.grid_selection().is_none());
+        terminal.copy_mode_select(SelectionType::Lines);
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "three");
+        assert_eq!(
+            terminal.term.lock().unwrap().vi_mode_cursor.point.line,
+            Line(-1)
+        );
     }
 
     #[test]

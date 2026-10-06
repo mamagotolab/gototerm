@@ -141,8 +141,8 @@ AIツールを選ぶと、そのフォルダで起動し、**抜けるとその�
 切り替えた時点で仕切り直し、背景ペインで届いた履歴を後から再生しません。
 プレビュー枠で一時的に開いたエディタは一覧対象外です。
 
-Windowsネイティブ環境では、既存の `gt` フック連携が未対応のツールは「状態通知なし」になります。
-ペインの一覧と移動は利用できます。WSL内では、[下記の `gt` 導入手順](#claude-code-と連携する)に従ってください。
+WindowsネイティブのClaude Code/Codexは、[helperの設定](#windowsのclaude-code--codex状態通知)で状態通知を使えます。
+WSL内では、[下記の `gt` 導入手順](#claude-code-と連携する)に従ってください。
 
 ---
 
@@ -288,7 +288,7 @@ AI に任せた作業を、あとから時系列で追えるモードです。
 |---|---|
 | Linux ローカル | `install -m 755 assets/bin/gt ~/.local/bin/gt` |
 | Windows の **WSL 内** | WSL の中で同上 |
-| Windows ネイティブ（PowerShell 上の Claude Code） | 現状**未対応**（sh スクリプトのため）。ファイル監視ベースの changes 表示は gt なしでも動きます |
+| Windows ネイティブ（Claude Code / Codex） | 状態通知は `gototerm-hook.exe` で対応。`gt` のファイル変更フックはPOSIX用。ローカルのファイル監視はhelperなしでも動きます |
 
 （`~/.local/bin` が PATH に入っていることを確認してください）
 
@@ -565,6 +565,7 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 `Ctrl+Shift+R`で表示中のHTTP/HTTPSリンクと既存のローカルファイルに、英字のラベルを表示します。
 ラベルの文字を入力するとブラウザまたはファイルプレビューで開き、`Esc`でキャンセルできます。
 候補が多いときは2文字です。画面更新・スクロール・フォーカス変更で候補は取り消されます。
+作業フォルダを取得できない場合、ファイルの候補は出しません。Windowsでは[OSC 7](#cwd-追従osc-7)を設定してください。
 
 ### 作業セット
 
@@ -574,7 +575,8 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 
 保存するのはローカルの作業フォルダ・タブ・分割方向・分割比率だけです。
 実行中のプロセス、端末出力、シェル履歴、メールやAI会話は保存せず、復元時には新しいシェルを起動します。
-リモート接続を含む配置は保存できません。復元先のフォルダが無い場合は表示し、残りの配置を開きます。
+リモート接続を含む配置や、作業フォルダを取得できないペインは保存できません。
+Windowsでは[OSC 7](#cwd-追従osc-7)の設定が必要です。復元先のフォルダが無い場合は表示し、残りの配置を開きます。
 保存先はWindowsが`%APPDATA%\gototerm\workspace-sets.json`、Linuxが
 `$XDG_CONFIG_HOME/gototerm/workspace-sets.json`（未設定なら`~/.config/gototerm/`）です。
 

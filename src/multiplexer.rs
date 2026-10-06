@@ -348,12 +348,7 @@ struct SplitNode {
 fn capture_workspace_node(node: &mut Node) -> Result<crate::workspace_sets::SavedNode, String> {
     use crate::workspace_sets::SavedNode;
     match node {
-        Node::Leaf(pane) => match pane.pane_location() {
-            ShellLocation::Local(cwd) => Ok(SavedNode::Pane { cwd }),
-            ShellLocation::Remote { .. } => Err(
-                "リモート接続の配置は保存できません。ローカルの作業セットを保存してください".into(),
-            ),
-        },
+        Node::Leaf(pane) => capture_workspace_location(pane.observed_location()),
         Node::Split(split) => Ok(SavedNode::Split {
             vertical: matches!(split.partition, Partition::Vertical),
             ratio: split.ratio,
@@ -361,6 +356,19 @@ fn capture_workspace_node(node: &mut Node) -> Result<crate::workspace_sets::Save
             second: Box::new(capture_workspace_node(&mut split.second)?),
         }),
         Node::Empty => Err("空のペインは保存できません".into()),
+    }
+}
+
+fn capture_workspace_location(
+    observed: Option<ShellLocation>,
+) -> Result<crate::workspace_sets::SavedNode, String> {
+    use crate::workspace_sets::SavedNode;
+    match observed {
+            Some(ShellLocation::Local(cwd)) => Ok(SavedNode::Pane { cwd }),
+            Some(ShellLocation::Remote { .. }) => Err(
+                "リモート接続の配置は保存できません。ローカルの作業セットを保存してください".into(),
+            ),
+            None => Err("作業フォルダを取得できません。WindowsではOSC 7のシェル統合を設定してから保存してください".into()),
     }
 }
 
@@ -938,6 +946,32 @@ impl PaneTreeNode for Node {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_capture_requires_observed_location_and_keeps_distinct_cwds() {
+        use crate::workspace_sets::SavedNode;
+        assert!(super::capture_workspace_location(None).is_err());
+        let first = std::env::temp_dir().join("project-a");
+        let second = std::env::temp_dir().join("project-b");
+        assert_eq!(
+            super::capture_workspace_location(Some(crate::vt::ShellLocation::Local(first.clone())))
+                .unwrap(),
+            SavedNode::Pane { cwd: first }
+        );
+        assert_eq!(
+            super::capture_workspace_location(Some(crate::vt::ShellLocation::Local(
+                second.clone()
+            )))
+            .unwrap(),
+            SavedNode::Pane { cwd: second }
+        );
+        assert!(
+            super::capture_workspace_location(Some(crate::vt::ShellLocation::Remote {
+                host: "server".into(),
+                path: "/project".into()
+            }))
+            .is_err()
+        );
+    }
     use super::*;
 
     #[test]
