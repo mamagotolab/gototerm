@@ -1535,8 +1535,14 @@ mod tests {
             Some(crate::vt::ShellLocation::Local(second.clone())),
         )
         .unwrap();
-        assert_eq!(a, std::fs::canonicalize(first.join("same.txt")).unwrap());
-        assert_eq!(b, std::fs::canonicalize(second.join("same.txt")).unwrap());
+        assert_eq!(
+            std::fs::canonicalize(&a).unwrap(),
+            std::fs::canonicalize(first.join("same.txt")).unwrap()
+        );
+        assert_eq!(
+            std::fs::canonicalize(&b).unwrap(),
+            std::fs::canonicalize(second.join("same.txt")).unwrap()
+        );
         assert_ne!(a, b);
         std::fs::remove_dir_all(dir).unwrap();
     }
