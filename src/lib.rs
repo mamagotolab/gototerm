@@ -23,6 +23,7 @@ mod task_activity;
 mod task_overview;
 mod terminal;
 mod timeline;
+mod tui_copy;
 mod utils;
 mod view;
 mod vt;

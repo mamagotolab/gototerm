@@ -1755,6 +1755,7 @@ fn url_at(term: &Term<EventProxy>, row: usize, col: usize) -> Option<String> {
 }
 
 /// 1フレーム分の描画スナップショット。
+#[derive(Clone)]
 pub struct Snapshot {
     pub lines: Vec<TLine>,
     pub cursor: Option<TCursor>,
@@ -1767,6 +1768,49 @@ impl VtTerminal {
     }
 
     /// 現在の画面内容を既存描画形式に変換して取り出す。
+    pub(crate) fn copy_frame(&self) -> crate::tui_copy::Frame {
+        use crate::tui_copy::{Frame, Row};
+        let term = self.term.lock().unwrap();
+        let rows = (0..term.screen_lines())
+            .map(|r| {
+                let row = &term.grid()[Line(r as i32)];
+                let cells = (0..term.columns())
+                    .map(|c| {
+                        let cell = &row[Column(c)];
+                        if cell
+                            .flags
+                            .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+                        {
+                            String::new()
+                        } else {
+                            let mut text = if cell.c == '\0' {
+                                " ".to_owned()
+                            } else {
+                                cell.c.to_string()
+                            };
+                            if let Some(extra) = cell.zerowidth() {
+                                text.extend(extra.iter());
+                            }
+                            text
+                        }
+                    })
+                    .collect();
+                Row {
+                    cells,
+                    wrapped: row[Column(term.columns() - 1)]
+                        .flags
+                        .contains(Flags::WRAPLINE),
+                }
+            })
+            .collect();
+        Frame {
+            rows,
+            alternate: term
+                .mode()
+                .contains(alacritty_terminal::term::TermMode::ALT_SCREEN),
+        }
+    }
+
     pub fn snapshot(&self) -> Snapshot {
         let term = self.term.lock().unwrap();
         let columns = term.columns();
@@ -2306,6 +2350,103 @@ mod tests {
         assert_eq!(after, before);
     }
 
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the less executable; run explicitly for live PTY verification"]
+    fn live_less_copy_crosses_multiple_screens_and_returns() {
+        use crate::tui_copy::TuiCopy;
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("gototerm-less-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        std::fs::write(
+            &file,
+            (1..=80).map(|n| format!("ROW{n:03}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let command = vec![
+            "less".into(),
+            "-+F".into(),
+            "-+X".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let mut terminal = VtTerminal::new(40, 8, 9, 18, &dir, Some(&command));
+        let wait = |expected: &str| {
+            let start = Instant::now();
+            loop {
+                let frame = terminal.copy_frame();
+                if frame.rows[0].cells.concat().trim() == expected {
+                    std::thread::sleep(Duration::from_millis(150));
+                    return terminal.copy_frame();
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(4),
+                    "less did not reach {expected}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let frame = wait("ROW001");
+        assert!(frame.alternate);
+        terminal.toggle_copy_mode();
+        let mut copy = TuiCopy::new(frame, 0, 0, 1000);
+        copy.select(SelectionType::Lines);
+        copy.move_cursor(6, 0);
+        for n in 2..=16 {
+            terminal.write(crate::input::cursor_key_sequence(
+                crate::input::CursorKey::Down,
+                terminal.application_cursor_mode(),
+            ));
+            assert!(
+                copy.observe(wait(&format!("ROW{n:03}"))),
+                "{:?}",
+                copy.stopped
+            );
+        }
+        assert_eq!(
+            copy.text().unwrap(),
+            (1..=22)
+                .map(|n| format!("ROW{n:03}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        for n in (13..=15).rev() {
+            terminal.write(crate::input::cursor_key_sequence(
+                crate::input::CursorKey::Up,
+                terminal.application_cursor_mode(),
+            ));
+            assert!(
+                copy.observe(wait(&format!("ROW{n:03}"))),
+                "{:?}",
+                copy.stopped
+            );
+        }
+        assert_eq!(
+            copy.text().unwrap(),
+            (1..=19)
+                .map(|n| format!("ROW{n:03}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        terminal.kill();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn copy_frame_uses_live_cells_with_wide_spacers_and_wraps() {
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal = VtTerminal::new(4, 3, 9, 18, Path::new("."), Some(&command));
+        let mut parser: Processor = Processor::new();
+        parser.advance(
+            &mut *terminal.term.lock().unwrap(),
+            "\x1b[?1049h日本語".as_bytes(),
+        );
+        let f = terminal.copy_frame();
+        assert!(f.alternate);
+        assert_eq!(f.rows[0].cells, vec!["日", "", "本", ""]);
+        assert!(f.rows[0].wrapped);
+        assert_eq!(f.rows[1].cells[0], "語");
+    }
     #[test]
     fn copy_mode_selection_crosses_scrollback_without_moving_anchor() {
         let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
