@@ -1,6 +1,6 @@
 # 全画面アプリの連続コピー Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [x]`) syntax for tracking.
 
 **Goal:** 対象5アプリのスクロール中、確定できる本文を保持して選択・コピーする。
 
@@ -31,9 +31,9 @@
 
 **Interfaces:** `Frame`は文字セルと折り返し情報、`TuiCopy`はフレーム・論理行座標・選択・停止理由を保持。`observe(frame)`で確定した移動を反映し、`text()`で保持済みの選択を返す。
 
-- [ ] 前後方向の移動、固定フッター、繰り返し、全面更新、上限、日本語、矩形選択の失敗テストを書く。
-- [ ] REDを確認し、確実な重なりだけを連結する最小実装を書く。
-- [ ] 関連テストをGREENにしてコミットする。
+- [x] 前後方向の移動、固定フッター、繰り返し、全面更新、上限、日本語、矩形選択の失敗テストを書く。
+- [x] REDを確認し、確実な重なりだけを連結する最小実装を書く。
+- [x] 関連テストをGREENにしてコミットする。
 
 ### Task 2: ペインの入力と表示へ統合
 
@@ -41,10 +41,10 @@
 
 **Interfaces:** `VtTerminal::copy_frame()`でライブグリッドを文字セルへ変換。`TerminalWindow`は`TuiCopy`とスクロール待機を保持する。
 
-- [ ] コピー中のスクロール経路、停止、境界、選択表示に関する失敗テストを追加する。
-- [ ] コピー専用モードと通常マウス選択に一時履歴を接続する。アプリへの要求を直列化し、描画確定後に次の行を要求する。
-- [ ] フレームの論理座標を可視選択へ変換し、コピー結果を既存のクリップボードへ渡す。
-- [ ] 関連テストをGREENにしてコミットする。
+- [x] コピー中のスクロール経路、停止、境界、選択表示に関する失敗テストを追加する。
+- [x] コピー専用モードと通常マウス選択に一時履歴を接続する。アプリへの要求を直列化し、描画確定後に次の行を要求する。
+- [x] フレームの論理座標を可視選択へ変換し、コピー結果を既存のクリップボードへ渡す。
+- [x] 関連テストをGREENにしてコミットする。
 
 ### Task 3: 実アプリ・レビュー・配布
 

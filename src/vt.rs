@@ -403,6 +403,7 @@ pub struct VtTerminal {
     child_pid: Option<u32>,
     shell_location: Arc<Mutex<Option<ShellLocation>>>,
     selection_drag: Mutex<Option<ExpandedSelection>>,
+    initial_mutt: bool,
 }
 
 fn window_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> WindowSize {
@@ -1364,6 +1365,10 @@ impl VtTerminal {
             child_pid,
             shell_location,
             selection_drag: Mutex::new(None),
+            initial_mutt: command
+                .and_then(|c| c.first())
+                .and_then(|p| std::path::Path::new(p).file_stem())
+                .is_some_and(|n| n == "mutt" || n == "neomutt"),
         }
     }
 
@@ -1385,6 +1390,16 @@ impl VtTerminal {
         {
             None
         }
+    }
+
+    pub(crate) fn foreground_is_mutt(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = self.master.process_group_leader() {
+            if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                return matches!(name.trim(), "mutt" | "neomutt");
+            }
+        }
+        self.initial_mutt
     }
 
     pub fn location(&self) -> Option<ShellLocation> {
@@ -2348,6 +2363,156 @@ mod tests {
         terminal.scroll(3);
         let after = terminal.selection_text(selection);
         assert_eq!(after, before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires Vim; set GOTOTERM_TEST_VIM to an isolated executable"]
+    fn live_vim_copy_preserves_scrolled_lines() {
+        let program = std::env::var("GOTOTERM_TEST_VIM").unwrap_or("vim".into());
+        live_reader_copy_test("vim", |file, _| {
+            vec![
+                program,
+                "-Nu".into(),
+                "NONE".into(),
+                "-n".into(),
+                "-i".into(),
+                "NONE".into(),
+                "+set noshowmode ruler laststatus=0 scrolloff=0 scrolljump=1".into(),
+                "+normal! 5G".into(),
+                file.into(),
+            ]
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires mutt; uses a synthetic local mailbox, no personal email"]
+    fn live_mutt_copy_preserves_scrolled_email() {
+        let program = std::env::var("GOTOTERM_TEST_MUTT").unwrap_or("mutt".into());
+        live_reader_copy_test("mutt", |file, dir| {
+            let body = std::fs::read_to_string(&file).unwrap();
+            std::fs::write(&file,format!("From sender@example.invalid Wed Oct  7 00:00:00 2026\nFrom: Test <sender@example.invalid>\nTo: reader@example.invalid\nSubject: Synthetic copy test\nDate: Wed, 7 Oct 2026 00:00:00 +0000\nContent-Type: text/plain; charset=utf-8\n\n{body}\n")).unwrap();
+            let config = dir.join("muttrc");
+            std::fs::write(&config,format!("set folder=\"{}\"\nset mbox=\"{}/mbox\"\nset history=0\nset history_file=\"/dev/null\"\nset pager_context=0\nset pager_stop=yes\nset pager_index_lines=0\nset sort=mailbox-order\n",dir.display(),dir.display())).unwrap();
+            vec![
+                program,
+                "-n".into(),
+                "-F".into(),
+                config.to_string_lossy().into_owned(),
+                "-R".into(),
+                "-f".into(),
+                file.into(),
+            ]
+        });
+    }
+
+    #[cfg(unix)]
+    fn live_reader_copy_test(name: &str, command: impl FnOnce(String, &Path) -> Vec<String>) {
+        use crate::tui_copy::TuiCopy;
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("gototerm-live-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("body.txt");
+        std::fs::write(
+            &file,
+            (1..=80).map(|n| format!("ROW{n:03}\n")).collect::<String>(),
+        )
+        .unwrap();
+        let command = command(file.to_string_lossy().into_owned(), &dir);
+        let mut terminal = VtTerminal::new(
+            80,
+            if name == "mutt" { 24 } else { 12 },
+            9,
+            18,
+            &dir,
+            Some(&command),
+        );
+        std::thread::sleep(Duration::from_millis(700));
+        if name == "mutt" {
+            terminal.write(b"\r");
+            std::thread::sleep(Duration::from_millis(700));
+        }
+        let frame = terminal.copy_frame();
+        let visible = |f: &crate::tui_copy::Frame| {
+            f.rows
+                .iter()
+                .enumerate()
+                .filter_map(|(i, r)| {
+                    let line = r.cells.concat();
+                    let line = line.trim();
+                    line.strip_prefix("ROW")
+                        .and_then(|v| v.parse::<usize>().ok())
+                        .map(|n| (i, n))
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = visible(&frame);
+        assert!(
+            !rows.is_empty(),
+            "{name} did not display the fixture: {:?}",
+            frame
+                .rows
+                .iter()
+                .map(|r| r.cells.concat())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(rows[0].1, 1);
+        let first = rows[0].0;
+        let last = rows.last().unwrap().0;
+        let mut max = rows.last().unwrap().1;
+        let mut copy = TuiCopy::new(frame, first, 0, 1000);
+        copy.select(SelectionType::Lines);
+        copy.move_cursor(last, 0);
+        for _ in 0..12 {
+            terminal.write(if name == "mutt" {
+                b"\r"
+            } else {
+                crate::input::cursor_key_sequence(
+                    crate::input::CursorKey::Down,
+                    terminal.application_cursor_mode(),
+                )
+            });
+            let start = Instant::now();
+            let mut retries = 0;
+            let mut retry_at = Instant::now();
+            let frame = loop {
+                let f = terminal.copy_frame();
+                if name == "vim" && retry_at.elapsed() > Duration::from_millis(160) && retries < 12
+                {
+                    terminal.write(crate::input::cursor_key_sequence(
+                        crate::input::CursorKey::Down,
+                        terminal.application_cursor_mode(),
+                    ));
+                    retries += 1;
+                    retry_at = Instant::now();
+                }
+                if visible(&f).last().is_some_and(|(_, n)| *n == max + 1) {
+                    std::thread::sleep(Duration::from_millis(150));
+                    break terminal.copy_frame();
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(3),
+                    "{name} did not scroll beyond ROW{max:03}; cursor_mode={}, labels={:?}, status={:?}",terminal.application_cursor_mode(),visible(&f),f.rows.iter().rev().take(2).map(|r|r.cells.concat()).collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert!(
+                copy.observe_scroll(frame, true),
+                "{name}: {:?}",
+                copy.stopped
+            );
+            max += 1;
+            assert_eq!(
+                copy.text().unwrap(),
+                (1..=max)
+                    .map(|n| format!("ROW{n:03}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+        }
+        terminal.kill();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

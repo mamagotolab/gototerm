@@ -63,8 +63,35 @@ impl TuiCopy {
     pub fn stop(&mut self, reason: &'static str) {
         self.stopped = Some(reason);
     }
+    fn selected_body(&self) -> Option<std::ops::Range<usize>> {
+        if let Some(body) = &self.body {
+            return Some(body.clone());
+        }
+        let a = self.anchor.unwrap_or(self.cursor);
+        let mut start = a.row.min(self.cursor.row).max(0) as usize;
+        let mut end = (a.row.max(self.cursor.row).max(0) as usize + 1).min(self.frame.rows.len());
+        // Matching context is separate from the selected text. A point or a
+        // one-line selection still needs two retained rows after a scroll.
+        if end - start < 3 {
+            let max_end = if end < self.frame.rows.len() {
+                self.frame.rows.len().saturating_sub(1)
+            } else {
+                self.frame.rows.len()
+            };
+            end = (start + 3).min(max_end.max(end));
+            start = end.saturating_sub(3);
+        }
+        Some(start..end)
+    }
+    pub fn display_unchanged(&self, frame: &Frame) -> bool {
+        if frame.alternate != self.frame.alternate || frame.rows.len() != self.frame.rows.len() {
+            return false;
+        }
+        self.selected_body()
+            .is_some_and(|b| self.frame.rows[b.clone()] == frame.rows[b])
+    }
     pub fn observe_scroll(&mut self, frame: Frame, down: bool) -> bool {
-        if let Some((delta, _)) = scroll_match(&self.frame, &frame, self.body.as_ref()) {
+        if let Some((delta, _)) = scroll_match(&self.frame, &frame, self.selected_body().as_ref()) {
             if (delta > 0) != down {
                 self.stop("要求と異なる画面移動のためコピー継続を停止しました");
                 return false;
@@ -83,13 +110,17 @@ impl TuiCopy {
         if self.frame == frame {
             return true;
         }
-        if let Some(body) = &self.body {
-            if self.frame.rows[body.clone()] == frame.rows[body.clone()] {
-                self.frame = frame;
-                return true;
-            }
+        if self.anchor.is_none() {
+            let (row, col) = self.visible_cursor();
+            *self = Self::new(frame, row, col, self.limit);
+            return true;
         }
-        let Some((delta, body)) = scroll_match(&self.frame, &frame, self.body.as_ref()) else {
+        if self.display_unchanged(&frame) {
+            self.frame = frame;
+            return true;
+        }
+        let Some((delta, body)) = scroll_match(&self.frame, &frame, self.selected_body().as_ref())
+        else {
             self.stop("本文の連続性を確認できません。保持済みの範囲はコピーできます");
             return false;
         };
@@ -213,43 +244,43 @@ fn scroll_match(
     new: &Frame,
     body: Option<&std::ops::Range<usize>>,
 ) -> Option<(i64, std::ops::Range<usize>)> {
-    let h = old.rows.len();
+    let body = body?;
+    let h = body.len();
     let mut candidates = Vec::new();
     for delta in -(h as i64 - 1)..h as i64 {
         if delta == 0 {
             continue;
         }
-        let mut run = None;
-        for j in 0..=h {
-            let i = j as i64 + delta;
-            let matched = j < h && i >= 0 && i < h as i64 && old.rows[i as usize] == new.rows[j];
-            if matched && run.is_none() {
-                run = Some(j);
-            }
-            if !matched {
-                if let Some(start) = run.take() {
-                    let end = j;
-                    let old_start = (start as i64 + delta) as usize;
-                    let region = if delta > 0 {
-                        start..(end as i64 + delta) as usize
-                    } else {
-                        old_start..end
-                    };
-                    if end - start < 2 || body.is_some_and(|b| b != &region) {
-                        continue;
-                    }
-                    let distinct: std::collections::BTreeSet<_> = new.rows[start..end]
-                        .iter()
-                        .map(|r| r.cells.concat())
-                        .filter(|s| !s.trim().is_empty())
-                        .collect();
-                    if distinct.len() < 2 {
-                        continue;
-                    }
-                    candidates.push((end - start, delta, region));
-                }
-            }
+        let new_start = body.start + (-delta).max(0) as usize;
+        let new_end = body.end - delta.max(0) as usize;
+        if new_end - new_start < 2 {
+            continue;
         }
+        let matched =
+            (new_start..new_end).all(|j| old.rows[(j as i64 + delta) as usize] == new.rows[j]);
+        if !matched {
+            continue;
+        }
+        let overlap = &new.rows[new_start..new_end];
+        let distinct: std::collections::BTreeSet<_> = overlap
+            .iter()
+            .map(|r| r.cells.concat())
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        if distinct.len() < 2 {
+            continue;
+        }
+        // A retained row duplicated at the newly exposed edge is also a common
+        // partial repaint. Decline both interpretations instead of guessing.
+        let exposed = if delta > 0 {
+            new_end..body.end
+        } else {
+            body.start..new_start
+        };
+        if new.rows[exposed].iter().any(|r| overlap.contains(r)) {
+            continue;
+        }
+        candidates.push((new_end - new_start, delta, body.clone()));
     }
     candidates.sort_by_key(|c| std::cmp::Reverse(c.0));
     let best = candidates.first()?;
@@ -273,6 +304,38 @@ mod tests {
                 .collect(),
             alternate: true,
         }
+    }
+    #[test]
+    fn one_line_selection_uses_context_and_can_extend_with_wheel() {
+        let mut c = TuiCopy::new(frame(&["A", "B", "C", "D", "E", ":"]), 0, 0, 100);
+        c.select(SelectionType::Lines);
+        assert!(c.observe_scroll(frame(&["B", "C", "D", "E", "F", ":"]), true));
+        assert_eq!(c.text().as_deref(), Some("A\nB"));
+    }
+    #[test]
+    fn footer_change_is_not_a_body_scroll() {
+        let mut c = TuiCopy::new(frame(&["A", "B", "C", "D", "E", "ruler1"]), 0, 0, 100);
+        c.select(SelectionType::Lines);
+        let next = frame(&["A", "B", "C", "D", "E", "ruler2"]);
+        assert!(c.display_unchanged(&next));
+        assert!(c.observe_scroll(next, true));
+        assert_eq!(c.offset, 0);
+        assert!(c.stopped.is_none());
+    }
+    #[test]
+    fn partial_redraw_never_becomes_new_body_content() {
+        let mut c = TuiCopy::new(
+            frame(&["header", "A", "B", "C", "D", "E", "status"]),
+            1,
+            0,
+            100,
+        );
+        c.select(SelectionType::Lines);
+        c.move_cursor(4, 0);
+        let text = c.text();
+        assert!(!c.observe_scroll(frame(&["header", "B", "C", "D", "D", "E", "status"]), true));
+        assert!(c.stopped.is_some());
+        assert_eq!(c.text(), text);
     }
     #[test]
     fn wide_spacer_cursor_selects_complete_glyph() {
@@ -327,7 +390,7 @@ mod tests {
         for (old, new) in [
             (
                 frame(&["same", "same", "same"]),
-                frame(&["same", "same", "different"]),
+                frame(&["same", "different", "different"]),
             ),
             (
                 frame(&["one", "two", "three"]),
@@ -358,9 +421,10 @@ mod tests {
     fn history_limit_stops_before_selected_rows_are_lost() {
         let mut c = TuiCopy::new(frame(&["one", "two", "three", ":"]), 0, 0, 3);
         c.select(SelectionType::Lines);
+        c.move_cursor(2, 0);
         assert!(!c.observe(frame(&["two", "three", "four", ":"])));
         assert!(c.stopped.is_some());
-        assert_eq!(c.text().as_deref(), Some("one"));
+        assert_eq!(c.text().as_deref(), Some("one\ntwo\nthree"));
     }
     #[test]
     fn wide_cells_wrapping_and_block_selection() {

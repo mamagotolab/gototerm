@@ -1,6 +1,6 @@
 [package]
 name = "gototerm"
-version = "0.6.17"
+version = "0.6.18"
 authors = ["mamagotolab"]
 edition = "2021"
 default-run = "gototerm"

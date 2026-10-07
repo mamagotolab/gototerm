@@ -21,6 +21,71 @@ use crate::vt::{GridSelection, ShellLocation, VtTerminal};
 use crate::Display;
 use alacritty_terminal::selection::SelectionType;
 
+fn copy_drag_reverse(
+    origin: Option<(usize, usize)>,
+    end: Option<(usize, usize)>,
+    cursor: Option<(usize, usize)>,
+    dragging: bool,
+) -> bool {
+    let end = if dragging { cursor.or(end) } else { end };
+    origin.zip(end).is_some_and(|(a, b)| a > b)
+}
+
+fn copy_app_scroll_bytes(up: bool, application: bool, mutt: bool) -> &'static [u8] {
+    if mutt {
+        if up {
+            b"\x7f"
+        } else {
+            b"\r"
+        }
+    } else {
+        cursor_key_sequence(
+            if up { CursorKey::Up } else { CursorKey::Down },
+            application,
+        )
+    }
+}
+
+fn capture_mouse_selection(
+    terminal: &VtTerminal,
+    reverse: bool,
+) -> Option<crate::tui_copy::TuiCopy> {
+    if terminal.display_offset() != 0
+        || !(terminal.alt_screen() || terminal.mouse_mode() || terminal.application_cursor_mode())
+    {
+        return None;
+    }
+    let selection = terminal.grid_selection()?;
+    let (anchor, end) = if reverse {
+        (selection.end, selection.start)
+    } else {
+        (selection.start, selection.end)
+    };
+    let mut copy = crate::tui_copy::TuiCopy::new(
+        terminal.copy_frame(),
+        anchor.line.0.max(0) as usize,
+        anchor.column.0,
+        crate::TOYTERM_CONFIG.scrollback_lines,
+    );
+    copy.select(if selection.block {
+        SelectionType::Block
+    } else {
+        SelectionType::Simple
+    });
+    copy.move_cursor(end.line.0.max(0) as usize, end.column.0);
+    Some(copy)
+}
+
+fn retry_copy_scroll(
+    accepted: bool,
+    unchanged: bool,
+    mouse: bool,
+    retries: usize,
+    rows: usize,
+) -> bool {
+    accepted && unchanged && !mouse && retries < rows
+}
+
 fn copy_scroll_to_app(_copy_mode: bool, live_capture: bool) -> bool {
     live_capture
 }
@@ -353,11 +418,15 @@ pub struct TerminalWindow {
     link_hints: Option<crate::link_hints::LinkHints>,
     tui_copy: Option<crate::tui_copy::TuiCopy>,
     copy_snapshot: Option<crate::vt::Snapshot>,
+    copy_drag_origin: Option<(usize, usize)>,
+    copy_drag_end: Option<(usize, usize)>,
     copy_scroll: i32,
     copy_pending: Option<(std::time::Instant, bool)>,
     copy_updated: std::time::Instant,
     copy_keyboard: bool,
+    copy_mutt: bool,
     copy_direction_down: bool,
+    copy_retries: usize,
     copy_notice: Option<&'static str>,
     window: Rc<Window>,
     terminal: VtTerminal,
@@ -472,11 +541,15 @@ impl TerminalWindow {
             link_hints: None,
             tui_copy: None,
             copy_snapshot: None,
+            copy_drag_origin: None,
+            copy_drag_end: None,
             copy_scroll: 0,
             copy_pending: None,
             copy_updated: std::time::Instant::now(),
             copy_keyboard: false,
+            copy_mutt: false,
             copy_direction_down: false,
+            copy_retries: 0,
             copy_notice: None,
         }
     }
@@ -526,7 +599,7 @@ impl TerminalWindow {
             if let Some(copy) = &mut self.tui_copy {
                 if self.copy_pending.is_none() && copy.stopped.is_none() {
                     let frame = self.terminal.copy_frame();
-                    if frame != copy.frame {
+                    if !copy.display_unchanged(&frame) {
                         copy.stop("スクロール操作以外の更新でコピー継続を停止しました");
                     }
                 }
@@ -863,14 +936,6 @@ impl TerminalWindow {
             self.view.update_contents(|view| view.preedit.clear());
             return;
         }
-        if self.copy_mode_active()
-            && matches!(
-                event,
-                WindowEvent::MouseInput { .. } | WindowEvent::CursorMoved { .. }
-            )
-        {
-            return;
-        }
         match event {
             &WindowEvent::Focused(gain) => self.focus_changed(gain),
 
@@ -912,6 +977,9 @@ impl TerminalWindow {
                 self.mouse.cursor_pos = CursorPosition { x, y };
                 if self.mouse.selecting {
                     self.update_mouse_selection();
+                    if let Some(end) = self.mouse_cell() {
+                        self.copy_drag_end = Some(end);
+                    }
                 }
 
                 self.update_link_cursor();
@@ -937,15 +1005,20 @@ impl TerminalWindow {
                 // Released は「ドラッグ開始時にローカル選択だったか(selecting)」も見る。
                 // 途中で Shift を離してもボタンを離すまでローカル選択を続け、
                 // 選択範囲を固定する。
-                let report_to_app = report_mouse_to_app(
-                    self.terminal.mouse_mode(),
-                    self.modifiers.shift_key(),
-                    *button == MouseButton::Left && self.ctrl_url_under_mouse(),
-                );
+                let report_to_app = !self.copy_mode_active()
+                    && report_mouse_to_app(
+                        self.terminal.mouse_mode(),
+                        self.modifiers.shift_key(),
+                        *button == MouseButton::Left && self.ctrl_url_under_mouse(),
+                    );
                 let report = match state {
                     ElementState::Pressed => report_to_app,
                     // 押下をアプリへ送った後にCtrlを押しても、解放は同じ相手へ送る。
-                    ElementState::Released => self.terminal.mouse_mode() && !self.mouse.selecting,
+                    ElementState::Released => {
+                        self.terminal.mouse_mode()
+                            && !self.mouse.selecting
+                            && !self.copy_mode_active()
+                    }
                 };
                 if report {
                     self.mouse.selecting = false;
@@ -994,12 +1067,21 @@ impl TerminalWindow {
                             self.mouse.last_clicked = std::time::Instant::now();
                             log::debug!("clicked {} times", self.mouse.click_count);
 
+                            let keyboard = self.copy_mode_active();
+                            let mutt = self.copy_mutt;
                             self.end_tui_copy();
+                            self.copy_keyboard = keyboard;
+                            self.copy_mutt = mutt;
                             self.mouse.pressed_pos = Some(self.mouse.cursor_pos);
                             // Ctrl を押しながらの開始は矩形選択。
                             let block = self.modifiers.control_key();
                             let CursorPosition { x, y } = self.mouse.cursor_pos;
                             let cell_size = self.view.cell_size();
+                            self.copy_drag_origin = Some((
+                                (y.max(0.0) / cell_size.h.max(1) as f64) as usize,
+                                (x.max(0.0) / cell_size.w.max(1) as f64) as usize,
+                            ));
+                            self.copy_drag_end = self.copy_drag_origin;
                             self.terminal.start_selection_at_pixel(
                                 selection_type_for_click(self.mouse.click_count, block),
                                 x,
@@ -1010,16 +1092,18 @@ impl TerminalWindow {
                             // このドラッグはローカル選択。離すまで継続する。
                             self.mouse.selecting = true;
                             self.update_mouse_selection();
-                            self.start_mouse_tui_copy();
                         }
                         ElementState::Released => {
                             self.update_mouse_selection();
+                            if let Some(end) = self.mouse_cell() {
+                                self.copy_drag_end = Some(end);
+                            }
                             self.mouse.selecting = false;
 
                             // ドラッグ（選択）でない単純な左クリック。URL は素のクリックで
                             // 開き、ファイルは Ctrl+クリックのときだけ開く（handle_link_click
                             // 内で判定）。マウス対応アプリでも Ctrl+URL はローカル処理する。
-                            if *button == MouseButton::Left {
+                            if *button == MouseButton::Left && !self.copy_mode_active() {
                                 if let Some(press) = self.mouse.pressed_pos.take() {
                                     let cs = self.view.cell_size();
                                     let to_cell = |p: CursorPosition| {
@@ -1079,6 +1163,9 @@ impl TerminalWindow {
                 //     誤解してページが動かなかった）
                 //  ・代替画面(マウス非対応の less 等) → 矢印キー
                 //  ・通常画面 → ローカル履歴スクロール
+                if self.tui_copy.is_none() {
+                    self.start_mouse_tui_copy();
+                }
                 if copy_scroll_to_app(self.copy_mode_active(), self.tui_copy.is_some()) {
                     self.queue_copy_scroll(vertical as i32);
                 } else if self.modifiers.shift_key() || self.copy_mode_active() {
@@ -1487,9 +1574,10 @@ impl TerminalWindow {
     }
 
     fn tui_app_screen(&self) -> bool {
-        self.terminal.alt_screen()
-            || self.terminal.mouse_mode()
-            || self.terminal.application_cursor_mode()
+        self.terminal.display_offset() == 0
+            && (self.terminal.alt_screen()
+                || self.terminal.mouse_mode()
+                || self.terminal.application_cursor_mode())
     }
 
     fn start_tui_copy(&mut self, row: usize, col: usize) {
@@ -1502,24 +1590,29 @@ impl TerminalWindow {
         self.copy_snapshot = Some(self.terminal.snapshot());
         self.copy_scroll = 0;
         self.copy_pending = None;
+        self.copy_retries = 0;
+        self.copy_mutt = self.terminal.foreground_is_mutt();
     }
 
     fn start_mouse_tui_copy(&mut self) {
-        if !self.tui_app_screen() {
+        if self.tui_copy.is_some() {
             return;
         }
-        if let Some(selection) = self.terminal.grid_selection() {
-            self.start_tui_copy(
-                selection.start.line.0.max(0) as usize,
-                selection.start.column.0,
-            );
-            let copy = self.tui_copy.as_mut().unwrap();
-            copy.select(if selection.block {
-                SelectionType::Block
-            } else {
-                SelectionType::Simple
-            });
-            copy.move_cursor(selection.end.line.0.max(0) as usize, selection.end.column.0);
+        let reverse = copy_drag_reverse(
+            self.copy_drag_origin,
+            self.copy_drag_end,
+            self.mouse_cell(),
+            self.mouse.selecting,
+        );
+        if let Some(copy) = capture_mouse_selection(&self.terminal, reverse) {
+            if !self.copy_keyboard {
+                self.copy_mutt = self.terminal.foreground_is_mutt();
+            }
+            self.tui_copy = Some(copy);
+            self.copy_snapshot = Some(self.terminal.snapshot());
+            self.copy_scroll = 0;
+            self.copy_pending = None;
+            self.copy_retries = 0;
         }
     }
 
@@ -1529,6 +1622,7 @@ impl TerminalWindow {
         self.copy_scroll = 0;
         self.copy_pending = None;
         self.copy_keyboard = false;
+        self.copy_mutt = false;
         self.copy_notice = None;
         self.view.update_contents(|view| view.preedit.clear());
         self.terminal.mark_dirty();
@@ -1570,15 +1664,31 @@ impl TerminalWindow {
                 return;
             }
             let frame = self.terminal.copy_frame();
-            let unchanged = frame == self.tui_copy.as_ref().unwrap().frame;
+            let unchanged = self.tui_copy.as_ref().unwrap().display_unchanged(&frame);
             let accepted = self
                 .tui_copy
                 .as_mut()
                 .unwrap()
                 .observe_scroll(frame, self.copy_direction_down);
             self.copy_pending = None;
-            if !accepted || unchanged {
+            if !accepted {
                 self.copy_scroll = 0;
+            } else if retry_copy_scroll(
+                accepted,
+                unchanged,
+                self.terminal.mouse_mode(),
+                self.copy_retries,
+                self.terminal.size().1,
+            ) {
+                // Cursor keys in Vim can move only the application cursor until
+                // it reaches an edge. Keep the original scroll request pending.
+                self.copy_retries += 1;
+                self.copy_scroll += if self.copy_direction_down { -1 } else { 1 };
+            } else if unchanged {
+                self.copy_scroll = 0;
+                self.copy_retries = 0;
+            } else {
+                self.copy_retries = 0;
             }
             if accepted {
                 self.copy_snapshot = Some(self.terminal.snapshot());
@@ -1613,9 +1723,10 @@ impl TerminalWindow {
                     self.normal_mouse_report(button, col as u32 + 1, row as u32 + 1);
                 }
             } else {
-                self.terminal.write(cursor_key_sequence(
-                    if up { CursorKey::Up } else { CursorKey::Down },
+                self.terminal.write(copy_app_scroll_bytes(
+                    up,
                     self.terminal.application_cursor_mode(),
+                    self.copy_mutt,
                 ));
             }
         }
@@ -1644,7 +1755,11 @@ impl TerminalWindow {
             return;
         };
         let (row, col) = copy.visible_cursor();
-        let stopped = copy.stopped;
+        let stopped = copy.stopped.or(if self.copy_mutt {
+            Some("コピー: mutt（Mで矢印操作に切替）")
+        } else {
+            None
+        });
         let cursor = if self.copy_keyboard {
             Some(crate::terminal::Cursor::at(
                 row,
@@ -1696,6 +1811,11 @@ impl TerminalWindow {
         let shift = self.modifiers.shift_key();
         if self.tui_copy.is_some() {
             match (ctrl, key) {
+                (false, KeyM) => {
+                    if self.copy_pending.is_none() {
+                        self.copy_mutt = !self.copy_mutt;
+                    }
+                }
                 (_, Escape) | (true, Space) => self.exit_copy_mode(),
                 (false, KeyY) => {
                     if self.copy_pending.is_some() {
@@ -1726,7 +1846,7 @@ impl TerminalWindow {
                 (false, KeyG) => {
                     let (_, col) = self.tui_copy.as_ref().unwrap().visible_cursor();
                     let target = if shift {
-                        self.terminal.size().1.saturating_sub(1)
+                        self.terminal.size().1.saturating_sub(2)
                     } else {
                         0
                     };
@@ -1847,6 +1967,92 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn released_drag_direction_is_independent_of_later_pointer_position() {
+        assert!(super::copy_drag_reverse(
+            Some((4, 0)),
+            Some((0, 0)),
+            Some((5, 0)),
+            false
+        ));
+        assert!(!super::copy_drag_reverse(
+            Some((0, 0)),
+            Some((4, 0)),
+            Some((0, 0)),
+            false
+        ));
+        assert!(super::copy_drag_reverse(
+            Some((4, 0)),
+            Some((4, 0)),
+            Some((0, 0)),
+            true
+        ));
+    }
+    #[test]
+    fn upwards_drag_keeps_original_bottom_anchor() {
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal =
+            crate::vt::VtTerminal::new(10, 6, 9, 18, std::path::Path::new("."), Some(&command));
+        let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+        parser.advance(
+            &mut *terminal.term.lock().unwrap(),
+            b"\x1b[?1049hA\r\nB\r\nC\r\nD\r\nE\r\n:",
+        );
+        terminal.start_selection(
+            SelectionType::Simple,
+            Point::new(Line(4), Column(0)),
+            Side::Right,
+        );
+        terminal.update_selection(Point::new(Line(0), Column(0)), Side::Left);
+        let mut copy = super::capture_mouse_selection(&terminal, true).unwrap();
+        parser.advance(
+            &mut *terminal.term.lock().unwrap(),
+            b"\x1b[HP\x1b[K\r\nA\x1b[K\r\nB\x1b[K\r\nC\x1b[K\r\nD\x1b[K",
+        );
+        assert!(copy.observe_scroll(terminal.copy_frame(), false));
+        assert_eq!(copy.text().as_deref(), Some("P\nA\nB\nC\nD\nE"));
+    }
+    #[test]
+    fn mutt_scroll_profile_uses_pager_keys_instead_of_changing_email() {
+        assert_eq!(super::copy_app_scroll_bytes(false, true, true), b"\r");
+        assert_eq!(super::copy_app_scroll_bytes(true, true, true), b"\x7f");
+        assert_eq!(super::copy_app_scroll_bytes(false, true, false), b"\x1bOB");
+    }
+    #[test]
+    fn drag_selection_is_captured_at_first_wheel_not_empty_press() {
+        use alacritty_terminal::index::{Column, Line, Point, Side};
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal =
+            crate::vt::VtTerminal::new(10, 4, 9, 18, std::path::Path::new("."), Some(&command));
+        let mut parser: vte::ansi::Processor = vte::ansi::Processor::new();
+        parser.advance(
+            &mut *terminal.term.lock().unwrap(),
+            b"\x1b[?1049hone\r\ntwo\r\nthree\r\n:",
+        );
+        terminal.start_selection(
+            alacritty_terminal::selection::SelectionType::Simple,
+            Point::new(Line(0), Column(0)),
+            Side::Left,
+        );
+        assert!(super::capture_mouse_selection(&terminal, false).is_none());
+        terminal.update_selection(Point::new(Line(2), Column(4)), Side::Right);
+        let mut copy = super::capture_mouse_selection(&terminal, false).unwrap();
+        assert_eq!(copy.text().as_deref(), Some("one\ntwo\nthree"));
+        parser.advance(
+            &mut *terminal.term.lock().unwrap(),
+            b"\x1b[Htwo\x1b[K\r\nthree\x1b[K\r\nfour\x1b[K",
+        );
+        assert!(copy.observe_scroll(terminal.copy_frame(), true));
+        assert_eq!(copy.text().as_deref(), Some("one\ntwo\nthree\nfour"));
+    }
+    #[test]
+    fn unchanged_application_cursor_request_retries_but_mouse_boundary_does_not() {
+        assert!(super::retry_copy_scroll(true, true, false, 0, 12));
+        assert!(!super::retry_copy_scroll(true, true, true, 0, 12));
+        assert!(!super::retry_copy_scroll(true, true, false, 12, 12));
+        assert!(!super::retry_copy_scroll(false, true, false, 0, 12));
+    }
     #[test]
     fn copy_wheel_reaches_app_only_when_live_capture_is_active() {
         assert!(super::copy_scroll_to_app(true, true));
