@@ -90,6 +90,37 @@ fn copy_scroll_to_app(_copy_mode: bool, live_capture: bool) -> bool {
     live_capture
 }
 
+fn finish_unchanged_scroll(
+    queued: &mut i32,
+    retries: &mut usize,
+    down: bool,
+    mouse: bool,
+    rows: usize,
+) {
+    // The in-flight request has already reached a boundary. A newer request
+    // in the other direction must survive both retry and boundary cleanup.
+    let step = if down { -1 } else { 1 };
+    if *queued != 0 && queued.signum() != step {
+        *retries = 0;
+        return;
+    }
+    if retry_copy_scroll(true, true, mouse, *retries, rows) {
+        *retries += 1;
+        *queued += if down { -1 } else { 1 };
+    } else {
+        *queued = 0;
+        *retries = 0;
+    }
+}
+
+fn enqueue_copy_scroll(queued: i32, delta: i32) -> i32 {
+    if delta != 0 && queued != 0 && queued.signum() != delta.signum() {
+        delta.clamp(-1000, 1000)
+    } else {
+        (queued + delta).clamp(-1000, 1000)
+    }
+}
+
 type CursorPosition = PhysicalPosition<f64>;
 
 pub(crate) fn visible_selection(
@@ -1640,7 +1671,7 @@ impl TerminalWindow {
         if !self.focused || self.tui_copy.as_ref().is_none_or(|c| c.stopped.is_some()) {
             return;
         }
-        self.copy_scroll = (self.copy_scroll + delta).clamp(-1000, 1000);
+        self.copy_scroll = enqueue_copy_scroll(self.copy_scroll, delta);
         self.drive_copy_scroll();
     }
 
@@ -1673,20 +1704,16 @@ impl TerminalWindow {
             self.copy_pending = None;
             if !accepted {
                 self.copy_scroll = 0;
-            } else if retry_copy_scroll(
-                accepted,
-                unchanged,
-                self.terminal.mouse_mode(),
-                self.copy_retries,
-                self.terminal.size().1,
-            ) {
+            } else if unchanged {
                 // Cursor keys in Vim can move only the application cursor until
                 // it reaches an edge. Keep the original scroll request pending.
-                self.copy_retries += 1;
-                self.copy_scroll += if self.copy_direction_down { -1 } else { 1 };
-            } else if unchanged {
-                self.copy_scroll = 0;
-                self.copy_retries = 0;
+                finish_unchanged_scroll(
+                    &mut self.copy_scroll,
+                    &mut self.copy_retries,
+                    self.copy_direction_down,
+                    self.terminal.mouse_mode(),
+                    self.terminal.size().1,
+                );
             } else {
                 self.copy_retries = 0;
             }
@@ -2052,6 +2079,26 @@ mod tests {
         assert!(!super::retry_copy_scroll(true, true, true, 0, 12));
         assert!(!super::retry_copy_scroll(true, true, false, 12, 12));
         assert!(!super::retry_copy_scroll(false, true, false, 0, 12));
+    }
+
+    #[test]
+    fn reverse_scroll_during_boundary_response_is_preserved() {
+        for mouse in [false, true] {
+            let mut queued = 2;
+            let mut retries = 0;
+            super::finish_unchanged_scroll(&mut queued, &mut retries, true, mouse, 12);
+            assert_eq!(queued, 2, "reverse request was lost, mouse={mouse}");
+            assert_eq!(retries, 0);
+        }
+    }
+
+    #[test]
+    fn reversing_scroll_cancels_old_unsent_requests() {
+        assert_eq!(super::enqueue_copy_scroll(-100, 3), 3);
+        assert_eq!(super::enqueue_copy_scroll(100, -3), -3);
+        assert_eq!(super::enqueue_copy_scroll(3, 2), 5);
+        assert_eq!(super::enqueue_copy_scroll(-3, -2), -5);
+        assert_eq!(super::enqueue_copy_scroll(-100, 0), -100);
     }
     #[test]
     fn copy_wheel_reaches_app_only_when_live_capture_is_active() {

@@ -2557,7 +2557,7 @@ mod tests {
         let mut copy = TuiCopy::new(frame, 0, 0, 1000);
         copy.select(SelectionType::Lines);
         copy.move_cursor(6, 0);
-        for n in 2..=16 {
+        for n in 2..=74 {
             terminal.write(crate::input::cursor_key_sequence(
                 crate::input::CursorKey::Down,
                 terminal.application_cursor_mode(),
@@ -2570,12 +2570,26 @@ mod tests {
         }
         assert_eq!(
             copy.text().unwrap(),
-            (1..=22)
+            (1..=80)
                 .map(|n| format!("ROW{n:03}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        for n in (13..=15).rev() {
+        // Attempt to scroll past EOF, then reverse direction. The footer may
+        // change at EOF, but this must not permanently stop the capture.
+        for _ in 0..3 {
+            terminal.write(crate::input::cursor_key_sequence(
+                crate::input::CursorKey::Down,
+                terminal.application_cursor_mode(),
+            ));
+            std::thread::sleep(Duration::from_millis(160));
+            assert!(
+                copy.observe_scroll(terminal.copy_frame(), true),
+                "{:?}",
+                copy.stopped
+            );
+        }
+        for n in (71..=73).rev() {
             terminal.write(crate::input::cursor_key_sequence(
                 crate::input::CursorKey::Up,
                 terminal.application_cursor_mode(),
@@ -2588,7 +2602,7 @@ mod tests {
         }
         assert_eq!(
             copy.text().unwrap(),
-            (1..=19)
+            (1..=77)
                 .map(|n| format!("ROW{n:03}"))
                 .collect::<Vec<_>>()
                 .join("\n")
