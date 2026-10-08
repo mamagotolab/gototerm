@@ -2365,7 +2365,6 @@ mod tests {
         assert_eq!(after, before);
     }
 
-    #[cfg(unix)]
     #[test]
     #[ignore = "requires Vim; set GOTOTERM_TEST_VIM to an isolated executable"]
     fn live_vim_copy_preserves_scrolled_lines() {
@@ -2383,6 +2382,79 @@ mod tests {
                 file.into(),
             ]
         });
+    }
+
+    #[test]
+    #[ignore = "requires Vim; also run on Windows ConPTY with GOTOTERM_TEST_VIM"]
+    fn live_vim_substitution_preserves_utf8_display_and_file() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("gototerm-vim-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("body.txt");
+        let original = (1..=5)
+            .map(|n| format!("* 日本語{n:03}\n"))
+            .collect::<String>();
+        let expected = original.replace("* ", "  ");
+        std::fs::write(&file, &original).unwrap();
+        let command = vec![
+            std::env::var("GOTOTERM_TEST_VIM").unwrap_or("vim".into()),
+            "-N".into(),
+            "-u".into(),
+            "NONE".into(),
+            "-i".into(),
+            "NONE".into(),
+            "-n".into(),
+            "+set noshowmode noruler laststatus=0".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let mut terminal = VtTerminal::new(60, 12, 9, 18, &dir, Some(&command));
+        let wait_body = |expected: &str| {
+            let start = Instant::now();
+            loop {
+                let frame = terminal.copy_frame();
+                if expected
+                    .lines()
+                    .enumerate()
+                    .all(|(i, s)| frame.rows[i].cells.concat().trim_end() == s)
+                {
+                    return;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "Vim body did not match synthetic expected text: {:?}",
+                    frame
+                        .rows
+                        .iter()
+                        .take(5)
+                        .map(|r| r.cells.concat())
+                        .collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_body(&original);
+        // Exercise entry/exit before editing, without using user configuration.
+        terminal.toggle_copy_mode();
+        terminal.toggle_copy_mode();
+        terminal.write(b":%s/* /  /g\r");
+        wait_body(&expected);
+        terminal.write(b":wq\r");
+        let started = Instant::now();
+        while !terminal.has_exited() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "Vim did not exit after saving"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            expected
+        );
+        terminal.kill();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]
@@ -2407,7 +2479,6 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
     fn live_reader_copy_test(name: &str, command: impl FnOnce(String, &Path) -> Vec<String>) {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
@@ -2461,6 +2532,7 @@ mod tests {
         let first = rows[0].0;
         let last = rows.last().unwrap().0;
         let mut max = rows.last().unwrap().1;
+        terminal.toggle_copy_mode();
         let mut copy = TuiCopy::new(frame, first, 0, 1000);
         copy.select(SelectionType::Lines);
         copy.move_cursor(last, 0);
@@ -2512,6 +2584,14 @@ mod tests {
             );
         }
         terminal.kill();
+        let killed = Instant::now();
+        while !terminal.has_exited() {
+            assert!(
+                killed.elapsed() < Duration::from_secs(3),
+                "{name} did not terminate"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2557,7 +2637,7 @@ mod tests {
         let mut copy = TuiCopy::new(frame, 0, 0, 1000);
         copy.select(SelectionType::Lines);
         copy.move_cursor(6, 0);
-        for n in 2..=16 {
+        for n in 2..=74 {
             terminal.write(crate::input::cursor_key_sequence(
                 crate::input::CursorKey::Down,
                 terminal.application_cursor_mode(),
@@ -2570,12 +2650,26 @@ mod tests {
         }
         assert_eq!(
             copy.text().unwrap(),
-            (1..=22)
+            (1..=80)
                 .map(|n| format!("ROW{n:03}"))
                 .collect::<Vec<_>>()
                 .join("\n")
         );
-        for n in (13..=15).rev() {
+        // Attempt to scroll past EOF, then reverse direction. The footer may
+        // change at EOF, but this must not permanently stop the capture.
+        for _ in 0..3 {
+            terminal.write(crate::input::cursor_key_sequence(
+                crate::input::CursorKey::Down,
+                terminal.application_cursor_mode(),
+            ));
+            std::thread::sleep(Duration::from_millis(160));
+            assert!(
+                copy.observe_scroll(terminal.copy_frame(), true),
+                "{:?}",
+                copy.stopped
+            );
+        }
+        for n in (71..=73).rev() {
             terminal.write(crate::input::cursor_key_sequence(
                 crate::input::CursorKey::Up,
                 terminal.application_cursor_mode(),
@@ -2588,7 +2682,7 @@ mod tests {
         }
         assert_eq!(
             copy.text().unwrap(),
-            (1..=19)
+            (1..=77)
                 .map(|n| format!("ROW{n:03}"))
                 .collect::<Vec<_>>()
                 .join("\n")
