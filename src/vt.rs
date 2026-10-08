@@ -2584,6 +2584,14 @@ mod tests {
             );
         }
         terminal.kill();
+        let killed = Instant::now();
+        while !terminal.has_exited() {
+            assert!(
+                killed.elapsed() < Duration::from_secs(3),
+                "{name} did not terminate"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 

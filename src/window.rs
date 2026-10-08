@@ -121,6 +121,13 @@ fn enqueue_copy_scroll(queued: i32, delta: i32) -> i32 {
     }
 }
 
+fn exit_terminal_copy_mode(terminal: &VtTerminal, keyboard: &mut bool) {
+    if terminal.copy_mode_active() {
+        terminal.toggle_copy_mode();
+    }
+    *keyboard = false;
+}
+
 type CursorPosition = PhysicalPosition<f64>;
 
 pub(crate) fn visible_selection(
@@ -985,6 +992,10 @@ impl TerminalWindow {
                 }
                 // 確定した文字列を PTY に流し、変換中表示を消す。
                 Ime::Commit(text) => {
+                    // Committed text edits the live application, just like a
+                    // normal key. Do not leave a mouse copy snapshot displayed.
+                    self.clear_mouse_selection();
+                    self.terminal.scroll_to_bottom();
                     self.terminal.write(text.as_bytes());
                     self.view.update_contents(|view| view.preedit.clear());
                     // 確定に使った Enter がこの直後にキー入力として来ても
@@ -1660,9 +1671,7 @@ impl TerminalWindow {
     }
 
     fn exit_copy_mode(&mut self) {
-        if self.terminal.copy_mode_active() {
-            self.terminal.toggle_copy_mode();
-        }
+        exit_terminal_copy_mode(&self.terminal, &mut self.copy_keyboard);
         self.end_tui_copy();
         self.window.set_ime_allowed(true);
     }
@@ -1886,15 +1895,13 @@ impl TerminalWindow {
         }
         match (ctrl, key) {
             (_, Escape) | (true, Space) => {
-                self.terminal.toggle_copy_mode();
-                self.window.set_ime_allowed(true);
+                self.exit_copy_mode();
             }
             (false, KeyY) => {
                 if let Some((_, text)) = self.terminal.tracked_selection_text() {
                     set_clipboard(&text);
                 }
-                self.terminal.toggle_copy_mode();
-                self.window.set_ime_allowed(true);
+                self.exit_copy_mode();
             }
             (true, KeyU) => self.terminal.copy_mode_page(true),
             (true, KeyD) => self.terminal.copy_mode_page(false),
@@ -1994,6 +2001,30 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn exit_after_mouse_selection_clears_keyboard_capture_and_vi_state() {
+        let command = if cfg!(windows) {
+            vec!["cmd.exe".into(), "/c".into(), "exit 0".into()]
+        } else {
+            vec!["sh".into(), "-c".into(), "exit 0".into()]
+        };
+        let terminal =
+            crate::vt::VtTerminal::new(20, 6, 9, 18, std::path::Path::new("."), Some(&command));
+        // A mouse press clears the TUI capture but retains copy_keyboard.
+        for vt_active in [true, false] {
+            if terminal.copy_mode_active() != vt_active {
+                terminal.toggle_copy_mode();
+            }
+            let mut keyboard = true;
+            super::exit_terminal_copy_mode(&terminal, &mut keyboard);
+            assert!(!keyboard, "mouse selection left the keyboard captured");
+            assert!(
+                !terminal.copy_mode_active(),
+                "exit must not re-enable VT copy mode"
+            );
+        }
+    }
+
     #[test]
     fn released_drag_direction_is_independent_of_later_pointer_position() {
         assert!(super::copy_drag_reverse(
