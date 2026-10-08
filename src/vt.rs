@@ -2385,6 +2385,79 @@ mod tests {
         });
     }
 
+    #[test]
+    #[ignore = "requires Vim; also run on Windows ConPTY with GOTOTERM_TEST_VIM"]
+    fn live_vim_substitution_preserves_utf8_display_and_file() {
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("gototerm-vim-replace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("body.txt");
+        let original = (1..=5)
+            .map(|n| format!("* 日本語{n:03}\n"))
+            .collect::<String>();
+        let expected = original.replace("* ", "  ");
+        std::fs::write(&file, &original).unwrap();
+        let command = vec![
+            std::env::var("GOTOTERM_TEST_VIM").unwrap_or("vim".into()),
+            "-N".into(),
+            "-u".into(),
+            "NONE".into(),
+            "-i".into(),
+            "NONE".into(),
+            "-n".into(),
+            "+set noshowmode noruler laststatus=0".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let mut terminal = VtTerminal::new(60, 12, 9, 18, &dir, Some(&command));
+        let wait_body = |expected: &str| {
+            let start = Instant::now();
+            loop {
+                let frame = terminal.copy_frame();
+                if expected
+                    .lines()
+                    .enumerate()
+                    .all(|(i, s)| frame.rows[i].cells.concat().trim_end() == s)
+                {
+                    return;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "Vim body did not match synthetic expected text: {:?}",
+                    frame
+                        .rows
+                        .iter()
+                        .take(5)
+                        .map(|r| r.cells.concat())
+                        .collect::<Vec<_>>()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        wait_body(&original);
+        // Exercise entry/exit before editing, without using user configuration.
+        terminal.toggle_copy_mode();
+        terminal.toggle_copy_mode();
+        terminal.write(b":%s/* /  /g\r");
+        wait_body(&expected);
+        terminal.write(b":wq\r");
+        let started = Instant::now();
+        while !terminal.has_exited() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "Vim did not exit after saving"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file)
+                .unwrap()
+                .replace("\r\n", "\n"),
+            expected
+        );
+        terminal.kill();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "requires mutt; uses a synthetic local mailbox, no personal email"]

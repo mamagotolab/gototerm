@@ -59,3 +59,17 @@ jobs:
           path: |
             target/release/gototerm.exe
             target/release/gototerm-hook.exe
+
+      - name: Verify Vim substitution on ConPTY
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'vim.zip'
+          Invoke-WebRequest 'https://github.com/vim/vim-win32-installer/releases/download/v9.2.1172/gvim_9.2.1172_x64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne '03e37f348a0fe5ccc61e3e2d9ffa43d3a3d0e8068f14d6d17b241bee31b38626') { throw 'Vim archive checksum mismatch' }
+          $extract = Join-Path $env:RUNNER_TEMP 'vim-test'
+          Expand-Archive $archive $extract
+          $env:GOTOTERM_TEST_VIM = (Get-ChildItem $extract -Filter vim.exe -Recurse | Select-Object -First 1).FullName
+          if (-not $env:GOTOTERM_TEST_VIM) { throw 'vim.exe missing from official archive' }
+          cargo test live_vim_substitution_preserves_utf8_display_and_file -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
