@@ -2365,7 +2365,6 @@ mod tests {
         assert_eq!(after, before);
     }
 
-    #[cfg(unix)]
     #[test]
     #[ignore = "requires Vim; set GOTOTERM_TEST_VIM to an isolated executable"]
     fn live_vim_copy_preserves_scrolled_lines() {
@@ -2480,7 +2479,6 @@ mod tests {
         });
     }
 
-    #[cfg(unix)]
     fn live_reader_copy_test(name: &str, command: impl FnOnce(String, &Path) -> Vec<String>) {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
@@ -2534,6 +2532,7 @@ mod tests {
         let first = rows[0].0;
         let last = rows.last().unwrap().0;
         let mut max = rows.last().unwrap().1;
+        terminal.toggle_copy_mode();
         let mut copy = TuiCopy::new(frame, first, 0, 1000);
         copy.select(SelectionType::Lines);
         copy.move_cursor(last, 0);

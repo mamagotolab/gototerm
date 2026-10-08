@@ -60,7 +60,7 @@ jobs:
             target/release/gototerm.exe
             target/release/gototerm-hook.exe
 
-      - name: Verify Vim substitution on ConPTY
+      - name: Verify Vim copy and substitution on ConPTY
         timeout-minutes: 3
         shell: pwsh
         run: |
@@ -71,5 +71,5 @@ jobs:
           Expand-Archive $archive $extract
           $env:GOTOTERM_TEST_VIM = (Get-ChildItem $extract -Filter vim.exe -Recurse | Select-Object -First 1).FullName
           if (-not $env:GOTOTERM_TEST_VIM) { throw 'vim.exe missing from official archive' }
-          cargo test live_vim_substitution_preserves_utf8_display_and_file -- --ignored --nocapture
+          cargo test live_vim_ -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
