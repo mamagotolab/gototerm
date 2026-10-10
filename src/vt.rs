@@ -2565,10 +2565,23 @@ mod tests {
         copy.select(SelectionType::Lines);
         for step in 1..=8 {
             terminal.write(b"\x1b[<65;1;1M");
+            let next = wait(&body[step * 3]);
             assert!(
-                copy.observe_scroll(wait(&body[step * 3]), true),
-                "{:?}",
-                copy.stopped
+                copy.observe_scroll(next.clone(), true),
+                "{:?} step={} old_trace={:?} new_trace={:?} old_rows={:?} new_rows={:?}",
+                copy.stopped,
+                step,
+                copy.frame.scroll,
+                next.scroll,
+                copy.frame
+                    .rows
+                    .iter()
+                    .map(|r| r.cells.concat())
+                    .collect::<Vec<_>>(),
+                next.rows
+                    .iter()
+                    .map(|r| r.cells.concat())
+                    .collect::<Vec<_>>()
             );
             assert_eq!(copy.text().unwrap(), body[..=step * 3].join("\n"));
         }
