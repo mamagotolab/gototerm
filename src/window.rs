@@ -21,6 +21,32 @@ use crate::vt::{GridSelection, ShellLocation, VtTerminal};
 use crate::Display;
 use alacritty_terminal::selection::SelectionType;
 
+fn copy_notice_lines(reason: &str, width: usize) -> Vec<crate::terminal::Line> {
+    use crate::terminal::{Cell, GraphicAttribute, Line};
+    use unicode_width::UnicodeWidthChar;
+    if width == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    let mut cells = Vec::new();
+    for ch in reason.chars() {
+        let w = ch.width().unwrap_or(0).max(1).min(width);
+        if cells.len() + w > width {
+            cells.resize(width, Cell::head(' ', 1, GraphicAttribute::default()));
+            lines.push(Line::from_cells(std::mem::take(&mut cells), false));
+        }
+        cells.push(Cell::head(ch, w as u16, GraphicAttribute::default()));
+        for _ in 1..w {
+            cells.push(Cell::spacer(1));
+        }
+    }
+    if !cells.is_empty() {
+        cells.resize(width, Cell::head(' ', 1, GraphicAttribute::default()));
+        lines.push(Line::from_cells(cells, false));
+    }
+    lines
+}
+
 fn copy_drag_reverse(
     origin: Option<(usize, usize)>,
     end: Option<(usize, usize)>,
@@ -1704,6 +1730,11 @@ impl TerminalWindow {
                 return;
             }
             let frame = self.terminal.copy_frame();
+            if self.tui_copy.as_ref().unwrap().awaiting_paint(&frame)
+                && started.elapsed() < Duration::from_secs(3)
+            {
+                return;
+            }
             let unchanged = self.tui_copy.as_ref().unwrap().display_unchanged(&frame);
             let accepted = self
                 .tui_copy
@@ -1818,22 +1849,12 @@ impl TerminalWindow {
                 if let Some(reason) = stopped {
                     // A display overlay only; captured text and the PTY grid are unchanged.
                     if let Some(line) = view.lines.last_mut() {
-                        use crate::terminal::{Cell, GraphicAttribute, Line};
-                        use unicode_width::UnicodeWidthChar;
                         let width = line.cells_mut().len();
-                        let mut cells = Vec::new();
-                        for ch in reason.chars() {
-                            let w = ch.width().unwrap_or(0).max(1);
-                            if cells.len() + w > width {
-                                break;
-                            }
-                            cells.push(Cell::head(ch, w as u16, GraphicAttribute::default()));
-                            for _ in 1..w {
-                                cells.push(Cell::spacer(1));
-                            }
+                        let lines = copy_notice_lines(reason, width);
+                        let start = view.lines.len().saturating_sub(lines.len());
+                        for (target, notice) in view.lines[start..].iter_mut().zip(lines) {
+                            *target = notice;
                         }
-                        cells.resize(width, Cell::head(' ', 1, GraphicAttribute::default()));
-                        *line = Line::from_cells(cells, false);
                     }
                 }
             }
@@ -2001,6 +2022,28 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn copy_stop_notice_is_complete_at_narrow_widths() {
+        let reason = "本文の連続性を確認できません。保持済みの範囲はコピーできます";
+        for width in [20, 39, 80] {
+            let mut lines = super::copy_notice_lines(reason, width);
+            let text: String = lines
+                .iter_mut()
+                .map(|line| {
+                    assert_eq!(line.cells_mut().len(), width);
+                    line.cells_mut()
+                        .iter()
+                        .filter(|c| c.width > 0)
+                        .map(|c| c.ch)
+                        .collect::<String>()
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect();
+            assert_eq!(text, reason, "width={width}");
+        }
+    }
+
     #[test]
     fn exit_after_mouse_selection_clears_keyboard_capture_and_vi_state() {
         let command = if cfg!(windows) {

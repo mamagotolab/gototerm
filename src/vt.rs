@@ -16,7 +16,9 @@ use alacritty_terminal::selection::{Selection as AlacSelection, SelectionType};
 use alacritty_terminal::term::{Config, Term};
 use alacritty_terminal::vte::ansi::Rgb;
 use portable_pty::{ChildKiller, CommandBuilder, MasterPty, PtySize};
-use vte::ansi::Processor;
+#[path = "vt_scroll.rs"]
+mod scroll;
+use scroll::Processor;
 
 use crate::gt::{parse_gt_message, GtMessage};
 use crate::sixel;
@@ -383,6 +385,7 @@ impl Dimensions for GridSize {
 
 /// alacritty_terminal ベースの端末。`term` を描画側と共有する。
 pub struct VtTerminal {
+    scroll_trace: Arc<Mutex<crate::tui_copy::ScrollTrace>>,
     #[cfg(windows)]
     _state_pipe: Option<crate::state_pipe::StatePipe>,
     pub term: Arc<Mutex<Term<EventProxy>>>,
@@ -1265,6 +1268,9 @@ impl VtTerminal {
         let last_alt = Arc::new(AtomicBool::new(false));
         let shell_location = Arc::new(Mutex::new(None));
 
+        let processor = Processor::new();
+        let scroll_trace = processor.trace.clone();
+
         // 読取スレッド：PTY 出力を Sixel と通常VTに分け、後者を Processor に流す
         {
             let term = term.clone();
@@ -1275,7 +1281,7 @@ impl VtTerminal {
             let winsize = winsize.clone();
             let shell_location = shell_location.clone();
             std::thread::spawn(move || {
-                let mut processor: Processor = Processor::new();
+                let mut processor = processor;
                 let mut splitter = SixelSplitter::default();
                 let diagnostics_enabled = matches!(
                     std::env::var("GOTOTERM_UTF8_DIAGNOSTICS").as_deref(),
@@ -1350,6 +1356,7 @@ impl VtTerminal {
         }
 
         VtTerminal {
+            scroll_trace,
             #[cfg(windows)]
             _state_pipe: state_pipe,
             term,
@@ -1819,6 +1826,7 @@ impl VtTerminal {
             })
             .collect();
         Frame {
+            scroll: self.scroll_trace.lock().unwrap().clone(),
             rows,
             alternate: term
                 .mode()
@@ -2457,6 +2465,134 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    #[test]
+    fn copy_scroll_waits_for_exposed_rows_to_be_painted() {
+        use crate::tui_copy::TuiCopy;
+        let mut term = link_test_term(12, "");
+        term.resize(GridSize { cols: 12, lines: 7 });
+        let mut parser = Processor::new();
+        let frame = |term: &Term<EventProxy>, parser: &Processor| crate::tui_copy::Frame {
+            alternate: true,
+            scroll: parser.trace.lock().unwrap().clone(),
+            rows: (0..7)
+                .map(|r| crate::tui_copy::Row {
+                    cells: (0..12)
+                        .map(|c| term.grid()[Line(r)][Column(c)].c.to_string())
+                        .collect(),
+                    wrapped: false,
+                })
+                .collect(),
+        };
+        let feed = |parser: &mut Processor, term: &mut Term<EventProxy>, bytes: &[u8]| {
+            parser.advance(term, bytes)
+        };
+        feed(
+            &mut parser,
+            &mut term,
+            b"\x1b[?1049h\x1b[2J\x1b[HA\r\nB\r\nC\r\nD\r\nE\r\nF\r\n:",
+        );
+        let mut copy = TuiCopy::new(frame(&term, &parser), 0, 0, 100);
+        copy.select(SelectionType::Lines);
+        copy.move_cursor(5, 0);
+        // A split CSI must be tracked exactly once, before any exposed text arrives.
+        feed(&mut parser, &mut term, b"\x1b[1;6r\x1b[H\x1b[3");
+        feed(&mut parser, &mut term, b"M");
+        let partial = frame(&term, &parser);
+        assert!(copy.awaiting_paint(&partial));
+        assert_eq!(copy.text().as_deref(), Some("A\nB\nC\nD\nE\nF"));
+        feed(&mut parser, &mut term, b"\x1b[4;1HG\r\nH\r\n\x1b[K");
+        let complete = frame(&term, &parser);
+        assert!(!copy.awaiting_paint(&complete));
+        assert!(copy.observe_scroll(complete, true), "{:?}", copy.stopped);
+        assert_eq!(copy.text().as_deref(), Some("A\nB\nC\nD\nE\nF\nG\nH\n"));
+        feed(&mut parser, &mut term, b"\x1b[r\x1b[7;1H\x1b[K");
+        let before = frame(&term, &parser);
+        feed(&mut parser, &mut term, b"\x1b[J\x1b[3J");
+        let after = frame(&term, &parser);
+        assert_eq!(
+            before.scroll.serial, after.scroll.serial,
+            "non-body cleanup must not invalidate copying"
+        );
+        assert_eq!(before.rows, after.rows);
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies its default three-line mouse scrolling"]
+    fn live_nvim_copy_from_one_line_survives_default_mouse_scroll() {
+        use crate::tui_copy::TuiCopy;
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("gototerm-nvim-copy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("body.txt");
+        let body = (1..=40)
+            .flat_map(|n| {
+                [
+                    format!("fn item{n:03}() {{ // 日本語"),
+                    "}".into(),
+                    String::new(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        std::fs::write(&file, body.join("\n") + "\n").unwrap();
+        let command = vec![
+            std::env::var("GOTOTERM_TEST_NVIM").unwrap_or("nvim".into()),
+            "--clean".into(),
+            "-n".into(),
+            "-i".into(),
+            "NONE".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let mut terminal = VtTerminal::new(80, 24, 9, 18, &dir, Some(&command));
+        let wait = |first: &str| {
+            let start = Instant::now();
+            loop {
+                let frame = terminal.copy_frame();
+                if frame.rows[0].cells.concat().trim_end() == first {
+                    std::thread::sleep(Duration::from_millis(150));
+                    return terminal.copy_frame();
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "nvim did not reach {first}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let first = wait(&body[0]);
+        assert!(terminal.mouse_mode() && terminal.sgr_mouse());
+        terminal.toggle_copy_mode();
+        let mut copy = TuiCopy::new(first, 0, 0, 1000);
+        copy.select(SelectionType::Lines);
+        for step in 1..=8 {
+            terminal.write(b"\x1b[<65;1;1M");
+            assert!(
+                copy.observe_scroll(wait(&body[step * 3]), true),
+                "{:?}",
+                copy.stopped
+            );
+            assert_eq!(copy.text().unwrap(), body[..=step * 3].join("\n"));
+        }
+        for step in (5..8).rev() {
+            terminal.write(b"\x1b[<64;1;1M");
+            assert!(
+                copy.observe_scroll(wait(&body[step * 3]), false),
+                "{:?}",
+                copy.stopped
+            );
+            assert_eq!(copy.text().unwrap(), body[..=step * 3].join("\n"));
+        }
+        terminal.kill();
+        let killed = Instant::now();
+        while !terminal.has_exited() {
+            assert!(
+                killed.elapsed() < Duration::from_secs(3),
+                "nvim did not terminate"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     #[ignore = "requires mutt; uses a synthetic local mailbox, no personal email"]
@@ -2642,10 +2778,13 @@ mod tests {
                 crate::input::CursorKey::Down,
                 terminal.application_cursor_mode(),
             ));
+            let next = wait(&format!("ROW{n:03}"));
             assert!(
-                copy.observe(wait(&format!("ROW{n:03}"))),
-                "{:?}",
-                copy.stopped
+                copy.observe(next.clone()),
+                "{:?} old={:?} new={:?}",
+                copy.stopped,
+                copy.frame.scroll,
+                next.scroll
             );
         }
         assert_eq!(
@@ -3326,8 +3465,8 @@ mod tests {
 
     #[test]
     fn responds_to_text_area_pixel_size_query() {
+        use crate::vt::scroll::Processor;
         use alacritty_terminal::term::{Config, Term};
-        use vte::ansi::Processor;
 
         let (writer, buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
@@ -3349,8 +3488,8 @@ mod tests {
 
     #[test]
     fn place_sixel_stores_image_and_advances_cursor() {
+        use crate::vt::scroll::Processor;
         use alacritty_terminal::term::{Config, Term};
-        use vte::ansi::Processor;
 
         let (writer, _buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 10, 20)));
@@ -3389,9 +3528,9 @@ mod tests {
 
     #[test]
     fn scrollback_shows_history_after_scroll() {
+        use crate::vt::scroll::Processor;
         use alacritty_terminal::grid::Scroll;
         use alacritty_terminal::term::{Config, Term};
-        use vte::ansi::Processor;
 
         let (writer, _buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(20, 5, 10, 20)));
