@@ -469,6 +469,22 @@ watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 
 ---
 
+### タスクファイル連携（任意）
+
+Markdown のチェックボックス（`- [ ] タスク`）で書いたタスクファイルを指定すると、
+タブバーの右端に未完了の件数「残8 優先2」を出します（先頭が `! ` のタスクを優先として数えます）。
+`Ctrl+Shift+G` で、今いるフォルダのタスクを `task_url` のページで開きます。
+
+```toml
+task_file = "~/notes/tasks.md"           # 空（既定）なら無効
+task_url = "http://localhost:8765/"      # ブラウザで開く先。?v=dir:<フォルダ> を付けて開く
+open_socket = true                       # Linux のみ。外部から「このファイルをエディタで開く」を受け付ける
+```
+
+`open_socket = true` にすると `$XDG_RUNTIME_DIR/gototerm.sock` を待ち受け、
+`open<TAB>/絶対パス<TAB>行番号` の1行を受け取ると、そのファイルを新しいタブのエディタで開きます。
+受け付けるのは既存ファイルの絶対パスだけで、コマンドは実行しません。ソケットは本人のみ読み書きできます（0600）。
+
 ## 色の設定
 
 色はすべて **`0xRRGGBBAA`**（赤・緑・青・**アルファ**）の 32bit 整数で指定します。
@@ -638,6 +654,7 @@ new_tab = "Ctrl+Shift+N"
 |---|---|
 | `new_tab` | `Ctrl+Shift+T` |
 | `open_task_overview` | `Ctrl+Shift+A` |
+| `open_tasks` | `Ctrl+Shift+G`（`task_file` 設定時のみ） |
 | `close_pane` | `Ctrl+Shift+W` |
 | `next_tab` | `Ctrl+Tab` |
 | `prev_tab` | `Ctrl+Shift+Tab` |

@@ -47,6 +47,17 @@ pub struct Config {
     #[serde(default = "default_agents")]
     pub launcher_agents: Vec<AgentDef>,
 
+    // gototask（Markdownのタスクファイル）連携。空なら無効。
+    // 設定するとタブバーに「残N 優先M」を出し、open_tasks キーでブラウザを開く。
+    #[serde(default)]
+    pub task_file: String,
+    #[serde(default = "default_task_url")]
+    pub task_url: String,
+    // 外部（gototask等）から「このファイルをエディタで開いて」を受け付けるソケット。
+    // Linux のみ。$XDG_RUNTIME_DIR/gototerm.sock。
+    #[serde(default)]
+    pub open_socket: bool,
+
     // RRGGBBAA
     pub color_background: u32,
     pub color_foreground: u32,
@@ -118,6 +129,9 @@ impl Default for Config {
             // 既定で起動時にランチャーを出す（落としてすぐ「開く場所を選ぶ」体験）。
             show_launcher_on_start: true,
             launcher_agents: default_agents(),
+            task_file: String::new(),
+            task_url: default_task_url(),
+            open_socket: false,
 
             scroll_bar_width: 5,
             // 既定の配色は Tokyo Night（Night バリアント）。
@@ -148,6 +162,10 @@ impl Default for Config {
             color_bright_white: 0xC0CAF5FF,
         }
     }
+}
+
+fn default_task_url() -> String {
+    "http://localhost:8765/".to_owned()
 }
 
 fn default_preview_ratio() -> f64 {

@@ -134,6 +134,7 @@ enum Action {
     NewTab,
     OpenLauncher,
     OpenTaskOverview,
+    OpenTasks,
     CloseFocused,
     NextTab,
     PrevTab,
@@ -1714,6 +1715,9 @@ pub struct Multiplexer {
     viewport: Viewport,
     status_view: TerminalView,
     status_signature: String,
+    task_summary: Option<crate::task_link::TaskSummary>,
+    #[cfg(unix)]
+    open_socket: Option<crate::task_link::OpenSocket>,
     sidebar: Sidebar,
     sidebar_focused: bool,
     preview_slot: PreviewSlot,
@@ -1801,6 +1805,14 @@ impl Multiplexer {
             viewport,
             status_view,
             status_signature: String::new(),
+            task_summary: crate::task_link::TaskSummary::from_config(
+                &crate::TOYTERM_CONFIG.task_file,
+            ),
+            #[cfg(unix)]
+            open_socket: crate::TOYTERM_CONFIG
+                .open_socket
+                .then(crate::task_link::OpenSocket::bind)
+                .flatten(),
             sidebar,
             sidebar_focused: false,
             preview_slot,
@@ -2122,9 +2134,14 @@ impl Multiplexer {
         }
     }
 
-    /// タブバーの高さ（px）。タブ1枚のときは 0（バー非表示）。
+    /// タスク集計をタブバーに出すか（task_file 設定済みで読めたとき）。
+    fn task_counts(&self) -> Option<(usize, usize)> {
+        self.task_summary.as_ref().and_then(|s| s.counts())
+    }
+
+    /// タブバーの高さ（px）。タブ1枚かつタスク集計なしのときは 0（バー非表示）。
     fn status_bar_height(&self) -> u32 {
-        if self.tabs.len() <= 1 {
+        if self.tabs.len() <= 1 && self.task_counts().is_none() {
             0
         } else {
             self.status_view.cell_size().h
@@ -2168,7 +2185,15 @@ impl Multiplexer {
     }
 
     fn update_status_bar(&mut self) {
-        if self.tabs.len() <= 1 {
+        let had_counts = self.task_counts().is_some();
+        if self.task_summary.as_mut().is_some_and(|s| s.refresh())
+            && had_counts != self.task_counts().is_some()
+        {
+            // バーの有無が変わる（タブ1枚のとき）ので内容領域を測り直す。
+            self.refresh_layout();
+        }
+        let counts = self.task_counts();
+        if self.tabs.len() <= 1 && counts.is_none() {
             return;
         }
 
@@ -2186,7 +2211,7 @@ impl Multiplexer {
                     .unwrap_or_else(|| "shell".into()),
             );
         }
-        let signature = format!("{cols}:{}:{titles:?}", self.focus);
+        let signature = format!("{cols}:{}:{titles:?}:{counts:?}", self.focus);
         if signature == self.status_signature {
             return;
         }
@@ -2229,10 +2254,25 @@ impl Multiplexer {
             }
             cells.extend(header);
         }
-        cells.truncate(cols);
-        cells.resize_with(cols, || {
+        // 右端にタスク集計（gototask）。優先があれば赤で目立たせる。
+        let mut right = Vec::new();
+        if let Some((open, important)) = counts {
+            let rest = format!(" 残{open} ");
+            let imp = format!("優先{important} ");
+            let rest_w = crate::launcher::display_width(&rest);
+            let imp_w = crate::launcher::display_width(&imp);
+            if rest_w + imp_w < cols {
+                right.extend(crate::launcher::column_cells(&rest, Color::White, BAR_BG, rest_w));
+                let color = if important > 0 { Color::Red } else { Color::White };
+                right.extend(crate::launcher::column_cells(&imp, color, BAR_BG, imp_w));
+            }
+        }
+        let left_cols = cols - right.len();
+        cells.truncate(left_cols);
+        cells.resize_with(left_cols, || {
             crate::launcher::column_cells(" ", Color::White, BAR_BG, 1)[0]
         });
+        cells.extend(right);
 
         self.status_view.update_contents(|view| {
             view.bg_color = BAR_BG;
@@ -2256,6 +2296,7 @@ impl Multiplexer {
             ShortcutAction::NewTab => Some(Action::NewTab),
             ShortcutAction::OpenLauncher => Some(Action::OpenLauncher),
             ShortcutAction::OpenTaskOverview => Some(Action::OpenTaskOverview),
+            ShortcutAction::OpenTasks => Some(Action::OpenTasks),
             ShortcutAction::ClosePane => Some(Action::CloseFocused),
             ShortcutAction::NextTab => Some(Action::NextTab),
             ShortcutAction::PrevTab => Some(Action::PrevTab),
@@ -2303,6 +2344,8 @@ impl Multiplexer {
             }
 
             Action::OpenTaskOverview => self.open_task_overview(),
+
+            Action::OpenTasks => self.open_tasks(),
 
             Action::CloseFocused => {
                 let tab_empty = self.tabs[self.focus].root.close_focused();
@@ -2491,6 +2534,46 @@ impl Multiplexer {
         if let Some(cwd) = cwd {
             self.recent.record(cwd);
         }
+    }
+
+    /// 今いるフォルダのタスクを gototask（ブラウザ）で開く。task_file 未設定なら何もしない。
+    fn open_tasks(&mut self) {
+        if self.task_summary.is_none() {
+            return;
+        }
+        let dir = match self.focused_location() {
+            ShellLocation::Local(path) => Some(path),
+            ShellLocation::Remote { .. } => None,
+        };
+        crate::window::open_url(&crate::task_link::tasks_url(
+            &crate::TOYTERM_CONFIG.task_url,
+            dir.as_deref(),
+        ));
+    }
+
+    /// 外部（gototask）から届いた「このファイルを開いて」を新しいタブのエディタで開く。
+    #[cfg(unix)]
+    fn handle_open_requests(&mut self) {
+        let Some(socket) = self.open_socket.as_ref() else {
+            return;
+        };
+        let requests = socket.poll();
+        if requests.is_empty() {
+            return;
+        }
+        let env_editor = std::env::var("EDITOR").ok();
+        let editor = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
+        for (path, line) in requests {
+            if !path.is_file() || !command_exists(&editor[0]) {
+                log::warn!("開けませんでした: {} ({})", path.display(), editor[0]);
+                continue;
+            }
+            let command = crate::task_link::editor_args(&editor, &path, line);
+            let cwd = path.parent().map(Path::to_path_buf);
+            self.open_tab_in(cwd.as_deref(), Some(&command));
+        }
+        self.window.focus_window();
+        self.window.request_redraw();
     }
 
     fn handle_session_review_outcome(&mut self, outcome: SessionReviewOutcome) {
@@ -3446,6 +3529,8 @@ impl Multiplexer {
                 }
 
                 self.handle_gt_messages();
+                #[cfg(unix)]
+                self.handle_open_requests();
                 self.update_status_bar();
 
                 if self.task_overview.is_some()

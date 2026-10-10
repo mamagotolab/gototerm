@@ -1487,7 +1487,7 @@ fn overlay_list_popup(
     (x0, y0)
 }
 
-fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     s.chars()
         .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
         .sum()

@@ -20,6 +20,7 @@ mod session_review;
 mod sidebar;
 mod sixel;
 mod task_activity;
+mod task_link;
 mod task_overview;
 mod terminal;
 mod timeline;
