@@ -16,7 +16,7 @@ jobs:
             libfontconfig1-dev \
             libwayland-dev \
             libxkbcommon-dev \
-            cmake
+            cmake neovim
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -26,6 +26,11 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      - name: Verify Neovim default mouse scrolling
+        env:
+          NVIM_LOG_FILE: ${{ runner.temp }}/nvim-test.log
+        run: cargo test live_nvim_ -- --ignored --nocapture
 
   build-windows:
     runs-on: windows-latest
@@ -49,6 +54,13 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Install Microsoft ConPTY for distribution and tests
+        shell: pwsh
+        run: |
+          & ./.github/scripts/install-conpty.ps1 -Destination target/release
+          New-Item -ItemType Directory -Force target/debug/deps | Out-Null
+          Copy-Item target/release/conpty.dll, target/release/OpenConsole.exe target/debug/deps
+
       - name: Test
         run: cargo test
 
@@ -59,6 +71,9 @@ jobs:
           path: |
             target/release/gototerm.exe
             target/release/gototerm-hook.exe
+            target/release/conpty.dll
+            target/release/OpenConsole.exe
+            target/release/LICENSE-ConPTY.txt
 
       - name: Verify Vim copy and substitution on ConPTY
         timeout-minutes: 3
@@ -72,4 +87,18 @@ jobs:
           $env:GOTOTERM_TEST_VIM = (Get-ChildItem $extract -Filter vim.exe -Recurse | Select-Object -First 1).FullName
           if (-not $env:GOTOTERM_TEST_VIM) { throw 'vim.exe missing from official archive' }
           cargo test live_vim_ -- --ignored --nocapture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify Neovim default mouse scrolling on ConPTY
+        timeout-minutes: 3
+        shell: pwsh
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP 'nvim.zip'
+          Invoke-WebRequest 'https://github.com/neovim/neovim/releases/download/v0.12.6/nvim-win64.zip' -OutFile $archive
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLower() -ne '4e12b7103b601ffc8f25954b4da100f339faa73dccb69a5b135e897fa3d893ed') { throw 'Neovim archive checksum mismatch' }
+          $extract = Join-Path $env:RUNNER_TEMP 'nvim-test'
+          Expand-Archive $archive $extract
+          $env:GOTOTERM_TEST_NVIM = Join-Path $extract 'nvim-win64/bin/nvim.exe'
+          $env:NVIM_LOG_FILE = Join-Path $env:RUNNER_TEMP 'nvim-test.log'
+          cargo test live_nvim_ -- --ignored --nocapture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

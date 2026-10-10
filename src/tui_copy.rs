@@ -11,6 +11,49 @@ pub(crate) struct Row {
 pub(crate) struct Frame {
     pub rows: Vec<Row>,
     pub alternate: bool,
+    pub scroll: ScrollTrace,
+}
+/// Bounded record of grid rotations emitted by the application, not inferred from text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScrollTrace {
+    pub serial: u64,
+    pub pending: std::collections::BTreeSet<usize>,
+    events: std::collections::VecDeque<(u64, Option<(i64, std::ops::Range<usize>)>)>,
+}
+impl ScrollTrace {
+    pub fn push(&mut self, event: Option<(i64, std::ops::Range<usize>)>) {
+        self.serial += 1;
+        self.events.push_back((self.serial, event));
+        if self.events.len() > 64 {
+            self.events.pop_front();
+        }
+    }
+    fn since(&self, old: &Self) -> Result<Option<(i64, std::ops::Range<usize>)>, ()> {
+        if self.serial == old.serial {
+            return Ok(None);
+        }
+        let mut serial = old.serial;
+        let mut movement: Option<(i64, std::ops::Range<usize>)> = None;
+        for (id, event) in self.events.iter().filter(|(id, _)| *id > old.serial) {
+            if *id != serial + 1 {
+                return Err(());
+            }
+            serial = *id;
+            let (delta, body) = event.as_ref().ok_or(())?;
+            if let Some((sum, region)) = &mut movement {
+                if region != body || (*sum > 0) != (*delta > 0) {
+                    return Err(());
+                }
+                *sum += delta;
+            } else {
+                movement = Some((*delta, body.clone()));
+            }
+        }
+        if serial != self.serial {
+            return Err(());
+        }
+        Ok(movement)
+    }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Point {
@@ -83,8 +126,14 @@ impl TuiCopy {
         }
         Some(start..end)
     }
+    pub fn awaiting_paint(&self, frame: &Frame) -> bool {
+        frame.scroll.serial != self.frame.scroll.serial && !frame.scroll.pending.is_empty()
+    }
     pub fn display_unchanged(&self, frame: &Frame) -> bool {
-        if frame.alternate != self.frame.alternate || frame.rows.len() != self.frame.rows.len() {
+        if frame.scroll.serial != self.frame.scroll.serial
+            || frame.alternate != self.frame.alternate
+            || frame.rows.len() != self.frame.rows.len()
+        {
             return false;
         }
         self.selected_body()
@@ -107,6 +156,10 @@ impl TuiCopy {
             self.stop("画面切替・サイズ変更でコピー継続を停止しました");
             return false;
         }
+        if self.awaiting_paint(&frame) {
+            self.stop("本文の描画を待てませんでした。保持済みの範囲はコピーできます");
+            return false;
+        }
         if self.frame == frame {
             return true;
         }
@@ -124,6 +177,10 @@ impl TuiCopy {
             self.stop("本文の連続性を確認できません。保持済みの範囲はコピーできます");
             return false;
         };
+        if self.body.as_ref().is_some_and(|previous| previous != &body) {
+            self.stop("本文領域が変更されたためコピー継続を停止しました");
+            return false;
+        }
         let offset = self.offset + delta;
         if self.body.is_none()
             && self
@@ -150,7 +207,7 @@ impl TuiCopy {
             return false;
         }
         self.rows = rows;
-        self.cursor.row += delta;
+        self.cursor.row = offset + self.visible_cursor().0.clamp(body.start, body.end - 1) as i64;
         self.offset = offset;
         self.body = Some(body);
         self.frame = frame;
@@ -244,6 +301,36 @@ fn scroll_match(
     new: &Frame,
     body: Option<&std::ops::Range<usize>>,
 ) -> Option<(i64, std::ops::Range<usize>)> {
+    // An explicit rotation gives both the complete body and the displacement.
+    // Validate every retained row; repeated/blank lines no longer make it ambiguous.
+    if let Some((delta, region)) = new.scroll.since(&old.scroll).ok()? {
+        if region.end > old.rows.len()
+            || region.end > new.rows.len()
+            || delta == 0
+            || delta.unsigned_abs() as usize >= region.len()
+        {
+            return None;
+        }
+        let matches = |range: &std::ops::Range<usize>| {
+            let start = range.start + (-delta).max(0) as usize;
+            let end = range.end - delta.max(0) as usize;
+            (start..end).all(|j| old.rows[(j as i64 + delta) as usize] == new.rows[j])
+        };
+        if matches(&region) {
+            return Some((delta, region));
+        }
+        // less scrolls the whole screen, then repaints its prompt. Preserve the
+        // already selected body when that fixed margin is the only mismatch.
+        let body = body?;
+        if body.start >= region.start
+            && body.end <= region.end
+            && body.len() > delta.unsigned_abs() as usize + 1
+            && matches(body)
+        {
+            return Some((delta, body.clone()));
+        }
+        return None;
+    }
     let body = body?;
     let h = body.len();
     let mut candidates = Vec::new();
@@ -303,6 +390,49 @@ mod tests {
                 })
                 .collect(),
             alternate: true,
+            scroll: ScrollTrace::default(),
+        }
+    }
+    #[test]
+    fn explicit_scroll_from_one_line_preserves_repeated_code_and_reverse() {
+        let old = frame(&["fn a() {", "}", "", "fn b() {", "}", "", "status"]);
+        let mut c = TuiCopy::new(old.clone(), 0, 0, 100);
+        c.select(SelectionType::Lines);
+        let mut next = frame(&["fn b() {", "}", "", "fn c() {", "}", "", "status2"]);
+        next.scroll.push(Some((3, 0..6)));
+        assert!(c.observe_scroll(next.clone(), true), "{:?}", c.stopped);
+        assert_eq!(c.text().as_deref(), Some("fn a() {\n}\n\nfn b() {"));
+        let mut back = old;
+        back.scroll = next.scroll;
+        back.scroll.push(Some((-3, 0..6)));
+        assert!(c.observe_scroll(back, false), "{:?}", c.stopped);
+        assert_eq!(c.text().as_deref(), Some("fn a() {"));
+    }
+    #[test]
+    fn explicit_scroll_moves_even_when_all_rows_are_equal() {
+        let mut c = TuiCopy::new(frame(&["}", "}", "}", "}", "}", "}", ":"]), 0, 0, 100);
+        c.select(SelectionType::Lines);
+        let mut next = c.frame.clone();
+        next.scroll.push(Some((3, 0..6)));
+        assert!(!c.display_unchanged(&next));
+        assert!(c.observe_scroll(next, true));
+        assert_eq!(c.text().as_deref(), Some("}\n}\n}\n}"));
+    }
+    #[test]
+    fn missing_or_invalid_scroll_trace_never_falls_back_to_text_guessing() {
+        for invalid in [true, false] {
+            let mut c = TuiCopy::new(frame(&["A", "B", "C", "D", "E", ":"]), 0, 0, 100);
+            c.select(SelectionType::Lines);
+            let mut next = frame(&["B", "C", "D", "E", "F", ":"]);
+            if invalid {
+                next.scroll.push(None);
+            } else {
+                for _ in 0..65 {
+                    next.scroll.push(Some((1, 0..5)));
+                }
+            }
+            assert!(!c.observe_scroll(next, true));
+            assert_eq!(c.text().as_deref(), Some("A"));
         }
     }
     #[test]
@@ -345,6 +475,7 @@ mod tests {
                 wrapped: false,
             }],
             alternate: true,
+            scroll: ScrollTrace::default(),
         };
         let mut c = TuiCopy::new(f, 0, 0, 10);
         c.move_cursor(0, 1);
@@ -440,6 +571,7 @@ mod tests {
                 },
             ],
             alternate: true,
+            scroll: ScrollTrace::default(),
         };
         let mut c = TuiCopy::new(f, 0, 0, 100);
         c.select(SelectionType::Simple);

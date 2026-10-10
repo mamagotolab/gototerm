@@ -34,7 +34,10 @@ Claude Code などの AI コーディングツールが「いま・どのファ�
 ### 🪟 Windows（ビルド不要・おすすめ）
 
 [**Releases ページ**](https://github.com/mamagotolab/gototerm/releases/latest) から
-`gototerm-windows-x64.exe` をダウンロードし、ダブルクリックで起動するだけです。
+`gototerm-windows-x64.zip` をダウンロードし、**すべて展開**してから、中の `gototerm.exe` を起動してください。
+更新・移動するときも、`conpty.dll` と `OpenConsole.exe` を含むフォルダ全体を使ってください。
+これらはWindows上でnvimなどのスクロール情報を保つための同梱ファイルです。
+単体の `gototerm-windows-x64.exe` も残していますが、同梱ファイルなしではOSによってコピー継続が停止します。
 
 - 設定ファイル（任意）は **`%APPDATA%\gototerm\config.toml`**。無くても内蔵フォントで動きます。
 - 設定例は [`config.windows.example.toml`](./config.windows.example.toml) を参照（フォント・サイズ・配色・透過）。
@@ -72,7 +75,8 @@ git clone https://github.com/mamagotolab/gototerm.git
 cd gototerm
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"   # 新しいCMakeが同梱FreeTypeの古いポリシーを拒否するため
 cargo build --release
-# 生成物: target\release\gototerm.exe
+& ./.github/scripts/install-conpty.ps1 -Destination target/release
+# 起動: target\release\gototerm.exe（同じフォルダのDLL・OpenConsole.exeも必要）
 ```
 
 > もし「couldn't determine visual studio generator」で止まる場合は、
@@ -572,8 +576,12 @@ Linuxのローカル前景プロセスと直接起動したmuttは自動で識�
 この操作はmuttの本文表示用です。キーを独自に変更している場合は、その設定に合わせる必要があります。
 
 本文の照合には選択とは別に前後の文字行を使い、本文領域を固定して選択の始点を保持します。
-同じ行の反復、検索ジャンプ、途中の更新、画面・サイズ・フォーカスの切り替えで連続性が判定できない場合は、
-保持した選択を残してコピー継続を止め、画面下部に理由を表示します。保持済みの範囲はコピーできます。
+nvimなどが端末へ送るスクロール領域・行数も使うため、1行だけ選択してからの複数行スクロールや、
+空行・同じ記号が続くコードの上下スクロールにも対応します。露出した行がまだ描画されていない間は最大3秒待ちます。
+移動量を確認できない同一行の反復、検索ジャンプ、途中の更新、画面・サイズ・フォーカスの切り替えで連続性が判定できない場合は、
+保持した選択を残してコピー継続を止め、画面下部に理由を折り返して表示します。保持済みの範囲はコピーできます。
+アプリの描画完了を保証する仕組みではありません。SSHなどで行の途中の描画が120ms以上途切れる場合は、
+途中までの表示を保持する可能性があるため、ファイル全文の取得にはアプリ側のコピー・保存を使ってください。
 一時履歴は設定した履歴行数が上限で、ディスクへ保存しません。画面に表示されていないファイル・メール・会話の全文は取得しません。
 履歴の保持行数を超えて消えた内容や、TUI自身が画面を描き直して消した内容はコピーできません。
 
