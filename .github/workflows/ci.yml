@@ -54,6 +54,13 @@ jobs:
       - name: Build
         run: cargo build --release
 
+      - name: Install Microsoft ConPTY for distribution and tests
+        shell: pwsh
+        run: |
+          & ./.github/scripts/install-conpty.ps1 -Destination target/release
+          New-Item -ItemType Directory -Force target/debug/deps | Out-Null
+          Copy-Item target/release/conpty.dll, target/release/OpenConsole.exe target/debug/deps
+
       - name: Test
         run: cargo test
 
@@ -64,6 +71,9 @@ jobs:
           path: |
             target/release/gototerm.exe
             target/release/gototerm-hook.exe
+            target/release/conpty.dll
+            target/release/OpenConsole.exe
+            target/release/LICENSE-ConPTY.txt
 
       - name: Verify Vim copy and substitution on ConPTY
         timeout-minutes: 3

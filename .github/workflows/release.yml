@@ -25,8 +25,17 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
       - name: Build
         run: cargo build --release
-      - name: Rename artifact
+      - name: Package Windows terminal
+        shell: pwsh
         run: |
+          $bundle = 'gototerm-windows-x64'
+          & ./.github/scripts/install-conpty.ps1 -Destination $bundle
+          Copy-Item target/release/gototerm.exe $bundle
+          Copy-Item target/release/gototerm-hook.exe $bundle
+          Copy-Item LICENSE (Join-Path $bundle 'LICENSE-gototerm.txt')
+          Copy-Item assets/windows-readme.txt (Join-Path $bundle 'README.txt')
+          Compress-Archive -Path $bundle -DestinationPath gototerm-windows-x64.zip
+          # Keep standalone files for existing helper download links.
           Copy-Item target/release/gototerm.exe gototerm-windows-x64.exe
           Copy-Item target/release/gototerm-hook.exe gototerm-hook.exe
       - name: Attach to release
@@ -34,6 +43,7 @@ jobs:
         with:
           prerelease: ${{ contains(github.ref_name, '-') }}
           files: |
+            gototerm-windows-x64.zip
             gototerm-windows-x64.exe
             gototerm-hook.exe
 

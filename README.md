@@ -34,7 +34,10 @@ Claude Code などの AI コーディングツールが「いま・どのファ�
 ### 🪟 Windows（ビルド不要・おすすめ）
 
 [**Releases ページ**](https://github.com/mamagotolab/gototerm/releases/latest) から
-`gototerm-windows-x64.exe` をダウンロードし、ダブルクリックで起動するだけです。
+`gototerm-windows-x64.zip` をダウンロードし、**すべて展開**してから、中の `gototerm.exe` を起動してください。
+更新・移動するときも、`conpty.dll` と `OpenConsole.exe` を含むフォルダ全体を使ってください。
+これらはWindows上でnvimなどのスクロール情報を保つための同梱ファイルです。
+単体の `gototerm-windows-x64.exe` も残していますが、同梱ファイルなしではOSによってコピー継続が停止します。
 
 - 設定ファイル（任意）は **`%APPDATA%\gototerm\config.toml`**。無くても内蔵フォントで動きます。
 - 設定例は [`config.windows.example.toml`](./config.windows.example.toml) を参照（フォント・サイズ・配色・透過）。
@@ -72,7 +75,8 @@ git clone https://github.com/mamagotolab/gototerm.git
 cd gototerm
 $env:CMAKE_POLICY_VERSION_MINIMUM = "3.5"   # 新しいCMakeが同梱FreeTypeの古いポリシーを拒否するため
 cargo build --release
-# 生成物: target\release\gototerm.exe
+& ./.github/scripts/install-conpty.ps1 -Destination target/release
+# 起動: target\release\gototerm.exe（同じフォルダのDLL・OpenConsole.exeも必要）
 ```
 
 > もし「couldn't determine visual studio generator」で止まる場合は、
