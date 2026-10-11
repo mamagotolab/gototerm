@@ -430,7 +430,7 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 
 /// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
 #[cfg(unix)]
-fn set_clipboard(text: &str) {
+pub(crate) fn set_clipboard(text: &str) {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
     match Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
@@ -459,7 +459,7 @@ fn get_clipboard() -> String {
 
 /// Windows のクリップボードへ書き込む（arboard）。
 #[cfg(windows)]
-fn set_clipboard(text: &str) {
+pub(crate) fn set_clipboard(text: &str) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_owned())) {
         Ok(()) => {}
         Err(e) => log::error!("クリップボード書き込みに失敗: {}", e),
@@ -959,10 +959,10 @@ impl TerminalWindow {
     pub fn focus_changed(&mut self, gain: bool) {
         if !gain {
             self.cancel_link_hints();
-            if let Some(copy) = &mut self.tui_copy {
-                copy.stop("フォーカス移動でコピー継続を停止しました");
-                self.copy_scroll = 0;
-            }
+            // 一時的なフォーカス喪失（Wayland の IME 等）では止めず、未送信の
+            // スクロール要求だけ捨てる。離れている間にアプリが描き直せば、
+            // 描画時の照合でコピー継続を停止する。
+            self.copy_scroll = 0;
         }
         self.focused = gain;
 
@@ -1231,7 +1231,7 @@ impl TerminalWindow {
                 //     誤解してページが動かなかった）
                 //  ・代替画面(マウス非対応の less 等) → 矢印キー
                 //  ・通常画面 → ローカル履歴スクロール
-                if self.tui_copy.is_none() {
+                if self.tui_copy.is_none() && crate::TOYTERM_CONFIG.tui_copy_scroll {
                     self.start_mouse_tui_copy();
                 }
                 if copy_scroll_to_app(self.copy_mode_active(), self.tui_copy.is_some()) {
@@ -1368,7 +1368,7 @@ impl TerminalWindow {
         if keybindings::lookup(self.modifiers, keycode) == Some(ShortcutAction::CopyMode) {
             self.end_tui_copy();
             self.terminal.toggle_copy_mode();
-            if self.tui_app_screen() {
+            if crate::TOYTERM_CONFIG.tui_copy_scroll && self.tui_app_screen() {
                 let cursor = self.terminal.term.lock().unwrap().vi_mode_cursor.point;
                 self.start_tui_copy(cursor.line.0.max(0) as usize, cursor.column.0);
                 self.copy_keyboard = true;
@@ -1732,11 +1732,17 @@ impl TerminalWindow {
             {
                 return;
             }
-            let frame = self.terminal.copy_frame();
-            if self.tui_copy.as_ref().unwrap().awaiting_paint(&frame)
-                && started.elapsed() < Duration::from_secs(3)
-            {
-                return;
+            let mut frame = self.terminal.copy_frame();
+            if self.tui_copy.as_ref().unwrap().awaiting_paint(&frame) {
+                if self.copy_updated.elapsed() < Duration::from_millis(500)
+                    && started.elapsed() < Duration::from_secs(3)
+                {
+                    return;
+                }
+                // 出力が落ち着いたら描画済みとみなす（空行は何も描かれない）。
+                // 後から描画されれば保持した本文との照合で停止する。
+                self.terminal.settle_pending();
+                frame = self.terminal.copy_frame();
             }
             let unchanged = self.tui_copy.as_ref().unwrap().display_unchanged(&frame);
             let accepted = self

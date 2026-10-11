@@ -321,12 +321,30 @@ impl TuiCopy {
     }
 }
 
+/// Vim/Neovim (`display=lastline`) cover the last cells of a line that does not
+/// fit on screen with "@@@" (more when it overlaps wide characters). Those
+/// cells are a marker, not document text.
+fn lastline_marker(row: &Row) -> usize {
+    let run = row.cells.iter().rev().take_while(|c| *c == "@").count();
+    if run >= 3 {
+        run
+    } else {
+        0
+    }
+}
+
 /// Match a unique, contiguous displacement with at least two distinct nonblank rows.
 /// Unmatched margins are headers/footers; never manufacture missing content.
+///
+/// Compares text only: Neovim may paint the same soft-wrapped row with or
+/// without terminal autowrap, so the wrap flag differs between redraws.
 fn rows_match(old: &Row, new: &Row, gutter: usize) -> bool {
-    old.wrapped == new.wrapped
-        && old.cells.len() == new.cells.len()
-        && old.cells[gutter.min(old.cells.len())..] == new.cells[gutter.min(new.cells.len())..]
+    if old.cells.len() != new.cells.len() {
+        return false;
+    }
+    let end = old.cells.len() - lastline_marker(old).max(lastline_marker(new));
+    let start = gutter.min(end);
+    old.cells[start..end] == new.cells[start..end]
 }
 
 fn editor_ruler(frame: &Frame, region: &std::ops::Range<usize>) -> bool {
@@ -776,5 +794,21 @@ mod tests {
         c.select(SelectionType::Block);
         c.cursor = Point { row: 0, col: 0 };
         assert_eq!(c.text().as_deref(), Some("日本\n語!"));
+    }
+
+    #[test]
+    fn lastline_marker_matches_the_fully_painted_row() {
+        let row = |text: &str| Row {
+            cells: text.chars().map(|c| c.to_string()).collect(),
+            wrapped: false,
+        };
+        assert!(rows_match(&row("abc  @@@"), &row("abc     "), 0));
+        assert!(rows_match(&row("abc def "), &row("abc d@@@"), 0));
+        assert!(!rows_match(&row("abX  @@@"), &row("abc     "), 0));
+        assert!(!rows_match(&row("abc  x@@"), &row("abc     "), 0));
+        assert!(rows_match(&row("ab@@@@"), &row("abcdef"), 0));
+        let mut wrapped = row("abc");
+        wrapped.wrapped = true;
+        assert!(rows_match(&wrapped, &row("abc"), 0));
     }
 }

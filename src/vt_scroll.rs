@@ -89,15 +89,15 @@ impl Handler for Tracked<'_> {
     fn input(&mut self, c: char) {
         use unicode_width::UnicodeWidthChar;
         let cursor = &self.term.grid().cursor;
-        // Implicit wrapping is not an application scroll request. Invalidate a
-        // pending hint rather than misclassifying a redraw as document movement.
+        // Implicit wrapping at the bottom of the region rotates the grid exactly
+        // like a linefeed there (less paints long lines this way), so record it.
         if c.width().unwrap_or(0) > 0
             && self.term.mode().contains(TermMode::LINE_WRAP)
             && (cursor.input_needs_wrap
                 || (c.width() == Some(2) && cursor.point.column.0 + 1 >= self.term.columns()))
             && cursor.point.line.0 + 1 == self.region.end as i32
         {
-            self.trace.push(None);
+            self.record(self.region.start, 1, false);
         }
         if c.width().unwrap_or(0) > 0 {
             // Use the post-input row since a character can wrap first.

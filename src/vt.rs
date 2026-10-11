@@ -295,8 +295,10 @@ impl EventListener for EventProxy {
                 // alacritty の Primary DA 応答(VT102=`?6c`)に Sixel(4) を足し、
                 // 画像対応を申告する。これが無いと yazi 等が Sixel を送らず、
                 // Wayland オーバーレイ描画に落ちて画面がガタつく。
+                // 52 は OSC 52（クリップボード書き込み）対応の申告。nvim はこれを見て
+                // SSH 越しでも OSC 52 でコピーする。
                 if text == "\x1b[?6c" {
-                    self.reply("\x1b[?62;4c"); // VT220 + Sixel
+                    self.reply("\x1b[?62;4;52c"); // VT220 + Sixel + OSC 52
                 } else {
                     self.reply(&text);
                 }
@@ -307,6 +309,11 @@ impl EventListener for EventProxy {
             }
             AlacEvent::ColorRequest(index, format) => {
                 self.reply(&format(color_index_to_rgb(index)));
+            }
+            // OSC 52 の書き込み（SSH 先の nvim 等のコピー）をローカルのクリップボードへ。
+            // 読み取りは alacritty の既定（OnlyCopy）で拒否される。
+            AlacEvent::ClipboardStore(alacritty_terminal::term::ClipboardType::Clipboard, text) => {
+                crate::window::set_clipboard(&text);
             }
             _ => {}
         }
@@ -1805,6 +1812,13 @@ impl VtTerminal {
     }
 
     /// 現在の画面内容を既存描画形式に変換して取り出す。
+    /// Treat rows exposed by an application scroll as painted once output has
+    /// settled. A document's blank line may never be painted at all, and
+    /// implicit wrapping at the bottom row shifts rows without updating them.
+    pub(crate) fn settle_pending(&self) {
+        self.scroll_trace.lock().unwrap().pending.clear();
+    }
+
     pub(crate) fn copy_frame(&self) -> crate::tui_copy::Frame {
         use crate::tui_copy::{Frame, Row};
         let term = self.term.lock().unwrap();
@@ -3766,5 +3780,51 @@ mod tests {
                 b: 238
             }
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the less executable; run explicitly for live PTY verification"]
+    fn live_less_copy_crosses_blank_lines() {
+        use crate::tui_copy::TuiCopy;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("gototerm-less-blank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        let source: Vec<String> = (1..=40)
+            .flat_map(|n| {
+                let mut rows = vec![format!("ROW{n:03}")];
+                if n % 4 == 0 {
+                    rows.push(String::new());
+                }
+                rows
+            })
+            .collect();
+        std::fs::write(&file, source.join("\n") + "\n").unwrap();
+        let command = vec![
+            "less".into(),
+            "-+F".into(),
+            "-+X".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let terminal = VtTerminal::new(40, 10, 9, 18, &dir, Some(&command));
+        std::thread::sleep(Duration::from_millis(500));
+        let mut copy = TuiCopy::new(terminal.copy_frame(), 0, 0, 1000);
+        copy.select(SelectionType::Lines);
+        copy.move_cursor(8, 0);
+        for _ in 0..20 {
+            terminal.write(crate::input::cursor_key_sequence(
+                crate::input::CursorKey::Down,
+                terminal.application_cursor_mode(),
+            ));
+            std::thread::sleep(Duration::from_millis(200));
+            let mut frame = terminal.copy_frame();
+            if copy.awaiting_paint(&frame) {
+                terminal.settle_pending();
+                frame = terminal.copy_frame();
+            }
+            assert!(copy.observe_scroll(frame, true), "{:?}", copy.stopped);
+        }
+        assert_eq!(copy.text().unwrap(), source[..29].join("\n"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
