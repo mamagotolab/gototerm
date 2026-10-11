@@ -112,6 +112,7 @@ fn percent_encode(s: &str) -> String {
 }
 
 /// ソケットに届く1行 `open\t<絶対パス>\t<行>` を解釈する。行は 0 = 指定なし。
+#[cfg(unix)]
 pub(crate) fn parse_open_request(line: &str) -> Option<(PathBuf, u32)> {
     let mut parts = line.trim_end_matches(['\r', '\n']).split('\t');
     if parts.next()? != "open" {
@@ -215,6 +216,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn parse_open_request_accepts_only_absolute_open() {
         assert_eq!(
             parse_open_request("open\t/a/b.md\t12\n"),
