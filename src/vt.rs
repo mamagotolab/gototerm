@@ -2711,7 +2711,7 @@ mod tests {
         )
         .unwrap();
         let command = vec![
-            "nvim".into(),
+            std::env::var("GOTOTERM_TEST_NVIM").unwrap_or("nvim".into()),
             "--clean".into(),
             "-n".into(),
             "-i".into(),
@@ -2757,6 +2757,11 @@ mod tests {
         );
         assert!(copy.text().unwrap().contains("item001"));
         terminal.kill();
+        let killed = Instant::now();
+        while !terminal.has_exited() {
+            assert!(killed.elapsed() < Duration::from_secs(3));
+            std::thread::sleep(Duration::from_millis(20));
+        }
         std::fs::remove_dir_all(dir).unwrap();
     }
 
