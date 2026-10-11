@@ -328,42 +328,42 @@ fn changing_number_gutter(
 ) -> Option<usize> {
     let start = region.start + (-delta).max(0) as usize;
     let end = region.end - delta.max(0) as usize;
-    let changed = (start..end)
-        .filter(|&j| old.rows[(j as i64 + delta) as usize] != new.rows[j])
-        .count();
-    if changed < ((end - start) / 2).max(3) {
+    if end - start < 2 {
         return None;
     }
-    let minimum = (1..=8).find(|&gutter| {
-        (start..end).all(|j| {
-            let a = &old.rows[(j as i64 + delta) as usize];
-            let b = &new.rows[j];
-            a.cells
-                .iter()
-                .take(gutter)
-                .chain(b.cells.iter().take(gutter))
-                .all(|cell| cell.chars().all(|c| c.is_ascii_digit() || c == ' '))
-                && rows_match(a, b, gutter)
+    let relative_numbers = |frame: &Frame, gutter: usize| {
+        let numbers = region
+            .clone()
+            .map(|i| {
+                let cells = &frame.rows[i].cells;
+                (cells.get(gutter - 1)? == " ")
+                    .then(|| cells[..gutter - 1].concat().trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .collect::<Option<Vec<_>>>();
+        numbers.is_some_and(|numbers| {
+            (0..numbers.len()).any(|cursor| {
+                numbers
+                    .iter()
+                    .enumerate()
+                    .all(|(i, &n)| i == cursor || n == i.abs_diff(cursor))
+            })
         })
-    })?;
-    // Neovim keeps one separating space after the rightmost number column.
-    // The smallest matching prefix can end before that separator.
-    let rightmost_digit = (start..end)
-        .flat_map(|j| [&old.rows[(j as i64 + delta) as usize], &new.rows[j]])
-        .flat_map(|r| r.cells.iter().take(minimum).enumerate())
-        .filter_map(|(i, cell)| cell.chars().any(|c| c.is_ascii_digit()).then_some(i))
-        .max()?;
-    let gutter = rightmost_digit + 2;
-    (gutter <= 8
-        && (start..end).all(|j| {
-            let a = &old.rows[(j as i64 + delta) as usize];
-            let b = &new.rows[j];
-            [a, b]
-                .into_iter()
-                .all(|r| r.cells.get(gutter - 1).is_some_and(|c| c == " "))
-                && rows_match(a, b, gutter)
-        }))
-    .then_some(gutter)
+    };
+    let width = old.rows[region.start].cells.len().min(32);
+    (2..=width).find(|&gutter| {
+        relative_numbers(old, gutter)
+            && relative_numbers(new, gutter)
+            && (start..end).all(|j| {
+                let a = &old.rows[(j as i64 + delta) as usize];
+                let b = &new.rows[j];
+                [a, b].into_iter().all(|r| {
+                    r.cells[..gutter]
+                        .iter()
+                        .all(|cell| cell.chars().all(|c| c.is_ascii_digit() || c == ' '))
+                }) && rows_match(a, b, gutter)
+            })
+    })
 }
 
 fn scroll_match(
@@ -523,6 +523,40 @@ mod tests {
             "7 golf ",
             "8 hotel",
             "9 india",
+            ":",
+        ]);
+        next.scroll.push(Some((1, 0..8)));
+        assert!(!c.observe_scroll(next, true));
+        assert_eq!(c.text().as_deref(), Some("1 alpha"));
+    }
+    #[test]
+    fn bulk_numeric_content_edits_are_not_discarded_as_line_numbers() {
+        let mut c = TuiCopy::new(
+            frame(&[
+                "1 alpha",
+                "2 beta",
+                "3 gamma",
+                "4 delta",
+                "5 echo",
+                "6 foxtrot",
+                "7 golf",
+                "8 hotel",
+                ":",
+            ]),
+            0,
+            0,
+            100,
+        );
+        c.select(SelectionType::Lines);
+        let mut next = frame(&[
+            "9 beta",
+            "8 gamma",
+            "7 delta",
+            "6 echo",
+            "5 foxtrot",
+            "4 golf",
+            "3 hotel",
+            "2 india",
             ":",
         ]);
         next.scroll.push(Some((1, 0..8)));

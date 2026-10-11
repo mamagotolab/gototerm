@@ -2516,11 +2516,16 @@ mod tests {
         assert_eq!(before.rows, after.rows);
     }
 
-    fn verify_nvim_copy_with_mouse_scroll(relative_numbers: bool) {
+    fn verify_nvim_copy_with_mouse_scroll(
+        relative_numbers: bool,
+        height: usize,
+        steps: usize,
+        number_width: usize,
+    ) {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
         let dir = std::env::temp_dir().join(format!(
-            "gototerm-nvim-copy-{}-{relative_numbers}",
+            "gototerm-nvim-copy-{}-{relative_numbers}-{height}-{number_width}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2544,9 +2549,12 @@ mod tests {
             file.to_string_lossy().into_owned(),
         ];
         if relative_numbers {
-            command.extend(["-c".into(), "set number relativenumber mouse=a".into()]);
+            command.extend([
+                "-c".into(),
+                format!("set number relativenumber mouse=a numberwidth={number_width}"),
+            ]);
         }
-        let mut terminal = VtTerminal::new(80, 24, 9, 18, &dir, Some(&command));
+        let mut terminal = VtTerminal::new(80, height, 9, 18, &dir, Some(&command));
         let wait = |first: &str| {
             let start = Instant::now();
             loop {
@@ -2570,7 +2578,7 @@ mod tests {
         terminal.toggle_copy_mode();
         let mut copy = TuiCopy::new(first, 0, 0, 1000);
         copy.select(SelectionType::Lines);
-        for step in 1..=8 {
+        for step in 1..=steps {
             terminal.write(b"\x1b[<65;1;1M");
             let next = wait(&body[step * 3]);
             assert!(
@@ -2592,7 +2600,7 @@ mod tests {
             );
             assert_eq!(copy.text().unwrap(), body[..=step * 3].join("\n"));
         }
-        for step in (5..8).rev() {
+        for step in (steps.saturating_sub(3)..steps).rev() {
             terminal.write(b"\x1b[<64;1;1M");
             assert!(
                 copy.observe_scroll(wait(&body[step * 3]), false),
@@ -2616,13 +2624,25 @@ mod tests {
     #[test]
     #[ignore = "requires nvim; verifies its default three-line mouse scrolling"]
     fn live_nvim_copy_from_one_line_survives_default_mouse_scroll() {
-        verify_nvim_copy_with_mouse_scroll(false);
+        verify_nvim_copy_with_mouse_scroll(false, 24, 8, 4);
     }
 
     #[test]
     #[ignore = "requires nvim; verifies changing relative line numbers"]
     fn live_nvim_copy_with_relative_numbers_preserves_body() {
-        verify_nvim_copy_with_mouse_scroll(true);
+        verify_nvim_copy_with_mouse_scroll(true, 24, 8, 4);
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies a two-row overlap in a short pane"]
+    fn live_nvim_copy_with_relative_numbers_in_short_pane() {
+        verify_nvim_copy_with_mouse_scroll(true, 7, 1, 4);
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies a wider relative-number gutter"]
+    fn live_nvim_copy_with_wide_relative_numbers() {
+        verify_nvim_copy_with_mouse_scroll(true, 24, 2, 12);
     }
 
     #[cfg(unix)]
