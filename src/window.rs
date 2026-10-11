@@ -1732,11 +1732,17 @@ impl TerminalWindow {
             {
                 return;
             }
-            let frame = self.terminal.copy_frame();
-            if self.tui_copy.as_ref().unwrap().awaiting_paint(&frame)
-                && started.elapsed() < Duration::from_secs(3)
-            {
-                return;
+            let mut frame = self.terminal.copy_frame();
+            if self.tui_copy.as_ref().unwrap().awaiting_paint(&frame) {
+                if self.copy_updated.elapsed() < Duration::from_millis(500)
+                    && started.elapsed() < Duration::from_secs(3)
+                {
+                    return;
+                }
+                // 出力が落ち着いたら描画済みとみなす（空行は何も描かれない）。
+                // 後から描画されれば保持した本文との照合で停止する。
+                self.terminal.settle_pending();
+                frame = self.terminal.copy_frame();
             }
             let unchanged = self.tui_copy.as_ref().unwrap().display_unchanged(&frame);
             let accepted = self

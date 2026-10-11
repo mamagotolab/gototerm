@@ -1805,6 +1805,13 @@ impl VtTerminal {
     }
 
     /// 現在の画面内容を既存描画形式に変換して取り出す。
+    /// Treat rows exposed by an application scroll as painted once output has
+    /// settled. A document's blank line may never be painted at all, and
+    /// implicit wrapping at the bottom row shifts rows without updating them.
+    pub(crate) fn settle_pending(&self) {
+        self.scroll_trace.lock().unwrap().pending.clear();
+    }
+
     pub(crate) fn copy_frame(&self) -> crate::tui_copy::Frame {
         use crate::tui_copy::{Frame, Row};
         let term = self.term.lock().unwrap();
@@ -3766,5 +3773,51 @@ mod tests {
                 b: 238
             }
         );
+    }
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "requires the less executable; run explicitly for live PTY verification"]
+    fn live_less_copy_crosses_blank_lines() {
+        use crate::tui_copy::TuiCopy;
+        use std::time::Duration;
+        let dir = std::env::temp_dir().join(format!("gototerm-less-blank-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("test.txt");
+        let source: Vec<String> = (1..=40)
+            .flat_map(|n| {
+                let mut rows = vec![format!("ROW{n:03}")];
+                if n % 4 == 0 {
+                    rows.push(String::new());
+                }
+                rows
+            })
+            .collect();
+        std::fs::write(&file, source.join("\n") + "\n").unwrap();
+        let command = vec![
+            "less".into(),
+            "-+F".into(),
+            "-+X".into(),
+            file.to_string_lossy().into_owned(),
+        ];
+        let terminal = VtTerminal::new(40, 10, 9, 18, &dir, Some(&command));
+        std::thread::sleep(Duration::from_millis(500));
+        let mut copy = TuiCopy::new(terminal.copy_frame(), 0, 0, 1000);
+        copy.select(SelectionType::Lines);
+        copy.move_cursor(8, 0);
+        for _ in 0..20 {
+            terminal.write(crate::input::cursor_key_sequence(
+                crate::input::CursorKey::Down,
+                terminal.application_cursor_mode(),
+            ));
+            std::thread::sleep(Duration::from_millis(200));
+            let mut frame = terminal.copy_frame();
+            if copy.awaiting_paint(&frame) {
+                terminal.settle_pending();
+                frame = terminal.copy_frame();
+            }
+            assert!(copy.observe_scroll(frame, true), "{:?}", copy.stopped);
+        }
+        assert_eq!(copy.text().unwrap(), source[..29].join("\n"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }
