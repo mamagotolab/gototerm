@@ -295,8 +295,10 @@ impl EventListener for EventProxy {
                 // alacritty の Primary DA 応答(VT102=`?6c`)に Sixel(4) を足し、
                 // 画像対応を申告する。これが無いと yazi 等が Sixel を送らず、
                 // Wayland オーバーレイ描画に落ちて画面がガタつく。
+                // 52 は OSC 52（クリップボード書き込み）対応の申告。nvim はこれを見て
+                // SSH 越しでも OSC 52 でコピーする。
                 if text == "\x1b[?6c" {
-                    self.reply("\x1b[?62;4c"); // VT220 + Sixel
+                    self.reply("\x1b[?62;4;52c"); // VT220 + Sixel + OSC 52
                 } else {
                     self.reply(&text);
                 }
@@ -307,6 +309,11 @@ impl EventListener for EventProxy {
             }
             AlacEvent::ColorRequest(index, format) => {
                 self.reply(&format(color_index_to_rgb(index)));
+            }
+            // OSC 52 の書き込み（SSH 先の nvim 等のコピー）をローカルのクリップボードへ。
+            // 読み取りは alacritty の既定（OnlyCopy）で拒否される。
+            AlacEvent::ClipboardStore(alacritty_terminal::term::ClipboardType::Clipboard, text) => {
+                crate::window::set_clipboard(&text);
             }
             _ => {}
         }

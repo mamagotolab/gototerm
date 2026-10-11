@@ -430,7 +430,7 @@ fn normalize_absolute_path(path: &Path) -> PathBuf {
 
 /// Wayland のクリップボードへ書き込む（wl-copy にパイプ）。
 #[cfg(unix)]
-fn set_clipboard(text: &str) {
+pub(crate) fn set_clipboard(text: &str) {
     use std::io::Write as _;
     use std::process::{Command, Stdio};
     match Command::new("wl-copy").stdin(Stdio::piped()).spawn() {
@@ -459,7 +459,7 @@ fn get_clipboard() -> String {
 
 /// Windows のクリップボードへ書き込む（arboard）。
 #[cfg(windows)]
-fn set_clipboard(text: &str) {
+pub(crate) fn set_clipboard(text: &str) {
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text.to_owned())) {
         Ok(()) => {}
         Err(e) => log::error!("クリップボード書き込みに失敗: {}", e),
