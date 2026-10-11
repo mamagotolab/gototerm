@@ -1805,9 +1805,9 @@ impl Multiplexer {
             viewport,
             status_view,
             status_signature: String::new(),
-            task_summary: crate::task_link::TaskSummary::from_config(
+            task_summary: Some(crate::task_link::TaskSummary::from_config(
                 &crate::TOYTERM_CONFIG.task_file,
-            ),
+            )),
             #[cfg(unix)]
             open_socket: crate::TOYTERM_CONFIG
                 .open_socket
@@ -2186,7 +2186,14 @@ impl Multiplexer {
 
     fn update_status_bar(&mut self) {
         let had_counts = self.task_counts().is_some();
-        if self.task_summary.as_mut().is_some_and(|s| s.refresh())
+        let cwd = match self.focused_location() {
+            ShellLocation::Local(path) => Some(path),
+            ShellLocation::Remote { .. } => None,
+        };
+        if self
+            .task_summary
+            .as_mut()
+            .is_some_and(|s| s.refresh(cwd.as_deref()))
             && had_counts != self.task_counts().is_some()
         {
             // バーの有無が変わる（タブ1枚のとき）ので内容領域を測り直す。
@@ -2536,9 +2543,9 @@ impl Multiplexer {
         }
     }
 
-    /// 今いるフォルダのタスクを gototask（ブラウザ）で開く。task_file 未設定なら何もしない。
+    /// 今いるフォルダのタスクを gototask（ブラウザ）で開く。task_url が空なら何もしない。
     fn open_tasks(&mut self) {
-        if self.task_summary.is_none() {
+        if crate::TOYTERM_CONFIG.task_url.trim().is_empty() {
             return;
         }
         let dir = match self.focused_location() {
@@ -2938,6 +2945,7 @@ impl Multiplexer {
                     reader.scroll_by(delta);
                 }
             }
+            SidebarRequest::EditFileAt(path, line) => self.open_editor_in_preview(path, line),
             SidebarRequest::EditPreview => {
                 if let Some(request) = self
                     .preview_slot
@@ -2961,21 +2969,22 @@ impl Multiplexer {
 
     fn handle_reader_request(&mut self, request: ReaderRequest) {
         match request {
-            ReaderRequest::EditFile(path) => self.open_editor_in_preview(path),
+            ReaderRequest::EditFile(path) => self.open_editor_in_preview(path, 0),
             ReaderRequest::OpenWithSystem(path) => crate::window::open_url(&path.to_string_lossy()),
         }
     }
 
-    fn open_editor_in_preview(&mut self, path: std::path::PathBuf) {
+    /// プレビュー枠でエディタを開く。`line` は 1 始まり（0 = 指定なし）。
+    fn open_editor_in_preview(&mut self, path: std::path::PathBuf, line: u32) {
         let env_editor = std::env::var("EDITOR").ok();
-        let mut command = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
-        if !command_exists(&command[0]) {
+        let editor = resolve_editor(&crate::TOYTERM_CONFIG.editor, env_editor.as_deref());
+        if !command_exists(&editor[0]) {
             if let Some(reader) = self.preview_slot.reader_mut() {
-                reader.show_missing_editor(&command[0]);
+                reader.show_missing_editor(&editor[0]);
             }
             return;
         }
-        command.push(path.to_string_lossy().into_owned());
+        let command = crate::task_link::editor_args(&editor, &path, line);
 
         let viewport = match &self.preview_slot {
             PreviewSlot::Reader(reader) => reader.viewport(),
