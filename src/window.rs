@@ -1231,7 +1231,7 @@ impl TerminalWindow {
                 //     誤解してページが動かなかった）
                 //  ・代替画面(マウス非対応の less 等) → 矢印キー
                 //  ・通常画面 → ローカル履歴スクロール
-                if self.tui_copy.is_none() {
+                if self.tui_copy.is_none() && crate::TOYTERM_CONFIG.tui_copy_scroll {
                     self.start_mouse_tui_copy();
                 }
                 if copy_scroll_to_app(self.copy_mode_active(), self.tui_copy.is_some()) {
@@ -1368,7 +1368,7 @@ impl TerminalWindow {
         if keybindings::lookup(self.modifiers, keycode) == Some(ShortcutAction::CopyMode) {
             self.end_tui_copy();
             self.terminal.toggle_copy_mode();
-            if self.tui_app_screen() {
+            if crate::TOYTERM_CONFIG.tui_copy_scroll && self.tui_app_screen() {
                 let cursor = self.terminal.term.lock().unwrap().vi_mode_cursor.point;
                 self.start_tui_copy(cursor.line.0.max(0) as usize, cursor.column.0);
                 self.copy_keyboard = true;

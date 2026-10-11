@@ -43,6 +43,10 @@ pub struct Config {
     // 起動時にプロジェクトランチャー（Ctrl+Shift+N）を最初から開く。
     #[serde(default)]
     pub show_launcher_on_start: bool,
+    // less / nvim 等の全画面アプリで、スクロールで通過した文字をつなぎ合わせて
+    // 画面外まで選択を伸ばす実験機能。既定は他の端末と同じく見えている範囲だけ。
+    #[serde(default)]
+    pub tui_copy_scroll: bool,
     // ランチャーで選べるAIエージェント。
     #[serde(default = "default_agents")]
     pub launcher_agents: Vec<AgentDef>,
@@ -128,6 +132,7 @@ impl Default for Config {
             scrollback_lines: default_scrollback_lines(),
             // 既定で起動時にランチャーを出す（落としてすぐ「開く場所を選ぶ」体験）。
             show_launcher_on_start: true,
+            tui_copy_scroll: false,
             launcher_agents: default_agents(),
             task_file: String::new(),
             task_url: default_task_url(),
