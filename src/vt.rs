@@ -2516,12 +2516,13 @@ mod tests {
         assert_eq!(before.rows, after.rows);
     }
 
-    #[test]
-    #[ignore = "requires nvim; verifies its default three-line mouse scrolling"]
-    fn live_nvim_copy_from_one_line_survives_default_mouse_scroll() {
+    fn verify_nvim_copy_with_mouse_scroll(relative_numbers: bool) {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
-        let dir = std::env::temp_dir().join(format!("gototerm-nvim-copy-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!(
+            "gototerm-nvim-copy-{}-{relative_numbers}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("body.txt");
         let body = (1..=40)
@@ -2534,7 +2535,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         std::fs::write(&file, body.join("\n") + "\n").unwrap();
-        let command = vec![
+        let mut command = vec![
             std::env::var("GOTOTERM_TEST_NVIM").unwrap_or("nvim".into()),
             "--clean".into(),
             "-n".into(),
@@ -2542,12 +2543,18 @@ mod tests {
             "NONE".into(),
             file.to_string_lossy().into_owned(),
         ];
+        if relative_numbers {
+            command.extend(["-c".into(), "set number relativenumber mouse=a".into()]);
+        }
         let mut terminal = VtTerminal::new(80, 24, 9, 18, &dir, Some(&command));
         let wait = |first: &str| {
             let start = Instant::now();
             loop {
                 let frame = terminal.copy_frame();
-                if frame.rows[0].cells.concat().trim_end() == first {
+                if frame.rows[0].cells.concat().contains(first)
+                    && terminal.mouse_mode()
+                    && terminal.sgr_mouse()
+                {
                     std::thread::sleep(Duration::from_millis(150));
                     return terminal.copy_frame();
                 }
@@ -2604,6 +2611,18 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies its default three-line mouse scrolling"]
+    fn live_nvim_copy_from_one_line_survives_default_mouse_scroll() {
+        verify_nvim_copy_with_mouse_scroll(false);
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies changing relative line numbers"]
+    fn live_nvim_copy_with_relative_numbers_preserves_body() {
+        verify_nvim_copy_with_mouse_scroll(true);
     }
 
     #[cfg(unix)]
