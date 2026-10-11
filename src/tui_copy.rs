@@ -69,6 +69,7 @@ pub(crate) struct TuiCopy {
     kind: SelectionType,
     body: Option<std::ops::Range<usize>>,
     gutter: usize,
+    trusted_nvim: bool,
     limit: usize,
     pub stopped: Option<&'static str>,
 }
@@ -93,6 +94,7 @@ impl TuiCopy {
             kind: SelectionType::Simple,
             body: None,
             gutter: 0,
+            trusted_nvim: false,
             limit,
             stopped: None,
         }
@@ -104,6 +106,9 @@ impl TuiCopy {
             self.kind = kind;
             self.anchor = Some(self.cursor);
         }
+    }
+    pub fn trust_nvim(&mut self, trusted: bool) {
+        self.trusted_nvim = trusted;
     }
     pub fn stop(&mut self, reason: &'static str) {
         self.stopped = Some(reason);
@@ -149,6 +154,7 @@ impl TuiCopy {
             &frame,
             self.selected_body().as_ref(),
             self.gutter,
+            self.trusted_nvim,
         ) {
             if (delta > 0) != down {
                 self.stop("要求と異なる画面移動のためコピー継続を停止しました");
@@ -174,7 +180,9 @@ impl TuiCopy {
         }
         if self.anchor.is_none() {
             let (row, col) = self.visible_cursor();
+            let trusted_nvim = self.trusted_nvim;
             *self = Self::new(frame, row, col, self.limit);
+            self.trusted_nvim = trusted_nvim;
             return true;
         }
         if self.display_unchanged(&frame) {
@@ -186,6 +194,7 @@ impl TuiCopy {
             &frame,
             self.selected_body().as_ref(),
             self.gutter,
+            self.trusted_nvim,
         ) else {
             self.stop("本文の連続性を確認できません。保持済みの範囲はコピーできます");
             return false;
@@ -320,34 +329,63 @@ fn rows_match(old: &Row, new: &Row, gutter: usize) -> bool {
         && old.cells[gutter.min(old.cells.len())..] == new.cells[gutter.min(new.cells.len())..]
 }
 
+fn editor_ruler(frame: &Frame, region: &std::ops::Range<usize>) -> bool {
+    let Some(row) = frame.rows.get(region.end) else {
+        return false;
+    };
+    let line = row.cells.concat();
+    let tokens = line.split_whitespace().collect::<Vec<_>>();
+    tokens.iter().any(|token| {
+        token.split_once(',').is_some_and(|(line, col)| {
+            !line.is_empty()
+                && line.bytes().all(|b| b.is_ascii_digit())
+                && !col.is_empty()
+                && col.bytes().all(|b| b.is_ascii_digit())
+        })
+    }) && tokens.iter().any(|token| {
+        matches!(*token, "Top" | "Bot" | "All")
+            || (token.ends_with('%')
+                && token.len() > 1
+                && token[..token.len() - 1].bytes().all(|b| b.is_ascii_digit()))
+    })
+}
+
 fn changing_number_gutter(
     old: &Frame,
     new: &Frame,
     delta: i64,
     region: &std::ops::Range<usize>,
+    trusted_nvim: bool,
 ) -> Option<usize> {
     let start = region.start + (-delta).max(0) as usize;
     let end = region.end - delta.max(0) as usize;
-    if end - start < 2 {
+    if end - start < 2
+        || !(trusted_nvim || (editor_ruler(old, region) && editor_ruler(new, region)))
+    {
         return None;
     }
     let relative_numbers = |frame: &Frame, gutter: usize| {
-        let numbers = region
-            .clone()
-            .map(|i| {
-                let cells = &frame.rows[i].cells;
-                (cells.get(gutter - 1)? == " ")
-                    .then(|| cells[..gutter - 1].concat().trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .collect::<Option<Vec<_>>>();
+        let numbers = region.clone().try_fold(Vec::new(), |mut numbers, i| {
+            let cells = &frame.rows[i].cells;
+            if cells.get(gutter - 1)? != " " {
+                return None;
+            }
+            let prefix = cells[..gutter - 1].concat();
+            let prefix = prefix.trim();
+            if prefix.is_empty() || (prefix == "~" && cells[gutter..].iter().all(|c| c == " ")) {
+                return Some(numbers);
+            }
+            numbers.push(prefix.parse::<usize>().ok()?);
+            Some(numbers)
+        });
         numbers.is_some_and(|numbers| {
-            (0..numbers.len()).any(|cursor| {
-                numbers
-                    .iter()
-                    .enumerate()
-                    .all(|(i, &n)| i == cursor || n == i.abs_diff(cursor))
-            })
+            numbers.len() >= 2
+                && (0..numbers.len()).any(|cursor| {
+                    numbers
+                        .iter()
+                        .enumerate()
+                        .all(|(i, &n)| i == cursor || n == i.abs_diff(cursor))
+                })
         })
     };
     let width = old.rows[region.start].cells.len().min(32);
@@ -358,9 +396,12 @@ fn changing_number_gutter(
                 let a = &old.rows[(j as i64 + delta) as usize];
                 let b = &new.rows[j];
                 [a, b].into_iter().all(|r| {
-                    r.cells[..gutter]
-                        .iter()
-                        .all(|cell| cell.chars().all(|c| c.is_ascii_digit() || c == ' '))
+                    r.cells.get(gutter - 1).is_some_and(|c| c == " ")
+                        && (r.cells[..gutter - 1]
+                            .iter()
+                            .all(|cell| cell.chars().all(|c| c.is_ascii_digit() || c == ' '))
+                            || (r.cells[..gutter - 1].concat().trim() == "~"
+                                && r.cells[gutter..].iter().all(|c| c == " ")))
                 }) && rows_match(a, b, gutter)
             })
     })
@@ -371,6 +412,7 @@ fn scroll_match(
     new: &Frame,
     body: Option<&std::ops::Range<usize>>,
     gutter: usize,
+    trusted_nvim: bool,
 ) -> Option<(i64, std::ops::Range<usize>, usize)> {
     // An explicit rotation gives both the complete body and the displacement.
     // Validate every retained row; repeated/blank lines no longer make it ambiguous.
@@ -392,7 +434,7 @@ fn scroll_match(
             return Some((delta, region, gutter));
         }
         if gutter == 0 {
-            if let Some(found) = changing_number_gutter(old, new, delta, &region) {
+            if let Some(found) = changing_number_gutter(old, new, delta, &region, trusted_nvim) {
                 return Some((delta, region, found));
             }
         }
@@ -562,6 +604,15 @@ mod tests {
         next.scroll.push(Some((1, 0..8)));
         assert!(!c.observe_scroll(next, true));
         assert_eq!(c.text().as_deref(), Some("1 alpha"));
+    }
+    #[test]
+    fn relative_looking_numeric_body_without_editor_status_is_not_a_gutter() {
+        let mut c = TuiCopy::new(frame(&["1 a", "1 b", "2 c", "3 d", "4 e", ":"]), 0, 0, 100);
+        c.select(SelectionType::Lines);
+        let mut next = frame(&["1 b", "1 c", "2 d", "3 e", "4 f", ":"]);
+        next.scroll.push(Some((1, 0..5)));
+        assert!(!c.observe_scroll(next, true));
+        assert_eq!(c.text().as_deref(), Some("1 a"));
     }
     #[test]
     fn missing_or_invalid_scroll_trace_never_falls_back_to_text_guessing() {

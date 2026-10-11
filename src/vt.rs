@@ -407,6 +407,7 @@ pub struct VtTerminal {
     shell_location: Arc<Mutex<Option<ShellLocation>>>,
     selection_drag: Mutex<Option<ExpandedSelection>>,
     initial_mutt: bool,
+    initial_nvim: bool,
 }
 
 fn window_size(cols: usize, lines: usize, cell_w: u16, cell_h: u16) -> WindowSize {
@@ -1376,6 +1377,10 @@ impl VtTerminal {
                 .and_then(|c| c.first())
                 .and_then(|p| std::path::Path::new(p).file_stem())
                 .is_some_and(|n| n == "mutt" || n == "neomutt"),
+            initial_nvim: command
+                .and_then(|c| c.first())
+                .and_then(|p| std::path::Path::new(p).file_stem())
+                .is_some_and(|n| n == "nvim"),
         }
     }
 
@@ -1407,6 +1412,16 @@ impl VtTerminal {
             }
         }
         self.initial_mutt
+    }
+
+    pub(crate) fn foreground_is_nvim(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let Some(pid) = self.master.process_group_leader() {
+            if let Ok(name) = std::fs::read_to_string(format!("/proc/{pid}/comm")) {
+                return name.trim() == "nvim";
+            }
+        }
+        self.initial_nvim
     }
 
     pub fn location(&self) -> Option<ShellLocation> {
@@ -2521,11 +2536,12 @@ mod tests {
         height: usize,
         steps: usize,
         number_width: usize,
+        ruler: bool,
     ) {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
         let dir = std::env::temp_dir().join(format!(
-            "gototerm-nvim-copy-{}-{relative_numbers}-{height}-{number_width}",
+            "gototerm-nvim-copy-{}-{relative_numbers}-{height}-{number_width}-{ruler}",
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).unwrap();
@@ -2551,7 +2567,10 @@ mod tests {
         if relative_numbers {
             command.extend([
                 "-c".into(),
-                format!("set number relativenumber mouse=a numberwidth={number_width}"),
+                format!(
+                    "set number relativenumber mouse=a numberwidth={number_width} {}",
+                    if ruler { "ruler" } else { "noruler" }
+                ),
             ]);
         }
         let mut terminal = VtTerminal::new(80, height, 9, 18, &dir, Some(&command));
@@ -2577,6 +2596,7 @@ mod tests {
         assert!(terminal.mouse_mode() && terminal.sgr_mouse());
         terminal.toggle_copy_mode();
         let mut copy = TuiCopy::new(first, 0, 0, 1000);
+        copy.trust_nvim(terminal.foreground_is_nvim());
         copy.select(SelectionType::Lines);
         for step in 1..=steps {
             terminal.write(b"\x1b[<65;1;1M");
@@ -2624,25 +2644,120 @@ mod tests {
     #[test]
     #[ignore = "requires nvim; verifies its default three-line mouse scrolling"]
     fn live_nvim_copy_from_one_line_survives_default_mouse_scroll() {
-        verify_nvim_copy_with_mouse_scroll(false, 24, 8, 4);
+        verify_nvim_copy_with_mouse_scroll(false, 24, 8, 4, true);
     }
 
     #[test]
     #[ignore = "requires nvim; verifies changing relative line numbers"]
     fn live_nvim_copy_with_relative_numbers_preserves_body() {
-        verify_nvim_copy_with_mouse_scroll(true, 24, 8, 4);
+        verify_nvim_copy_with_mouse_scroll(true, 24, 8, 4, true);
     }
 
     #[test]
     #[ignore = "requires nvim; verifies a two-row overlap in a short pane"]
     fn live_nvim_copy_with_relative_numbers_in_short_pane() {
-        verify_nvim_copy_with_mouse_scroll(true, 7, 1, 4);
+        verify_nvim_copy_with_mouse_scroll(true, 7, 1, 4, true);
     }
 
     #[test]
     #[ignore = "requires nvim; verifies a wider relative-number gutter"]
     fn live_nvim_copy_with_wide_relative_numbers() {
-        verify_nvim_copy_with_mouse_scroll(true, 24, 2, 12);
+        verify_nvim_copy_with_mouse_scroll(true, 24, 2, 12, true);
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies no default ruler"]
+    fn live_nvim_copy_with_relative_numbers_without_ruler() {
+        verify_nvim_copy_with_mouse_scroll(true, 24, 2, 4, false);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires bash and nvim; verifies foreground app recognition"]
+    fn shell_launched_nvim_is_identified_for_copy() {
+        use std::time::{Duration, Instant};
+        let dir =
+            std::env::temp_dir().join(format!("gototerm-nvim-process-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let command = vec!["bash".into(), "--noprofile".into(), "--norc".into()];
+        let mut terminal = VtTerminal::new(80, 24, 9, 18, &dir, Some(&command));
+        assert!(!terminal.foreground_is_nvim());
+        terminal.write(b"nvim --clean -n -i NONE\r");
+        let start = Instant::now();
+        while !terminal.foreground_is_nvim() {
+            assert!(
+                start.elapsed() < Duration::from_secs(5),
+                "nvim was not identified"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        terminal.kill();
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires nvim; verifies blank number columns on wrapped rows"]
+    fn live_nvim_copy_with_relative_numbers_and_wrapped_rows() {
+        use crate::tui_copy::TuiCopy;
+        use std::time::{Duration, Instant};
+        let dir = std::env::temp_dir().join(format!("gototerm-nvim-wrap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("body.txt");
+        std::fs::write(
+            &file,
+            (1..=30)
+                .map(|n| format!("item{n:03} {}\n", "abcdef ".repeat(15)))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let command = vec![
+            "nvim".into(),
+            "--clean".into(),
+            "-n".into(),
+            "-i".into(),
+            "NONE".into(),
+            file.to_string_lossy().into_owned(),
+            "-c".into(),
+            "set number relativenumber wrap mouse=a".into(),
+        ];
+        let mut terminal = VtTerminal::new(80, 24, 9, 18, &dir, Some(&command));
+        let start = Instant::now();
+        while !terminal.mouse_mode() || !terminal.sgr_mouse() {
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        std::thread::sleep(Duration::from_millis(150));
+        let first = terminal.copy_frame();
+        let mut copy = TuiCopy::new(first.clone(), 0, 0, 1000);
+        copy.select(SelectionType::Lines);
+        terminal.write(b"\x1b[<65;1;1M");
+        let start = Instant::now();
+        let next = loop {
+            let frame = terminal.copy_frame();
+            if frame.scroll.serial > first.scroll.serial && frame.scroll.pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(150));
+                break terminal.copy_frame();
+            }
+            assert!(start.elapsed() < Duration::from_secs(5));
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert!(
+            copy.observe_scroll(next.clone(), true),
+            "{:?} old={:?} new={:?}",
+            copy.stopped,
+            first
+                .rows
+                .iter()
+                .map(|r| r.cells.concat())
+                .collect::<Vec<_>>(),
+            next.rows
+                .iter()
+                .map(|r| r.cells.concat())
+                .collect::<Vec<_>>()
+        );
+        assert!(copy.text().unwrap().contains("item001"));
+        terminal.kill();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[cfg(unix)]

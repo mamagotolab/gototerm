@@ -1649,12 +1649,14 @@ impl TerminalWindow {
     }
 
     fn start_tui_copy(&mut self, row: usize, col: usize) {
-        self.tui_copy = Some(crate::tui_copy::TuiCopy::new(
+        let mut copy = crate::tui_copy::TuiCopy::new(
             self.terminal.copy_frame(),
             row,
             col,
             crate::TOYTERM_CONFIG.scrollback_lines,
-        ));
+        );
+        copy.trust_nvim(self.terminal.foreground_is_nvim());
+        self.tui_copy = Some(copy);
         self.copy_snapshot = Some(self.terminal.snapshot());
         self.copy_scroll = 0;
         self.copy_pending = None;
@@ -1672,7 +1674,8 @@ impl TerminalWindow {
             self.mouse_cell(),
             self.mouse.selecting,
         );
-        if let Some(copy) = capture_mouse_selection(&self.terminal, reverse) {
+        if let Some(mut copy) = capture_mouse_selection(&self.terminal, reverse) {
+            copy.trust_nvim(self.terminal.foreground_is_nvim());
             if !self.copy_keyboard {
                 self.copy_mutt = self.terminal.foreground_is_mutt();
             }
