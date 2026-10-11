@@ -959,10 +959,10 @@ impl TerminalWindow {
     pub fn focus_changed(&mut self, gain: bool) {
         if !gain {
             self.cancel_link_hints();
-            if let Some(copy) = &mut self.tui_copy {
-                copy.stop("フォーカス移動でコピー継続を停止しました");
-                self.copy_scroll = 0;
-            }
+            // 一時的なフォーカス喪失（Wayland の IME 等）では止めず、未送信の
+            // スクロール要求だけ捨てる。離れている間にアプリが描き直せば、
+            // 描画時の照合でコピー継続を停止する。
+            self.copy_scroll = 0;
         }
         self.focused = gain;
 
