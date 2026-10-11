@@ -10,6 +10,7 @@ use winit::{
 };
 
 use crate::gt::AgentSignal;
+use crate::task_link::TaskItem;
 use crate::terminal::{Cell, Color, GraphicAttribute, Line};
 use crate::timeline::{format_age, Timeline};
 use crate::view::{LazyTerminalView, Viewport};
@@ -72,6 +73,13 @@ pub struct Sidebar {
     /// AI 作業タイムライン（[log] モードで表示）。hooks とファイル監視から溜める。
     timeline: Timeline,
     log_scroll: usize,
+    /// [tasks] モード：今いるフォルダから上へたどって見つけた TASKS.md と、その未完了タスク。
+    tasks_path: Option<PathBuf>,
+    tasks_mtime: Option<std::time::SystemTime>,
+    tasks: Vec<TaskItem>,
+    tasks_closed: usize,
+    tasks_scroll: usize,
+    tasks_notice: Option<String>,
 }
 
 impl Sidebar {
@@ -109,6 +117,12 @@ impl Sidebar {
             ai_activity: None,
             timeline: Timeline::default(),
             log_scroll: 0,
+            tasks_path: None,
+            tasks_mtime: None,
+            tasks: Vec::new(),
+            tasks_closed: 0,
+            tasks_scroll: 0,
+            tasks_notice: None,
         }
     }
 
@@ -290,6 +304,16 @@ impl Sidebar {
                     return;
                 }
             }
+            SidebarMode::Tasks => {
+                if let Some(i) = self
+                    .tasks
+                    .iter()
+                    .position(|t| t.title.to_lowercase().contains(&q))
+                {
+                    self.set_list_selection(i);
+                    return;
+                }
+            }
         }
         // 一致なし：クエリ表示を更新するため再描画だけする。
         self.rebuild();
@@ -316,12 +340,20 @@ impl Sidebar {
                 None
             }
             RowAction::PreviewFile(path) => Some(SidebarRequest::PreviewFile(path)),
+            RowAction::TaskRow(index) => {
+                let task = self.tasks.get(index)?;
+                let path = self.tasks_path.clone()?;
+                Some(SidebarRequest::EditFileAt(path, task.line as u32 + 1))
+            }
             RowAction::TimelineRow(index) => {
                 let entry = self.timeline.entries().get(index)?;
                 if entry.kind == ChangeKind::Deleted {
                     return None; // 消えたファイルはプレビューできない。
                 }
-                let root = self.watcher_root.as_deref().unwrap_or_else(|| Path::new(""));
+                let root = self
+                    .watcher_root
+                    .as_deref()
+                    .unwrap_or_else(|| Path::new(""));
                 Some(SidebarRequest::PreviewFile(root.join(&entry.path)))
             }
         }
@@ -371,6 +403,10 @@ impl Sidebar {
                 self.run_row_action(RowAction::ToggleMode);
                 SidebarKeyResult::Consumed
             }
+            KeyCode::KeyX if self.mode == SidebarMode::Tasks => {
+                self.mark_selected_task_done();
+                SidebarKeyResult::Consumed
+            }
             KeyCode::KeyE => SidebarKeyResult::Request(SidebarRequest::EditPreview),
             KeyCode::KeyO => SidebarKeyResult::Request(SidebarRequest::OpenPreview),
             _ => SidebarKeyResult::Consumed,
@@ -404,11 +440,26 @@ impl Sidebar {
                 let next = if delta > 0 {
                     self.log_scroll.saturating_sub(delta as usize)
                 } else {
-                    self.log_scroll.saturating_add(delta.unsigned_abs() as usize)
+                    self.log_scroll
+                        .saturating_add(delta.unsigned_abs() as usize)
                 };
                 let clamped = clamp_browse_scroll(next, self.timeline.len(), visible);
                 if clamped != self.log_scroll {
                     self.log_scroll = clamped;
+                    self.rebuild();
+                }
+            }
+            SidebarMode::Tasks => {
+                let visible = self.task_entry_slots();
+                let next = if delta > 0 {
+                    self.tasks_scroll.saturating_sub(delta as usize)
+                } else {
+                    self.tasks_scroll
+                        .saturating_add(delta.unsigned_abs() as usize)
+                };
+                let clamped = clamp_browse_scroll(next, self.tasks.len(), visible);
+                if clamped != self.tasks_scroll {
+                    self.tasks_scroll = clamped;
                     self.rebuild();
                 }
             }
@@ -420,6 +471,7 @@ impl Sidebar {
             SidebarMode::Changes => 5,
             SidebarMode::Files => self.browse_entry_slots().max(1),
             SidebarMode::Log => self.log_entry_slots().max(1),
+            SidebarMode::Tasks => self.task_entry_slots().max(1),
         }
     }
 
@@ -430,6 +482,7 @@ impl Sidebar {
                 self.browse_entries.len() + usize::from(self.browse_dir.parent().is_some())
             }
             SidebarMode::Log => self.timeline.len(),
+            SidebarMode::Tasks => self.tasks.len(),
         }
     }
 
@@ -467,6 +520,14 @@ impl Sidebar {
                 );
             }
         }
+        if self.mode == SidebarMode::Tasks {
+            self.tasks_scroll = keep_selection_visible(
+                self.tasks_scroll,
+                self.browse_selected,
+                self.tasks.len(),
+                self.task_entry_slots(),
+            );
+        }
         if self.mode == SidebarMode::Log {
             self.log_scroll = keep_selection_visible(
                 self.log_scroll,
@@ -486,6 +547,14 @@ impl Sidebar {
                 }
                 Some(RowAction::TimelineRow(
                     self.browse_selected.min(self.timeline.len() - 1),
+                ))
+            }
+            SidebarMode::Tasks => {
+                if self.tasks.is_empty() {
+                    return None;
+                }
+                Some(RowAction::TaskRow(
+                    self.browse_selected.min(self.tasks.len() - 1),
                 ))
             }
             SidebarMode::Changes => {
@@ -960,6 +1029,10 @@ impl Sidebar {
                 SidebarMode::Log => {
                     self.push_timeline(&mut lines, &mut row_actions, cols);
                 }
+                SidebarMode::Tasks => {
+                    self.reload_tasks();
+                    self.push_tasks(&mut lines, &mut row_actions, cols);
+                }
             }
         }
 
@@ -1019,7 +1092,11 @@ impl Sidebar {
         }
         // ソリッド背景では BrightBlack(#414868) だと暗くて沈むので、Tokyo Night の
         // コメント色(#565F89)で読める明るさにする。
-        let hint = " j/k:選択 l:開く h:上へ /:検索 Tab:切替 Esc:端末";
+        let hint = if self.mode == SidebarMode::Tasks {
+            " j/k:選択 l:行を開く x:済 /:検索 Tab:切替 Esc:端末"
+        } else {
+            " j/k:選択 l:開く h:上へ /:検索 Tab:切替 Esc:端末"
+        };
         push_line(
             lines,
             row_actions,
@@ -1157,6 +1234,11 @@ impl Sidebar {
         } else {
             " log "
         };
+        let tasks = if self.mode == SidebarMode::Tasks {
+            "[tasks]"
+        } else {
+            " tasks "
+        };
         push_segments(
             lines,
             row_actions,
@@ -1168,6 +1250,8 @@ impl Sidebar {
                 (files, Color::BrightWhite),
                 ("  ", Color::White),
                 (log, Color::BrightWhite),
+                ("  ", Color::White),
+                (tasks, Color::BrightWhite),
             ],
             Some(RowAction::ToggleMode),
         );
@@ -1299,7 +1383,14 @@ impl Sidebar {
                 None,
             );
         } else {
-            push_line(lines, row_actions, cols, " 作業ログ", Color::BrightWhite, None);
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                " 作業ログ",
+                Color::BrightWhite,
+                None,
+            );
         }
 
         if self.timeline.is_empty() {
@@ -1409,6 +1500,219 @@ impl Sidebar {
                 row_actions,
                 cols,
                 &format!("   … ほか {rest} 件"),
+                Color::BrightBlack,
+                None,
+            );
+        }
+    }
+
+    /// 今いるフォルダの TASKS.md を（変わっていれば）読み直す。
+    fn reload_tasks(&mut self) {
+        let path = self.root().and_then(crate::task_link::find_tasks_file);
+        let mtime = path
+            .as_ref()
+            .and_then(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok());
+        if path == self.tasks_path && mtime == self.tasks_mtime {
+            return;
+        }
+        if path != self.tasks_path {
+            self.browse_selected = 0;
+            self.tasks_scroll = 0;
+        }
+        let (tasks, closed) = path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .map(|text| crate::task_link::parse_tasks(&text))
+            .unwrap_or_default();
+        self.tasks = tasks;
+        self.tasks_closed = closed;
+        self.tasks_path = path;
+        self.tasks_mtime = mtime;
+    }
+
+    /// 選んでいるタスクを済にする（✅ 今日の日付）。裏で書き換わっていたら何もしない。
+    fn mark_selected_task_done(&mut self) {
+        let (Some(path), Some(task)) = (
+            self.tasks_path.clone(),
+            self.tasks.get(self.browse_selected).cloned(),
+        ) else {
+            return;
+        };
+        let today = crate::task_link::today();
+        self.tasks_notice = Some(
+            match crate::task_link::mark_done(&path, task.line, &task.raw, &today) {
+                Ok(true) => format!("済: {}", task.title),
+                Ok(false) => "ファイルが書き換わっていました。もう一度選んでください".to_owned(),
+                Err(e) => format!("書き込めませんでした: {e}"),
+            },
+        );
+        self.tasks_mtime = None;
+        self.rebuild();
+    }
+
+    fn task_entry_slots(&self) -> usize {
+        // 見出し・区分の行も混ざるので files より少し多めに見せる。
+        let slots = FILE_BROWSER_VISIBLE_ROWS + 5;
+        if self.tasks.len() > slots {
+            slots.saturating_sub(1)
+        } else {
+            slots
+        }
+    }
+
+    /// TASKS.md の未完了タスク。区分（## 見出し）ごとに、優先は ◆、期限・担当を後ろに。
+    fn push_tasks(
+        &self,
+        lines: &mut Vec<Line>,
+        row_actions: &mut Vec<Option<RowAction>>,
+        cols: usize,
+    ) {
+        let Some(path) = &self.tasks_path else {
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                " タスク",
+                Color::BrightWhite,
+                None,
+            );
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                "   (このフォルダに TASKS.md がありません)",
+                Color::BrightBlack,
+                None,
+            );
+            push_line(lines, row_actions, cols, "", Color::White, None);
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                " 作るには:",
+                Color::BrightBlack,
+                None,
+            );
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                "   gtask init",
+                Color::BrightWhite,
+                None,
+            );
+            return;
+        };
+        let important = self.tasks.iter().filter(|t| t.important).count();
+        let name = path
+            .parent()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        push_segments(
+            lines,
+            row_actions,
+            cols,
+            &[
+                (" タスク  ", Color::BrightWhite),
+                (&format!("残{}", self.tasks.len()), Color::White),
+                (
+                    &if important > 0 {
+                        format!(" 優先{important}")
+                    } else {
+                        String::new()
+                    },
+                    Color::BrightMagenta,
+                ),
+                (&format!("  済{}", self.tasks_closed), Color::BrightBlack),
+                (
+                    &format!("  {name}/TASKS.md"),
+                    Color::Rgb { rgba: 0x565F_89FF },
+                ),
+            ],
+            None,
+        );
+        if let Some(notice) = &self.tasks_notice {
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                &format!("   {notice}"),
+                Color::Green,
+                None,
+            );
+        }
+        if self.tasks.is_empty() {
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                "   (残っているタスクはありません)",
+                Color::BrightBlack,
+                None,
+            );
+            return;
+        }
+        let today = crate::task_link::today();
+        let slots = self.task_entry_slots();
+        let start = self.tasks_scroll.min(self.tasks.len().saturating_sub(1));
+        let end = (start + slots).min(self.tasks.len());
+        let mut section: Option<&str> = (start > 0).then(|| self.tasks[start - 1].section.as_str());
+        for (index, task) in self.tasks.iter().enumerate().skip(start).take(end - start) {
+            if section != Some(task.section.as_str()) && !task.section.is_empty() {
+                push_line(
+                    lines,
+                    row_actions,
+                    cols,
+                    &format!(" ## {}", task.section),
+                    Color::Rgb { rgba: 0x7AA2_F7FF },
+                    None,
+                );
+            }
+            section = Some(task.section.as_str());
+            let (mark, mark_color) = if task.important {
+                ("◆", Color::BrightMagenta)
+            } else {
+                ("▸", Color::BrightBlack)
+            };
+            let who: String = task.who.iter().map(|w| format!(" @{w}")).collect();
+            let (due, due_color) = match &task.due {
+                Some(d) if d.as_str() < today.as_str() => {
+                    (format!(" 期限{}過ぎ", short_date(d)), Color::BrightRed)
+                }
+                Some(d) if *d == today => (" 今日まで".to_owned(), Color::BrightYellow),
+                Some(d) => (format!(" 期限{}", short_date(d)), Color::BrightBlack),
+                None => (String::new(), Color::BrightBlack),
+            };
+            let picked = if task.scheduled.as_deref() == Some(today.as_str()) {
+                " 今日"
+            } else {
+                ""
+            };
+            let fixed = 3 + display_width(&who) + display_width(&due) + display_width(picked);
+            let title = abbreviate_end(&task.title, cols.saturating_sub(fixed));
+            push_segments(
+                lines,
+                row_actions,
+                cols,
+                &[
+                    (" ", Color::White),
+                    (mark, mark_color),
+                    (" ", Color::White),
+                    (&title, Color::White),
+                    (&who, Color::BrightYellow),
+                    (&due, due_color),
+                    (picked, Color::BrightYellow),
+                ],
+                Some(RowAction::TaskRow(index)),
+            );
+        }
+        if end < self.tasks.len() {
+            push_line(
+                lines,
+                row_actions,
+                cols,
+                &format!("   … ほか {} 件", self.tasks.len() - end),
                 Color::BrightBlack,
                 None,
             );
@@ -1541,12 +1845,15 @@ impl Sidebar {
         self.mode = match self.mode {
             SidebarMode::Changes => SidebarMode::Files,
             SidebarMode::Files => SidebarMode::Log,
-            SidebarMode::Log => SidebarMode::Changes,
+            SidebarMode::Log => SidebarMode::Tasks,
+            SidebarMode::Tasks => SidebarMode::Changes,
         };
         self.search = None;
         self.browse_selected = 0;
         self.browse_scroll = 0;
         self.log_scroll = 0;
+        self.tasks_scroll = 0;
+        self.tasks_notice = None;
         if self.mode == SidebarMode::Files && self.browse_entries.is_empty() {
             self.request_browse_dir();
         }
@@ -1639,6 +1946,8 @@ impl Sidebar {
 
 pub enum SidebarRequest {
     PreviewFile(PathBuf),
+    /// ファイルの指定行（1 始まり）をプレビュー枠のエディタで開く。
+    EditFileAt(PathBuf, u32),
     ScrollPreview(isize),
     EditPreview,
     OpenPreview,
@@ -1656,6 +1965,8 @@ enum SidebarMode {
     Files,
     /// AI 作業タイムライン（いつ・何が・どのツールで変わったか＋要確認ラベル）。
     Log,
+    /// 今いるフォルダの TASKS.md（gototask と同じファイル）の未完了タスク。
+    Tasks,
 }
 
 /// AI の「今どうしているか」。ファイル監視／hooks の event メッセージからは
@@ -1691,6 +2002,8 @@ enum RowAction {
     /// タイムラインの i 番目の行。同じファイルが複数回並び得るので
     /// パスでなく添字で行を特定する（選択ハイライトのため）。
     TimelineRow(usize),
+    /// [tasks] の i 番目の未完了タスク。
+    TaskRow(usize),
 }
 
 /// watcher の生成をバックグラウンドで行う（生成＝ディレクトリ登録は
@@ -1923,6 +2236,18 @@ fn abbreviate_end(text: &str, max_width: usize) -> String {
         used += width;
     }
     format!("{out}\u{2026}")
+}
+
+/// 2026-10-20 → 10/20
+fn short_date(d: &str) -> String {
+    match (d.get(5..7), d.get(8..10)) {
+        (Some(m), Some(day)) => format!(
+            "{}/{}",
+            m.trim_start_matches('0'),
+            day.trim_start_matches('0')
+        ),
+        _ => d.to_owned(),
+    }
 }
 
 fn display_width(text: &str) -> usize {
