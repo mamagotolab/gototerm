@@ -2624,7 +2624,7 @@ impl Multiplexer {
             return;
         };
         if let Some((pos, size)) = launcher.ime_cursor_area() {
-            self.window.set_ime_cursor_area(pos, size);
+            crate::window::set_ime_cursor_area_dedup(&self.window, pos, size);
         }
     }
 

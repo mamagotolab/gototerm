@@ -478,6 +478,34 @@ fn get_clipboard() -> String {
     }
 }
 
+thread_local! {
+    /// 最後にコンポジタへ送った IME 候補位置。ウィンドウは1枚なので全ペイン・
+    /// ランチャーで共有する。
+    static IME_AREA_SENT: std::cell::Cell<Option<(PhysicalPosition<u32>, PhysicalSize<u32>)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// IME 候補位置をコンポジタへ送る。前回と同じ位置なら送らない。
+/// 再描画や IME イベントのたびに送ると、描画の多いアプリ（Claude Code 2.1.301
+/// など）や、送信→done→Preedit→送信の往復で毎秒数万件になり、Wayland の
+/// 送信バッファが溢れて接続を切られる（gototerm が終了する）。
+pub fn set_ime_cursor_area_dedup(
+    window: &Window,
+    pos: PhysicalPosition<u32>,
+    size: PhysicalSize<u32>,
+) {
+    if IME_AREA_SENT.get() == Some((pos, size)) {
+        return;
+    }
+    IME_AREA_SENT.set(Some((pos, size)));
+    window.set_ime_cursor_area(pos, size);
+}
+
+/// 次の IME 候補位置を必ず送らせる（フォーカス復帰・IME 再有効化時）。
+pub fn reset_ime_cursor_area_cache() {
+    IME_AREA_SENT.set(None);
+}
+
 pub struct TerminalWindow {
     link_hints: Option<crate::link_hints::LinkHints>,
     tui_copy: Option<crate::tui_copy::TuiCopy>,
@@ -678,12 +706,11 @@ impl TerminalWindow {
             if let Some(cursor) = snapshot.cursor.filter(|_| self.focused) {
                 // 変換候補ウィンドウをカーソルのセル位置に出す（over-the-spot）。
                 // フォーカス中のペインだけが IME 位置を更新する。
-                self.window.set_ime_cursor_area(
-                    PhysicalPosition::new(
-                        self.viewport().x + cursor.col as u32 * cell_size.w,
-                        self.viewport().y + cursor.row as u32 * cell_size.h,
-                    ),
-                    PhysicalSize::new(cell_size.w, cell_size.h),
+                self.set_ime_area(
+                    self.viewport().x + cursor.col as u32 * cell_size.w,
+                    self.viewport().y + cursor.row as u32 * cell_size.h,
+                    cell_size.w,
+                    cell_size.h,
                 );
             }
 
@@ -965,6 +992,8 @@ impl TerminalWindow {
             self.copy_scroll = 0;
         }
         self.focused = gain;
+        // フォーカスが戻ったら IME 位置を改めて伝える（再送の省略をリセット）。
+        reset_ime_cursor_area_cache();
 
         // Update cursor
         self.view.update_contents(|view| {
@@ -982,14 +1011,21 @@ impl TerminalWindow {
         if let Some(cursor) = self.view.cursor {
             let cell_size = self.view.cell_size();
             let vp = self.viewport();
-            self.window.set_ime_cursor_area(
-                PhysicalPosition::new(
-                    vp.x + cursor.col as u32 * cell_size.w,
-                    vp.y + cursor.row as u32 * cell_size.h,
-                ),
-                PhysicalSize::new(cell_size.w, cell_size.h),
+            self.set_ime_area(
+                vp.x + cursor.col as u32 * cell_size.w,
+                vp.y + cursor.row as u32 * cell_size.h,
+                cell_size.w,
+                cell_size.h,
             );
         }
+    }
+
+    fn set_ime_area(&self, x: u32, y: u32, w: u32, h: u32) {
+        set_ime_cursor_area_dedup(
+            &self.window,
+            PhysicalPosition::new(x, y),
+            PhysicalSize::new(w, h),
+        );
     }
 
     /// マネージャから渡されるウィンドウイベントを処理する。
@@ -1030,6 +1066,8 @@ impl TerminalWindow {
                 }
                 Ime::Enabled | Ime::Disabled => {
                     self.view.update_contents(|view| view.preedit.clear());
+                    // IME が入り直したら位置を改めて伝える。
+                    reset_ime_cursor_area_cache();
                     self.update_ime_position();
                 }
             },
