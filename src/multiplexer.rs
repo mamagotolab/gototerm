@@ -3309,9 +3309,7 @@ impl Multiplexer {
                     if let Some(launcher) = self.launcher.as_mut() {
                         let outcome = launcher.handle_key(key, self.modifiers);
                         self.handle_launcher_outcome(outcome);
-                        // 入力欄に入った直後に変換候補の位置を合わせる
-                        // （起動メニューを開いた時点で候補が正しい場所に出る）。
-                        self.sync_launcher_ime_area();
+                        // 変換候補の位置は AboutToWait でまとめて合わせる。
                         return;
                     }
                     if !self.sidebar_focused
@@ -3464,7 +3462,9 @@ impl Multiplexer {
                     if let Some(launcher) = self.launcher.as_mut() {
                         launcher.handle_ime(ime);
                     }
-                    self.sync_launcher_ime_area();
+                    // ここで位置を送ると、done ごとに来る Preedit("")→Preedit(文字)
+                    // の途中の位置まで送ってしまい、送信→done→送信の往復が毎秒
+                    // 1万回になる（入力が重くなる）。AboutToWait でまとめて送る。
                 }
 
                 WindowEvent::Ime(_) if self.sidebar_focused || self.reader_focused => {}
@@ -3536,6 +3536,10 @@ impl Multiplexer {
                 {
                     self.suspend_focus_for_overview();
                 }
+
+                // ランチャーの変換候補の位置は、イベントを処理し終えた時点の
+                // 位置を1回だけ送る（同じ位置なら送らない）。
+                self.sync_launcher_ime_area();
 
                 self.handle_gt_messages();
                 #[cfg(unix)]
