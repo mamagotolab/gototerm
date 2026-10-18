@@ -3012,12 +3012,6 @@ mod tests {
             &dir,
             Some(&command),
         );
-        std::thread::sleep(Duration::from_millis(700));
-        if name == "mutt" {
-            terminal.write(b"\r");
-            std::thread::sleep(Duration::from_millis(700));
-        }
-        let frame = terminal.copy_frame();
         let visible = |f: &crate::tui_copy::Frame| {
             f.rows
                 .iter()
@@ -3031,6 +3025,21 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
+        if name == "mutt" {
+            std::thread::sleep(Duration::from_millis(700));
+            terminal.write(b"\r");
+        }
+        // 決め打ちの待ち時間だと、CI（特に Windows の ConPTY）でエディタの起動が
+        // 遅れたときに空の画面を判定して落ちる。本文が出るまで待つ。
+        let started = Instant::now();
+        let mut frame = terminal.copy_frame();
+        while visible(&frame).is_empty() && started.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(100));
+            frame = terminal.copy_frame();
+        }
+        // 最初の行が見えた直後は描き途中のことがあるので、少しだけ落ち着かせる。
+        std::thread::sleep(Duration::from_millis(200));
+        frame = terminal.copy_frame();
         let rows = visible(&frame);
         assert!(
             !rows.is_empty(),
