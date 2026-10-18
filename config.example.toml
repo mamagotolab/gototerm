@@ -65,6 +65,19 @@ watch_ignore = [".git", "node_modules", "target", "dist", "__pycache__"]
 # 完全不透明にするなら末尾を FF（0x1A1B26FF）にする。
 color_background = 0x1A1B26CC
 
+# Ctrl+クリック（リンクヒント含む）で、プレビューを挟まず OS の既定アプリ
+# （ブラウザ・画像ビューア）で開く拡張子。`path:12` の行番号付きでも開ける。
+# open_externally = ["html", "htm", "pdf", "svg", "png", "jpg", "jpeg", "gif", "webp"]
+
+# 見た目と動き（コメントの値が既定）。
+# padding = 10              # ペインの内側の余白(px)。0 で余白なし
+# corner_radius = 10        # ペイン枠の角丸の半径(px)。0 で角丸なし
+# inactive_dim = 0.35       # 分割時、フォーカス外のペインを暗くする割合。0.0 で無効
+# cursor_animation = true   # カーソル移動時に残像を滑らせる
+# animations = true         # タブ切り替え時のフェードイン
+# visual_bell = true        # ベル(BEL)で画面を一瞬光らせる
+# post_effect = "none"      # "crt" で走査線＋周辺減光のレトロ表示
+
 # copy_mode = "Ctrl+Shift+Space"
 # link_hints = "Ctrl+Shift+R"
 # select_tab_1 = "Ctrl+1"

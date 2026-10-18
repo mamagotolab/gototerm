@@ -158,7 +158,19 @@ impl Launcher {
         let cols = (self.view.viewport().w / self.view.cell_size().w).max(1) as usize;
         let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
         let lines = self.state.render(cols, rows);
+        let cell = self.view.cell_size();
+        let shadow = self
+            .state
+            .popup_box
+            .map(|(x, y, w, h)| crate::view::popup_shadow(x, y, w, h, cell))
+            .unwrap_or_default();
+        let popup_rect = self
+            .state
+            .popup_box
+            .map(|(x, y, w, h)| crate::view::popup_rect_with_shadow(x, y, w, h, cell));
+        self.view.set_popup_rect(popup_rect);
         self.view.update_contents(|view| {
+            view.overlays = shadow;
             // ターミナルと同じ透過設定（セルの Color::Background クアッドで半透明を出す）。
             // ポップアップ部分だけ各セルに不透明色を敷いて透過を消す。
             view.bg_color = Color::Background;
@@ -235,6 +247,8 @@ struct LauncherState {
     last_ime_commit: Instant,
     /// 変換候補ウィンドウを出すセル (row, col)。描画のたびに更新する。
     ime_cursor: Option<(usize, usize)>,
+    /// 直前の描画で出したポップアップの枠 (x0, y0, 幅, 高さ)（セル単位）。影を付けるのに使う。
+    popup_box: Option<(usize, usize, usize, usize)>,
 }
 
 /// 起動メニューの「別の始め方」。名前入力の下に、使えるものだけ並べる。
@@ -391,6 +405,7 @@ impl LauncherState {
             preedit: String::new(),
             last_ime_commit: Instant::now() - Duration::from_secs(10),
             ime_cursor: None,
+            popup_box: None,
         };
         state.reload();
         state
@@ -426,6 +441,7 @@ impl LauncherState {
             preedit: String::new(),
             last_ime_commit: Instant::now() - Duration::from_secs(10),
             ime_cursor: None,
+            popup_box: None,
         };
         state.reload();
         state
@@ -1110,6 +1126,7 @@ impl LauncherState {
     fn render(&mut self, cols: usize, rows: usize) -> Vec<Line> {
         // 変換候補の位置は描くたびに置き直す（入力欄の無い画面では出さない）。
         self.ime_cursor = None;
+        self.popup_box = None;
         match self.mode {
             Mode::Workspaces | Mode::WorkspaceName => self.render_workspaces(cols, rows),
             Mode::Browse => self.render_browse(cols, rows),
@@ -1261,7 +1278,7 @@ impl LauncherState {
         lines
     }
 
-    fn overlay_agent_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+    fn overlay_agent_popup(&mut self, lines: &mut [Line], cols: usize, rows: usize) {
         let subtitle = self
             .chosen_dir
             .as_deref()
@@ -1288,7 +1305,7 @@ impl LauncherState {
         content.push((String::new(), Color::White, false));
         content.push(("j/k:選択  Enter:起動  Esc:戻る".to_owned(), DIM, false));
 
-        overlay_list_popup(lines, cols, rows, &content);
+        self.popup_box = Some(overlay_list_popup(lines, cols, rows, &content));
     }
 
     fn render_launch_menu(&mut self, cols: usize, rows: usize) -> Vec<Line> {
@@ -1343,7 +1360,9 @@ impl LauncherState {
         };
         content.push((fit_width(footer, MENU_W), DIM, false));
 
-        let (x0, y0) = overlay_list_popup(lines, cols, rows, &content);
+        let popup = overlay_list_popup(lines, cols, rows, &content);
+        self.popup_box = Some(popup);
+        let (x0, y0, _, _) = popup;
         // 変換候補ウィンドウは名前欄のカーソル位置に出す。
         // 中身の行は「枠+左パディング」の分だけ右にずれている。
         if on_name {
@@ -1373,7 +1392,7 @@ impl LauncherState {
         lines
     }
 
-    fn overlay_history_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+    fn overlay_history_popup(&mut self, lines: &mut [Line], cols: usize, rows: usize) {
         let mut content: Vec<(String, Color, bool)> = Vec::new();
         content.push((pad_to("続きから", MENU_W), ACCENT, false));
         content.push((String::new(), Color::White, false));
@@ -1399,7 +1418,7 @@ impl LauncherState {
             false,
         ));
 
-        overlay_list_popup(lines, cols, rows, &content);
+        self.popup_box = Some(overlay_list_popup(lines, cols, rows, &content));
     }
 
     fn render_hooks_nudge(&mut self, cols: usize, rows: usize) -> Vec<Line> {
@@ -1408,7 +1427,7 @@ impl LauncherState {
         lines
     }
 
-    fn overlay_hooks_nudge_popup(&self, lines: &mut [Line], cols: usize, rows: usize) {
+    fn overlay_hooks_nudge_popup(&mut self, lines: &mut [Line], cols: usize, rows: usize) {
         let mut content: Vec<(String, Color, bool)> = Vec::new();
         content.push(("Claude Code 連携を設定しますか？".to_owned(), ACCENT, false));
         content.push((
@@ -1434,7 +1453,7 @@ impl LauncherState {
             false,
         ));
 
-        overlay_list_popup(lines, cols, rows, &content);
+        self.popup_box = Some(overlay_list_popup(lines, cols, rows, &content));
     }
 }
 
@@ -1447,7 +1466,7 @@ fn overlay_list_popup(
     cols: usize,
     rows: usize,
     content: &[(String, Color, bool)],
-) -> (usize, usize) {
+) -> (usize, usize, usize, usize) {
     let inner_w = content
         .iter()
         .map(|(t, _, _)| display_width(t))
@@ -1484,7 +1503,7 @@ fn overlay_list_popup(
     }
     // 下ボーダー
     stamp(lines, y0 + box_h - 1, x0, border_row('╰', '╯', dash));
-    (x0, y0)
+    (x0, y0, box_w, box_h)
 }
 
 pub(crate) fn display_width(s: &str) -> usize {

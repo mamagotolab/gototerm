@@ -89,6 +89,32 @@ pub struct Config {
 
     pub east_asian_width_ambiguous: u8,
 
+    // Ctrl+クリック（リンクヒント含む）でプレビューを挟まず OS の既定アプリで開く拡張子。
+    #[serde(default = "default_open_externally")]
+    pub open_externally: Vec<String>,
+
+    // ---- 見た目と動き ----
+    // ペインの内側の余白(px)と、ペイン枠の角丸の半径(px)。0 で従来どおり。
+    #[serde(default = "default_padding")]
+    pub padding: u32,
+    #[serde(default = "default_corner_radius")]
+    pub corner_radius: u32,
+    // 分割時、フォーカスしていないペインを暗くする割合（0.0=暗くしない）。
+    #[serde(default = "default_inactive_dim")]
+    pub inactive_dim: f32,
+    // カーソルが移動するとき残像を滑らせる。
+    #[serde(default = "default_true")]
+    pub cursor_animation: bool,
+    // タブ切り替え時のフェードイン。
+    #[serde(default = "default_true")]
+    pub animations: bool,
+    // ベル(BEL)で画面を一瞬光らせる。
+    #[serde(default = "default_true")]
+    pub visual_bell: bool,
+    // 画面全体の仕上げ効果。"none" / "crt"（走査線＋周辺減光）。
+    #[serde(default = "default_post_effect")]
+    pub post_effect: String,
+
     // カーソルを点滅させるか。
     pub cursor_blink: bool,
     // バー/下線カーソルの太さ(px)。ブロックカーソルには影響しない。
@@ -136,6 +162,14 @@ impl Default for Config {
             launcher_agents: default_agents(),
             task_file: String::new(),
             task_url: default_task_url(),
+            open_externally: default_open_externally(),
+            padding: default_padding(),
+            corner_radius: default_corner_radius(),
+            inactive_dim: default_inactive_dim(),
+            cursor_animation: true,
+            animations: true,
+            visual_bell: true,
+            post_effect: default_post_effect(),
             open_socket: false,
 
             scroll_bar_width: 5,
@@ -167,6 +201,34 @@ impl Default for Config {
             color_bright_white: 0xC0CAF5FF,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_padding() -> u32 {
+    10
+}
+
+fn default_corner_radius() -> u32 {
+    10
+}
+
+fn default_inactive_dim() -> f32 {
+    0.35
+}
+
+fn default_post_effect() -> String {
+    "none".to_owned()
+}
+
+fn default_open_externally() -> Vec<String> {
+    [
+        "html", "htm", "pdf", "svg", "png", "jpg", "jpeg", "gif", "webp",
+    ]
+    .map(String::from)
+    .to_vec()
 }
 
 fn default_task_url() -> String {

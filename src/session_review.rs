@@ -99,8 +99,13 @@ impl SessionReview {
     fn rebuild(&mut self) {
         let cols = (self.view.viewport().w / self.view.cell_size().w).max(1) as usize;
         let rows = (self.view.viewport().h / self.view.cell_size().h).max(1) as usize;
-        let lines = render(&self.summary, cols, rows);
+        let (lines, popup) = render(&self.summary, cols, rows);
+        let (x, y, w, h) = popup;
+        let shadow = crate::view::popup_shadow(x, y, w, h, self.view.cell_size());
+        let rect = crate::view::popup_rect_with_shadow(x, y, w, h, self.view.cell_size());
+        self.view.set_popup_rect(Some(rect));
         self.view.update_contents(|view| {
+            view.overlays = shadow;
             // ターミナルと同じ透過（背景キャンバスは空セルのみ、ボックスは不透明）。
             view.bg_color = Color::Background;
             view.skip_default_bg = false;
@@ -114,7 +119,12 @@ impl SessionReview {
     }
 }
 
-fn render(summary: &SessionSummary, cols: usize, rows: usize) -> Vec<Line> {
+/// 描いた行と、ポップアップの枠 (x0, y0, 幅, 高さ)（セル単位）。
+fn render(
+    summary: &SessionSummary,
+    cols: usize,
+    rows: usize,
+) -> (Vec<Line>, (usize, usize, usize, usize)) {
     let content = review_lines(summary);
 
     let mut lines: Vec<Line> = (0..rows)
@@ -154,7 +164,7 @@ fn render(summary: &SessionSummary, cols: usize, rows: usize) -> Vec<Line> {
     }
     stamp(&mut lines, y0 + box_h - 1, x0, border_row('╰', '╯', dash));
 
-    lines
+    (lines, (x0, y0, box_w, box_h))
 }
 
 /// ポップアップの中身（テキスト・文字色）を組み立てる。純粋関数（幅計算・stamp は

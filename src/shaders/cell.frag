@@ -2,6 +2,16 @@
 
 uniform sampler2D tex;
 uniform float timestamp;
+// 見た目の効果（view.rs の Effects）。frame_rect はペイン枠の (left, bottom, w, h)
+// をフレームバッファ座標で、screen はフレームバッファ全体の大きさ。
+uniform vec4 frame_rect;
+uniform vec2 screen;
+uniform float radius;
+uniform float dim;
+uniform float flash;
+uniform int effect;
+uniform float pop_alpha;
+flat in uint v_in_pop;
 in vec2 v_tex_coords;
 flat in uint v_is_bg;
 flat in uint v_blinking;
@@ -34,10 +44,42 @@ void main() {
         fore = back;
     }
 
+    vec4 c;
     if (v_is_bg == 1u) {
-        gl_FragColor = back;
+        c = back;
     } else {
         float a = texture(tex, v_tex_coords).r;
-        gl_FragColor = vec4(fore.rgb, a);
+        c = vec4(fore.rgb, a);
     }
+
+    // 角丸：枠の外は捨て、縁の1pxだけアルファで滑らかにする。
+    if (radius > 0.0) {
+        vec2 half_size = frame_rect.zw * 0.5;
+        vec2 q = abs(gl_FragCoord.xy - frame_rect.xy - half_size) - (half_size - vec2(radius));
+        float d = length(max(q, 0.0)) - radius;
+        if (d > 0.5) {
+            discard;
+        }
+        c.a *= clamp(0.5 - d, 0.0, 1.0);
+    }
+
+    c.rgb *= 1.0 - dim;
+    c.rgb = mix(c.rgb, vec3(1.0), flash);
+
+    // CRT 風：走査線と周辺減光、わずかな蛍光体の緑み。走査線は背景だけに
+    // かける（文字に載せると横縞で欠けて解像度が落ちたように見える）。
+    if (effect == 1) {
+        if (v_is_bg == 1u && mod(gl_FragCoord.y, 3.0) < 1.0) {
+            c.rgb *= 0.85;
+        }
+        vec2 uv = gl_FragCoord.xy / max(screen, vec2(1.0)) - 0.5;
+        c.rgb *= clamp(1.0 - dot(uv, uv) * 0.9, 0.0, 1.0);
+        c.rgb *= vec3(0.96, 1.04, 0.98);
+    }
+
+    if (v_in_pop == 1u) {
+        c.a *= pop_alpha;
+    }
+
+    gl_FragColor = c;
 }

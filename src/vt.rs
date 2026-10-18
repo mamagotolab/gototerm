@@ -280,6 +280,8 @@ fn selection_text_from_term<T>(term: &Term<T>, selection: GridSelection) -> Stri
 pub struct EventProxy {
     writer: SharedWriter,
     winsize: Arc<Mutex<WindowSize>>,
+    /// BEL を受けたら立つ。描画側が take_bell で拾って画面を光らせる。
+    bell: Arc<AtomicBool>,
 }
 
 impl EventProxy {
@@ -312,6 +314,7 @@ impl EventListener for EventProxy {
             }
             // OSC 52 の書き込み（SSH 先の nvim 等のコピー）をローカルのクリップボードへ。
             // 読み取りは alacritty の既定（OnlyCopy）で拒否される。
+            AlacEvent::Bell => self.bell.store(true, Ordering::SeqCst),
             AlacEvent::ClipboardStore(alacritty_terminal::term::ClipboardType::Clipboard, text) => {
                 crate::window::set_clipboard(&text);
             }
@@ -401,6 +404,7 @@ pub struct VtTerminal {
     killer: Box<dyn ChildKiller + Send + Sync>,
     exited: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
+    bell: Arc<AtomicBool>,
     /// テキスト領域の現在寸法。`TextAreaSizeRequest` 応答に使う（resize で更新）。
     winsize: Arc<Mutex<WindowSize>>,
     /// Sixel で描かれた画像。グリッドとは別に保持し、描画時に重ねる。
@@ -1258,9 +1262,11 @@ impl VtTerminal {
         drop(pair.slave); // slave を閉じ、子終了時に reader が EOF を受け取れるように
 
         let winsize = Arc::new(Mutex::new(window_size(cols, lines, cell_w, cell_h)));
+        let bell = Arc::new(AtomicBool::new(false));
         let proxy = EventProxy {
             writer: writer.clone(),
             winsize: winsize.clone(),
+            bell: bell.clone(),
         };
         let size = GridSize { cols, lines };
         let term_config = Config {
@@ -1373,6 +1379,7 @@ impl VtTerminal {
             killer,
             exited,
             dirty,
+            bell,
             winsize,
             images,
             gt_messages,
@@ -1446,6 +1453,11 @@ impl VtTerminal {
 
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// 前回以降に BEL を受けたか（受けていれば true を返し、フラグを下げる）。
+    pub fn take_bell(&self) -> bool {
+        self.bell.swap(false, Ordering::SeqCst)
     }
 
     /// 現在の端末サイズ (columns, screen_lines)。
@@ -1592,6 +1604,16 @@ impl VtTerminal {
         self.term.lock().unwrap().grid().display_offset()
     }
 
+    /// スクロールバー用の (表示位置, 履歴の行数, 画面の行数)。
+    pub fn scroll_position(&self) -> (usize, usize, usize) {
+        let term = self.term.lock().unwrap();
+        (
+            term.grid().display_offset(),
+            term.history_size(),
+            term.screen_lines(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn start_selection(
         &self,
@@ -1725,8 +1747,46 @@ use crate::terminal::{
 use alacritty_terminal::term::cell::Flags;
 use vte::ansi::{Color as AColor, CursorShape, NamedColor};
 
-/// 表示位置のリンクを端末グリッドから取得する。OSC 8 と自動折り返しを保持する。
-fn url_at(term: &Term<EventProxy>, row: usize, col: usize) -> Option<String> {
+fn is_link_token(c: char) -> bool {
+    !c.is_whitespace()
+        && c != '\0'
+        && !matches!(
+            c,
+            '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '│'
+        )
+}
+
+/// 1行ぶんの文字（1要素＝画面の1列。全角後半は '\0'）。
+fn row_chars(term: &Term<EventProxy>, line: Line) -> Vec<char> {
+    let grid = term.grid();
+    (0..term.columns())
+        .map(|col| {
+            let cell = &grid[line][Column(col)];
+            if cell
+                .flags
+                .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
+            {
+                '\0'
+            } else {
+                cell.c
+            }
+        })
+        .collect()
+}
+
+/// 自動折り返しをつないだ位置のトークン。
+struct WrappedToken {
+    text: String,
+    first: Line,
+    last: Line,
+    /// トークンの前（先頭行）に空白と枠線しかないか。
+    at_line_start: bool,
+    /// トークンの後（末尾行）に空白と枠線しかないか。
+    at_line_end: bool,
+}
+
+/// 表示位置 (row, col) を grid の Point に直す。範囲外は None。
+fn display_point(term: &Term<EventProxy>, row: usize, col: usize) -> Option<Point> {
     if row >= term.screen_lines() || col >= term.columns() {
         return None;
     }
@@ -1736,14 +1796,12 @@ fn url_at(term: &Term<EventProxy>, row: usize, col: usize) -> Option<String> {
     if grid[point].flags.contains(Flags::WIDE_CHAR_SPACER) && col > 0 {
         point.column = Column(col - 1);
     }
-    let is_web_url = |url: &str| {
-        (url.starts_with("https://") || url.starts_with("http://"))
-            && !url.chars().any(char::is_control)
-    };
-    if let Some(link) = grid[point].hyperlink() {
-        return is_web_url(link.uri()).then(|| link.uri().to_owned());
-    }
+    Some(point)
+}
 
+fn wrapped_token(term: &Term<EventProxy>, point: Point) -> Option<WrappedToken> {
+    let grid = term.grid();
+    let line = point.line;
     let last_col = Column(term.columns() - 1);
     let mut first = line;
     while first > term.topmost_line()
@@ -1757,45 +1815,117 @@ fn url_at(term: &Term<EventProxy>, row: usize, col: usize) -> Option<String> {
     while last < term.bottommost_line() && grid[last][last_col].flags.contains(Flags::WRAPLINE) {
         last += 1;
     }
-    // 1要素＝画面の1列。全角後半は文字列化するときだけ除外する。
     let mut chars = Vec::new();
     for row in first.0..=last.0 {
-        for col in 0..term.columns() {
-            let cell = &grid[Line(row)][Column(col)];
-            chars.push(
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::LEADING_WIDE_CHAR_SPACER)
-                {
-                    '\0'
-                } else {
-                    cell.c
-                },
-            );
-        }
+        chars.extend(row_chars(term, Line(row)));
     }
     let index = (line.0 - first.0) as usize * term.columns() + point.column.0;
-    let is_token = |c: char| {
-        !c.is_whitespace()
-            && !matches!(
-                c,
-                '"' | '\'' | '<' | '>' | '`' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '│'
-            )
-    };
-    if !is_token(chars[index]) {
+    if !is_link_token(chars[index]) {
         return None;
     }
     let mut start = index;
-    while start > 0 && is_token(chars[start - 1]) {
+    while start > 0 && (is_link_token(chars[start - 1]) || chars[start - 1] == '\0') {
         start -= 1;
     }
     let mut end = index + 1;
-    while end < chars.len() && is_token(chars[end]) {
+    while end < chars.len() && (is_link_token(chars[end]) || chars[end] == '\0') {
         end += 1;
     }
-    let token: String = chars[start..end].iter().filter(|c| **c != '\0').collect();
-    let token = token.trim_end_matches(['.', ',', ';', ':', '!', '?', '。', '、']);
+    let blank = |c: &char| c.is_whitespace() || matches!(c, '\0' | '│' | '|');
+    Some(WrappedToken {
+        text: chars[start..end].iter().filter(|c| **c != '\0').collect(),
+        first,
+        last,
+        at_line_start: chars[..start].iter().all(blank),
+        at_line_end: chars[end..].iter().all(blank),
+    })
+}
+
+fn trim_link_punctuation(token: &str) -> &str {
+    token.trim_end_matches(['.', ',', ';', ':', '!', '?', '。', '、'])
+}
+
+/// 表示位置のリンクを端末グリッドから取得する。OSC 8 と自動折り返しを保持する。
+fn url_at(term: &Term<EventProxy>, row: usize, col: usize) -> Option<String> {
+    let point = display_point(term, row, col)?;
+    let is_web_url = |url: &str| {
+        (url.starts_with("https://") || url.starts_with("http://"))
+            && !url.chars().any(char::is_control)
+    };
+    if let Some(link) = term.grid()[point].hyperlink() {
+        return is_web_url(link.uri()).then(|| link.uri().to_owned());
+    }
+    let token = wrapped_token(term, point)?;
+    let token = trim_link_punctuation(&token.text);
     is_web_url(token).then(|| token.to_owned())
+}
+
+/// 表示位置にあるファイルパスの候補（長い順）。Claude Code などの TUI は長いパスを
+/// 自前の改行で折り返すので、行末/行頭に接するトークンは前後の行とつないだ形も返す。
+/// どれが本物かは呼び出し側がファイルの存在で決める。
+fn path_candidates_at(term: &Term<EventProxy>, row: usize, col: usize) -> Vec<String> {
+    let Some(point) = display_point(term, row, col) else {
+        return Vec::new();
+    };
+    let Some(base) = wrapped_token(term, point) else {
+        return Vec::new();
+    };
+    // 前後の行の、接している側のトークン。最大2行先まで（3行にまたがるパス）。
+    let edge_token = |line: Line, from_start: bool| -> Option<WrappedToken> {
+        if line < term.topmost_line() || line > term.bottommost_line() {
+            return None;
+        }
+        let chars = row_chars(term, line);
+        let blank = |c: &char| c.is_whitespace() || matches!(c, '\0' | '│' | '|');
+        let col = if from_start {
+            chars.iter().position(|c| !blank(c))?
+        } else {
+            chars.iter().rposition(|c| !blank(c))?
+        };
+        wrapped_token(term, Point::new(line, Column(col)))
+    };
+
+    let mut befores = vec![String::new()];
+    let mut cur = base.at_line_start.then_some(base.first);
+    let mut prefix = String::new();
+    while let Some(line) = cur {
+        if befores.len() > 2 {
+            break;
+        }
+        let Some(prev) = edge_token(line - 1, false).filter(|t| t.at_line_end) else {
+            break;
+        };
+        prefix = format!("{}{prefix}", prev.text);
+        befores.push(prefix.clone());
+        cur = prev.at_line_start.then_some(prev.first);
+    }
+    let mut afters = vec![String::new()];
+    let mut cur = base.at_line_end.then_some(base.last);
+    let mut suffix = String::new();
+    while let Some(line) = cur {
+        if afters.len() > 2 {
+            break;
+        }
+        let Some(next) = edge_token(line + 1, true).filter(|t| t.at_line_start) else {
+            break;
+        };
+        suffix.push_str(&next.text);
+        afters.push(suffix.clone());
+        cur = next.at_line_end.then_some(next.last);
+    }
+
+    let mut out = Vec::new();
+    for b in befores.iter().rev() {
+        for a in afters.iter().rev() {
+            let joined = format!("{b}{}{a}", base.text);
+            let joined = trim_link_punctuation(&joined).to_owned();
+            if !joined.is_empty() && !out.contains(&joined) {
+                out.push(joined);
+            }
+        }
+    }
+    out.sort_by_key(|s| std::cmp::Reverse(s.chars().count()));
+    out
 }
 
 /// 1フレーム分の描画スナップショット。
@@ -1809,6 +1939,10 @@ pub struct Snapshot {
 impl VtTerminal {
     pub fn url_at(&self, row: usize, col: usize) -> Option<String> {
         url_at(&self.term.lock().unwrap(), row, col)
+    }
+
+    pub fn path_candidates_at(&self, row: usize, col: usize) -> Vec<String> {
+        path_candidates_at(&self.term.lock().unwrap(), row, col)
     }
 
     /// 現在の画面内容を既存描画形式に変換して取り出す。
@@ -2111,6 +2245,7 @@ mod tests {
         let proxy = EventProxy {
             writer,
             winsize: Arc::new(Mutex::new(window_size(cols, 4, 9, 18))),
+            bell: Default::default(),
         };
         let mut term = Term::new(Config::default(), &GridSize { cols, lines: 4 }, proxy);
         let mut processor: Processor = Processor::new();
@@ -2179,6 +2314,38 @@ mod tests {
     }
 
     #[test]
+    fn path_candidates_join_soft_wrap() {
+        let term = link_test_term(16, "/home/u/work/report.html");
+        assert_eq!(
+            path_candidates_at(&term, 1, 2).first().map(String::as_str),
+            Some("/home/u/work/report.html")
+        );
+    }
+
+    #[test]
+    fn path_candidates_join_hard_wrapped_tui_lines() {
+        // Claude Code 風：枠線と字下げ付きで自前改行したパス。
+        let term = link_test_term(
+            30,
+            "  見る: /home/u/work/tmp/\r\n  2026-10-18/out.html:12 │",
+        );
+        let from_top = path_candidates_at(&term, 0, 12);
+        assert!(from_top.contains(&"/home/u/work/tmp/2026-10-18/out.html:12".to_owned()));
+        assert!(from_top.contains(&"/home/u/work/tmp/".to_owned()));
+        let from_bottom = path_candidates_at(&term, 1, 4);
+        assert_eq!(
+            from_bottom.first().map(String::as_str),
+            Some("/home/u/work/tmp/2026-10-18/out.html:12")
+        );
+    }
+
+    #[test]
+    fn path_candidates_do_not_join_mid_line_tokens() {
+        let term = link_test_term(40, "see a/b.txt here\r\nnext/line");
+        assert_eq!(path_candidates_at(&term, 0, 5), vec!["a/b.txt".to_owned()]);
+    }
+
+    #[test]
     fn url_at_does_not_open_non_web_osc8_targets() {
         let term = link_test_term(40, "\x1b]8;;file:///tmp/example\x1b\\label\x1b]8;;\x1b\\");
         assert_eq!(url_at(&term, 0, 0), None);
@@ -2187,7 +2354,11 @@ mod tests {
     fn render_split_input(input: &[u8], split: usize) -> String {
         let (writer, _buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
-        let proxy = EventProxy { writer, winsize };
+        let proxy = EventProxy {
+            writer,
+            winsize,
+            bell: Default::default(),
+        };
         let mut term = Term::new(
             Config::default(),
             &GridSize {
@@ -2281,7 +2452,11 @@ mod tests {
     fn run_diagnostic_pipeline(chunks: &[&[u8]]) -> Vec<Utf8Issue> {
         let (writer, _buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
-        let proxy = EventProxy { writer, winsize };
+        let proxy = EventProxy {
+            writer,
+            winsize,
+            bell: Default::default(),
+        };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
             &GridSize {
@@ -3656,7 +3831,11 @@ mod tests {
 
         let (writer, buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(80, 24, 9, 18)));
-        let proxy = EventProxy { writer, winsize };
+        let proxy = EventProxy {
+            writer,
+            winsize,
+            bell: Default::default(),
+        };
 
         let size = GridSize {
             cols: 80,
@@ -3682,6 +3861,7 @@ mod tests {
         let proxy = EventProxy {
             writer,
             winsize: winsize.clone(),
+            bell: Default::default(),
         };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
@@ -3720,7 +3900,11 @@ mod tests {
 
         let (writer, _buf) = dummy_writer();
         let winsize = Arc::new(Mutex::new(window_size(20, 5, 10, 20)));
-        let proxy = EventProxy { writer, winsize };
+        let proxy = EventProxy {
+            writer,
+            winsize,
+            bell: Default::default(),
+        };
         let mut term = Term::new(Config::default(), &GridSize { cols: 20, lines: 5 }, proxy);
         let mut processor: Processor = Processor::new();
 

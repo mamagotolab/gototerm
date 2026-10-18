@@ -25,10 +25,10 @@ use crate::reader::{ReaderHeaderAction, ReaderKeyResult, ReaderPane, ReaderReque
 use crate::recent::RecentProjects;
 use crate::session_review::{SessionReview, SessionReviewOutcome, SessionSummary};
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
-use crate::task_activity::{sanitize_display_text, PaneId};
+use crate::task_activity::{sanitize_display_text, ActivityKind, PaneId};
 use crate::task_overview::{OverviewOutcome, TaskOverview, TaskRow};
-use crate::terminal::{Color, Line};
-use crate::view::{TerminalView, Viewport};
+use crate::terminal::{Cell, Color, Line};
+use crate::view::{PixelRect, TerminalView, Viewport};
 use crate::vt::ShellLocation;
 use crate::window::TerminalWindow;
 use crate::Display;
@@ -36,7 +36,7 @@ use crate::Display;
 type Event = winit::event::Event<()>;
 
 /// 分割の境界に空ける隙間（px）。
-const GAP: u32 = 2;
+const GAP: u32 = 1;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct DpiUpdate {
@@ -370,6 +370,53 @@ fn capture_workspace_location(
                 "リモート接続の配置は保存できません。ローカルの作業セットを保存してください".into(),
             ),
             None => Err("作業フォルダを取得できません。WindowsではOSC 7のシェル統合を設定してから保存してください".into()),
+    }
+}
+
+/// 太さ（bold: 1=太字 / 0=通常 / -1=淡色）を指定した文字セル。
+fn column_cells_styled(text: &str, fg: Color, bg: Color, width: usize, bold: i8) -> Vec<Cell> {
+    let mut cells = crate::launcher::column_cells(text, fg, bg, width);
+    for cell in &mut cells {
+        cell.attr.bold = bold;
+    }
+    cells
+}
+
+/// プロジェクト（フォルダ）ごとに決まる色印。同じ場所のタブは同じ色になる。
+/// 赤・黄は状態表示（警告・許可待ち）と紛れるので使わない。
+fn project_mark_color(path: &Path) -> Color {
+    const PALETTE: [u32; 6] = [
+        0x7AA2F7FF, // 青
+        0xBB9AF7FF, // 紫
+        0x7DCFFFFF, // 水色
+        0x9ECE6AFF, // 緑
+        0x73DACAFF, // 青緑
+        0xFF9E64FF, // 橙
+    ];
+    // FNV-1a。起動ごとに変わらないよう固定のハッシュを使う。
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in path.as_os_str().as_encoded_bytes() {
+        hash = (hash ^ *b as u64).wrapping_mul(0x100000001b3);
+    }
+    Color::Rgb {
+        rgba: PALETTE[(hash % PALETTE.len() as u64) as usize],
+    }
+}
+
+/// タブ内のエージェントの状態をまとめたバッジ。許可待ち＞作業中＞応答終了の順に優先。
+/// 通知が来ていない（NoSignal）ペインは推測しない。
+fn tab_badge(kinds: &[ActivityKind]) -> Option<(&'static str, Color)> {
+    if kinds.contains(&ActivityKind::Blocked) {
+        Some(("▲", Color::Yellow))
+    } else if kinds
+        .iter()
+        .any(|k| matches!(k, ActivityKind::SessionStarted | ActivityKind::FileChanged))
+    {
+        Some(("▸", Color::Cyan))
+    } else if kinds.contains(&ActivityKind::ResponseEnded) {
+        Some(("✓", Color::Green))
+    } else {
+        None
     }
 }
 
@@ -1347,20 +1394,20 @@ mod tests {
                 sidebar: Viewport {
                     x: 0,
                     y: 20,
-                    w: 248,
+                    w: 249,
                     h: 700
                 },
                 preview: Viewport {
-                    x: 252,
+                    x: 251,
                     y: 20,
-                    w: 748,
-                    h: 348
+                    w: 749,
+                    h: 349
                 },
                 terminal: Viewport {
-                    x: 252,
-                    y: 372,
-                    w: 748,
-                    h: 348
+                    x: 251,
+                    y: 371,
+                    w: 749,
+                    h: 349
                 },
             }
         );
@@ -1749,6 +1796,10 @@ pub struct Multiplexer {
     window_focused: bool,
     /// カーソル点滅の起点と現在の表示フェーズ。
     blink_start: Instant,
+    /// 前のフレームで表に出ていたタブ。変わったらフェードインさせる。
+    shown_tab: usize,
+    /// 前のフレームでワークベンチが出ていたか。出た瞬間にフェードインさせる。
+    workbench_shown: bool,
     cursor_blink_on: bool,
     /// ワークベンチの左サイドバー幅・上プレビュー高さの比率（実行時に
     /// Ctrl+Shift+矢印 で変えられる。初期値は config）。
@@ -1836,6 +1887,8 @@ impl Multiplexer {
             occluded: false,
             window_focused: true,
             blink_start: Instant::now(),
+            shown_tab: 0,
+            workbench_shown: false,
             cursor_blink_on: true,
             sidebar_ratio: crate::TOYTERM_CONFIG.sidebar_ratio,
             preview_ratio: crate::TOYTERM_CONFIG.preview_ratio,
@@ -2205,8 +2258,11 @@ impl Multiplexer {
         }
 
         const BAR_BG: Color = Color::Background;
-        let cols = (self.viewport.w / self.status_view.cell_size().w).max(1) as usize;
+        let cell = self.status_view.cell_size();
+        let cols = (self.viewport.w / cell.w).max(1) as usize;
         let mut titles = Vec::new();
+        let mut marks = Vec::new();
+        let mut badges = Vec::new();
         for tab in &mut self.tabs {
             let path = match tab.root.focused_leaf_mut().pane_location() {
                 ShellLocation::Local(path) | ShellLocation::Remote { path, .. } => path,
@@ -2217,8 +2273,16 @@ impl Multiplexer {
                     .filter(|name| !name.is_empty())
                     .unwrap_or_else(|| "shell".into()),
             );
+            marks.push(project_mark_color(&path));
+            let mut kinds = Vec::new();
+            tab.root
+                .for_each_leaf_ref(&mut |w| kinds.push(w.activity().kind));
+            badges.push(tab_badge(&kinds));
         }
-        let signature = format!("{cols}:{}:{titles:?}:{counts:?}", self.focus);
+        let signature = format!(
+            "{cols}:{}:{titles:?}:{counts:?}:{badges:?}:{marks:?}",
+            self.focus
+        );
         if signature == self.status_signature {
             return;
         }
@@ -2230,36 +2294,81 @@ impl Multiplexer {
             0
         };
         let width = (cols / visible).clamp(1, 26);
+        // 選択中のタブは塗りつぶさず、薄い面＋青い下線で示す。
+        let active_bg = Color::Rgb {
+            rgba: (crate::TOYTERM_CONFIG.color_bright_black & 0xFFFF_FF00) | 0x70,
+        };
         let mut cells = Vec::new();
+        let mut overlays = Vec::new();
         for (i, title) in titles.iter().enumerate().skip(first).take(visible) {
             let active = i == self.focus;
-            let bg = if active { Color::BrightBlack } else { BAR_BG };
-            let prefix = if width >= 4 {
-                format!("{}{:02} ", if active { "›" } else { " " }, i + 1)
-            } else {
-                format!("{:02}", i + 1)
+            let bg = if active { active_bg } else { BAR_BG };
+            let x = (cells.len() as u32 * cell.w) as i32;
+            let badge = badges[i];
+            // 先頭1列は色印の場所、末尾2列は状態バッジの場所。
+            // 記号の表示幅を測って場所を取る（全角の記号でも欠けないように）。
+            let badge_w = match badge {
+                Some((mark, _)) if width >= 8 => 1 + crate::launcher::display_width(mark),
+                _ => 0,
             };
-            let prefix_width = width.min(if width >= 4 { 4 } else { 2 });
-            let mut header = crate::launcher::column_cells(
-                &prefix,
-                if active { Color::Cyan } else { Color::White },
-                bg,
-                prefix_width,
-            );
-            if width > prefix_width {
-                header.extend(crate::launcher::column_cells(
-                    title,
-                    Color::White,
+            let number = format!("{:02} ", i + 1);
+            let mut tab_cells = column_cells_styled(" ", Color::White, bg, 1.min(width), 0);
+            if width > 1 {
+                tab_cells.extend(column_cells_styled(
+                    &number,
+                    // 細字（Thin）や暗すぎる色はにじんで見えるので使わない。
+                    // 強弱は通常の太さのまま、色の明るさだけで付ける。
+                    if active { Color::Blue } else { Color::White },
                     bg,
-                    width - prefix_width,
+                    (width - 1).min(3),
+                    0,
                 ));
             }
-            if !active {
-                for cell in &mut header {
-                    cell.attr.bold = -1;
-                }
+            // 状態バッジはタイトルの直後に置く（右端だと隣のタブの印に見える）。
+            if width > 4 + badge_w {
+                let title_w = crate::launcher::display_width(title).min(width - 4 - badge_w);
+                tab_cells.extend(column_cells_styled(
+                    title,
+                    if active {
+                        Color::BrightWhite
+                    } else {
+                        Color::White
+                    },
+                    bg,
+                    title_w,
+                    if active { 1 } else { 0 },
+                ));
             }
-            cells.extend(header);
+            if let Some((mark, color)) = badge.filter(|_| badge_w > 0) {
+                tab_cells.extend(column_cells_styled(" ", color, bg, 1, 0));
+                tab_cells.extend(column_cells_styled(mark, color, bg, badge_w - 1, 0));
+            }
+            tab_cells.resize_with(width, || {
+                crate::launcher::column_cells(" ", Color::White, bg, 1)[0]
+            });
+            if width > 1 {
+                overlays.push((
+                    PixelRect {
+                        x: x + 2,
+                        y: (cell.h / 4) as i32,
+                        w: 3,
+                        h: (cell.h / 2).max(1),
+                    },
+                    marks[i],
+                ));
+            }
+            if active {
+                overlays.push((
+                    PixelRect {
+                        x,
+                        y: cell.h as i32 - 2,
+                        w: width as u32 * cell.w,
+                        h: 2,
+                    },
+                    Color::Blue,
+                ));
+            }
+            cells.extend(tab_cells);
         }
         // 右端にタスク集計（gototask）。優先があれば赤で目立たせる。
         let mut right = Vec::new();
@@ -2276,6 +2385,12 @@ impl Multiplexer {
         }
         let left_cols = cols - right.len();
         cells.truncate(left_cols);
+        // 右端の集計に重なる装飾は切り詰める。
+        let limit = (left_cols as u32 * cell.w) as i32;
+        overlays.retain_mut(|(rect, _)| {
+            rect.w = rect.w.min(limit.saturating_sub(rect.x).max(0) as u32);
+            rect.w > 0
+        });
         cells.resize_with(left_cols, || {
             crate::launcher::column_cells(" ", Color::White, BAR_BG, 1)[0]
         });
@@ -2283,6 +2398,7 @@ impl Multiplexer {
 
         self.status_view.update_contents(|view| {
             view.bg_color = BAR_BG;
+            view.overlays = overlays;
             view.lines = vec![Line::from_cells(cells, false)];
             view.images = Vec::new();
             view.cursor = None;
@@ -3361,6 +3477,7 @@ impl Multiplexer {
 
                 WindowEvent::CursorMoved { position, .. } => {
                     self.cursor_pos = *position;
+                    self.sidebar.on_hover(*position);
                     // どのペインでドラッグ選択しても効くよう、全ペインへ座標を配る。
                     let focus_tab = self.focus;
                     self.tabs[focus_tab]
@@ -3600,6 +3717,36 @@ impl Multiplexer {
                     if let Some(reader) = self.preview_slot.reader_mut() {
                         reader.poll();
                     }
+                }
+
+                // フォーカスの場所を明るさで示す：分割中のフォーカス外ペインと、
+                // ワークベンチ側にフォーカスがあるときの端末を暗くする。
+                {
+                    let focused = self.tabs[self.focus].root.focused_leaf().pane_id();
+                    let mut leaves = 0;
+                    self.tabs[self.focus]
+                        .root
+                        .for_each_leaf_ref(&mut |_| leaves += 1);
+                    let elsewhere =
+                        self.sidebar_focused || self.reader_focused || self.editor_focused;
+                    self.tabs[self.focus].root.for_each_leaf(&mut |w| {
+                        w.set_dimmed(elsewhere || (leaves > 1 && w.pane_id() != focused));
+                    });
+                }
+                if self.sidebar.is_visible() != self.workbench_shown {
+                    self.workbench_shown = self.sidebar.is_visible();
+                    if self.workbench_shown {
+                        self.sidebar.start_fade_in();
+                        if let Some(reader) = self.preview_slot.reader_mut() {
+                            reader.start_fade_in();
+                        }
+                    }
+                }
+                if self.shown_tab != self.focus {
+                    self.shown_tab = self.focus;
+                    self.tabs[self.focus]
+                        .root
+                        .for_each_leaf(&mut |w| w.start_fade_in());
                 }
 
                 // 隠れている間は再描画を要求しない（swap ブロック＝無応答を防ぐ）。

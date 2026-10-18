@@ -1,8 +1,11 @@
 //! ファイル一覧の見た目（アイコン・色・選択バー）をランチャーとサイドバーで
 //! 共有するためのヘルパー。両者の見た目を揃え、今後もズレないようにする。
 //!
-//! アイコンは Nerd Font のグリフ。config で Nerd Font を指定している前提
-//! （無いフォント環境では豆腐になる）。
+//! アイコンは Nerd Font のグリフ。使う字だけを抜き出したフォント
+//! （src/fonts/SymbolsNerdFont-Subset.ttf）を内蔵しているので、OS に Nerd Font が
+//! 無くても出る。アイコンを足すときは、そのフォントにも字を足し直すこと
+//! （fonttools の `pyftsubset SymbolsNerdFont-Regular.ttf --unicodes=U+F062,...
+//! --no-hinting --desubroutinize` で作り直す）。
 
 use crate::terminal::Color;
 

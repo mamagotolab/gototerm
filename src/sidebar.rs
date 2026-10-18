@@ -54,6 +54,8 @@ pub struct Sidebar {
     browse_error: Option<String>,
     browse_scroll: usize,
     row_actions: Vec<Option<RowAction>>,
+    /// ポインターが乗っているクリックできる行（ホバー表示）。
+    hover_row: Option<usize>,
     focused: bool,
     browse_selected: usize,
     /// `/` 検索中の入力文字列（None=非検索）。前方一致で選択がジャンプする。
@@ -104,6 +106,7 @@ impl Sidebar {
             browse_error: None,
             browse_scroll: 0,
             row_actions: Vec::new(),
+            hover_row: None,
             focused: false,
             browse_selected: 0,
             search: None,
@@ -185,6 +188,42 @@ impl Sidebar {
             .expect("workbench view initialized")
             .cell_size()
             .h
+    }
+
+    /// ポインターの移動。クリックできる行に乗ったら、選択（青）より弱い
+    /// 薄い帯で示す。キーボードの選択は動かさない。行が変わったときだけ描き直す。
+    pub fn on_hover(&mut self, p: PhysicalPosition<f64>) {
+        let row = if self.contains(p) {
+            let viewport = self.view.viewport();
+            let row = click_row(viewport, self.cell_height(), p);
+            sidebar_action_at(&self.row_actions, row).map(|_| row)
+        } else {
+            None
+        };
+        if row == self.hover_row {
+            return;
+        }
+        self.hover_row = row;
+        let Some(view) = self.view.get_mut() else {
+            return;
+        };
+        let (cell_h, width) = (view.cell_size().h, view.viewport().w);
+        let overlays = row
+            .map(|row| {
+                vec![(
+                    crate::view::PixelRect {
+                        x: 0,
+                        y: (row as u32 * cell_h) as i32,
+                        w: width,
+                        h: cell_h,
+                    },
+                    Color::Rgb {
+                        rgba: (crate::TOYTERM_CONFIG.color_bright_black & 0xFFFF_FF00) | 0x50,
+                    },
+                )]
+            })
+            .unwrap_or_default();
+        view.update_contents(|view| view.overlays = overlays);
     }
 
     pub fn on_click(&mut self, p: PhysicalPosition<f64>) -> Option<SidebarRequest> {
@@ -711,6 +750,11 @@ impl Sidebar {
                 .expect("workbench view initialized")
                 .draw(surface);
         }
+    }
+
+    /// ワークベンチを開いたときのフェードイン。
+    pub fn start_fade_in(&mut self) {
+        self.view.start_fade_in();
     }
 
     pub fn needs_redraw(&self) -> bool {

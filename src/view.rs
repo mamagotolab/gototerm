@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::Instant;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
 
 use crate::cache::GlyphCache;
@@ -252,7 +253,7 @@ impl LazyTerminalView {
 
     pub(crate) fn ensure_initialized(&mut self) -> bool {
         let display = self.display.clone();
-        self.state.ensure_with(|spec| {
+        let created = self.state.ensure_with(|spec| {
             log::debug!("initializing lazy workbench terminal view");
             TerminalView::with_viewport(
                 display,
@@ -261,7 +262,19 @@ impl LazyTerminalView {
                 spec.scale_factor,
                 spec.scroll_bar,
             )
-        })
+        });
+        // 初めて開いたときも、2回目以降（start_fade_in）と同じく浮かび上がらせる。
+        if created {
+            self.start_fade_in();
+        }
+        created
+    }
+
+    /// 開いたときのフェードイン。まだ作られていなければ作るときに付く。
+    pub(crate) fn start_fade_in(&mut self) {
+        if let Some(view) = self.get_mut() {
+            view.start_fade_in();
+        }
     }
 
     pub(crate) fn is_initialized(&self) -> bool {
@@ -432,6 +445,9 @@ mod lazy_tests {
 
 pub struct TerminalView {
     pub(crate) hint_labels: Vec<(usize, usize, String)>,
+    /// セル背景の上・文字の下に重ねる矩形（ビュー内のピクセル座標）。タブの
+    /// 下線や色印、行のホバーなど、セル単位では描けない細い装飾に使う。
+    pub(crate) overlays: Vec<(PixelRect, Color)>,
     fonts: FontSet,
     cache: GlyphCache,
     logical_font_size: u32,
@@ -445,6 +461,9 @@ pub struct TerminalView {
     pub cursor: Option<Cursor>,
     // IME 変換中（未確定）の文字列。確定すると空になる。
     pub preedit: String,
+    /// IME が伝えてきた変換中文字列内の編集位置（バイト位置の範囲）。
+    /// 範囲なら青い下線、同じ位置なら細い縦線で示す。
+    pub preedit_cursor: Option<(usize, usize)>,
     pub selection_range: Option<Selection>,
     pub scroll_bar: Option<(u32, u32)>,
     pub bg_color: Color,
@@ -454,6 +473,11 @@ pub struct TerminalView {
     /// ターミナルは透過がこのクアッド由来なので false のまま。
     pub skip_default_bg: bool,
     pub view_focused: bool,
+    /// 余白込みのペイン枠。Some のとき背景をこの矩形に（角丸で）塗り、
+    /// 文字は内側の viewport に描く。None なら viewport を背景で塗る。
+    pub frame: Option<Viewport>,
+    pub corner_radius: f32,
+    effects: Effects,
     // カーソル点滅の表示フェーズ。false の間はカーソルを描かない。
     cursor_blink_on: bool,
     updated: bool,
@@ -473,6 +497,79 @@ pub struct TerminalView {
     draw_queries_scaled: Vec<DrawQuery<CellVertex>>,
     draw_queries_img: Vec<DrawQuery<ImageVertex>>,
     clock: std::time::Instant,
+}
+
+const DIM_MS: f32 = 160.0;
+const FADE_MS: f32 = 320.0;
+const FLASH_MS: f32 = 220.0;
+const CURSOR_MS: f32 = 160.0;
+const POPUP_MS: f32 = 130.0;
+
+/// 時間で変わる見た目の効果。値は描画時に経過時間から計算し、シェーダーの
+/// uniform として渡す（頂点を組み直さないので軽い）。動いている間だけ再描画する。
+#[derive(Default)]
+struct Effects {
+    dim_from: f32,
+    dim_to: f32,
+    dim_start: Option<Instant>,
+    fade_start: Option<Instant>,
+    flash_start: Option<Instant>,
+    /// カーソルの残像：直前の表示位置（ピクセル）から現在位置へ滑らせる。
+    cursor_from: (f32, f32),
+    cursor_start: Option<Instant>,
+    cursor_cell: Option<(usize, usize)>,
+    /// 出現アニメーション中のポップアップ（ビュー内ピクセル）と開始時刻。
+    popup: Option<(PixelRect, Instant)>,
+}
+
+/// 0..1 の進み具合。終わっていれば None。
+fn progress(start: Option<Instant>, ms: f32, now: Instant) -> Option<f32> {
+    let t = now.saturating_duration_since(start?).as_secs_f32() * 1000.0 / ms;
+    (t < 1.0).then_some(t)
+}
+
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t).powi(3)
+}
+
+impl Effects {
+    fn dim(&self, now: Instant) -> f32 {
+        match progress(self.dim_start, DIM_MS, now) {
+            Some(t) => self.dim_from + (self.dim_to - self.dim_from) * ease_out(t),
+            None => self.dim_to,
+        }
+    }
+
+    fn fade(&self, now: Instant) -> f32 {
+        progress(self.fade_start, FADE_MS, now).map_or(0.0, |t| 0.6 * (1.0 - ease_out(t)))
+    }
+
+    fn flash(&self, now: Instant) -> f32 {
+        progress(self.flash_start, FLASH_MS, now).map_or(0.0, |t| 0.18 * (1.0 - t))
+    }
+
+    /// 残像の現在位置。動き終わっていれば None。
+    fn cursor_ghost(&self, to: (f32, f32), now: Instant) -> Option<(f32, f32, f32)> {
+        let t = progress(self.cursor_start, CURSOR_MS, now)?;
+        let e = ease_out(t);
+        let (fx, fy) = self.cursor_from;
+        Some((fx + (to.0 - fx) * e, fy + (to.1 - fy) * e, 1.0 - t))
+    }
+
+    fn animating(&self, now: Instant) -> bool {
+        progress(self.dim_start, DIM_MS, now).is_some()
+            || progress(self.fade_start, FADE_MS, now).is_some()
+            || progress(self.flash_start, FLASH_MS, now).is_some()
+            || progress(self.cursor_start, CURSOR_MS, now).is_some()
+            || progress(self.popup.map(|(_, at)| at), POPUP_MS, now).is_some()
+    }
+
+    /// (ずらす量 px, 不透明度)。動き終わっていれば None。
+    fn popup_motion(&self, now: Instant) -> Option<(PixelRect, f32, f32)> {
+        let (rect, at) = self.popup?;
+        let e = ease_out(progress(Some(at), POPUP_MS, now)?);
+        Some((rect, 8.0 * (1.0 - e), e))
+    }
 }
 
 struct DrawQuery<V: glium::vertex::Vertex> {
@@ -549,12 +646,17 @@ impl TerminalView {
             images: Vec::new(),
             cursor: None,
             preedit: String::new(),
+            preedit_cursor: None,
             selection_range: None,
             hint_labels: Vec::new(),
+            overlays: Vec::new(),
             scroll_bar,
             bg_color: Color::Black,
             skip_default_bg: false,
             view_focused: false,
+            frame: None,
+            corner_radius: 0.0,
+            effects: Effects::default(),
             cursor_blink_on: true,
             updated: false,
 
@@ -585,7 +687,85 @@ impl TerminalView {
     /// 変化が無いフレームでスワップしないことで、ウィンドウが隠れたときの
     /// 「コンポジタ待ちでスワップがブロック→無応答」を防ぐ。
     pub fn needs_redraw(&self) -> bool {
-        self.updated
+        self.updated || self.effects.animating(Instant::now())
+    }
+
+    /// 非アクティブなペインとして暗くするか。切り替えは短くフェードする。
+    pub fn set_dimmed(&mut self, dimmed: bool) {
+        let to = if dimmed {
+            crate::TOYTERM_CONFIG.inactive_dim.clamp(0.0, 0.9)
+        } else {
+            0.0
+        };
+        if self.effects.dim_to != to {
+            let now = Instant::now();
+            self.effects.dim_from = self.effects.dim(now);
+            self.effects.dim_to = to;
+            self.effects.dim_start = Some(now);
+        }
+    }
+
+    /// タブを切り替えて表に出たときの、暗い所からのフェードイン。
+    pub fn start_fade_in(&mut self) {
+        if crate::TOYTERM_CONFIG.animations {
+            self.effects.fade_start = Some(Instant::now());
+        }
+    }
+
+    /// ポップアップの枠（影込み）を伝える。新しく出たときだけ、少し下から
+    /// フェードしながら持ち上がる動きを付ける。None で消えたことを伝える。
+    pub(crate) fn set_popup_rect(&mut self, rect: Option<PixelRect>) {
+        match (rect, self.effects.popup) {
+            (None, _) => self.effects.popup = None,
+            (Some(_), Some(_)) => {}
+            (Some(rect), None) if crate::TOYTERM_CONFIG.animations => {
+                self.effects.popup = Some((rect, Instant::now()));
+            }
+            (Some(rect), None) => {
+                // 動かさない設定でも「出ている」ことは覚えておく（開始時刻を過去に）。
+                let past = Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(1))
+                    .unwrap_or_else(Instant::now);
+                self.effects.popup = Some((rect, past));
+            }
+        }
+    }
+
+    /// ベル（BEL）を画面の一瞬の光で知らせる。
+    pub fn flash(&mut self) {
+        self.effects.flash_start = Some(Instant::now());
+    }
+
+    /// カーソルのセル位置が変わったら、前の表示位置から残像を滑らせる。
+    fn track_cursor(&mut self, now: Instant) {
+        let cell = self.cursor.map(|c| (c.row, c.col));
+        if cell == self.effects.cursor_cell {
+            return;
+        }
+        let prev = self.effects.cursor_cell;
+        self.effects.cursor_cell = cell;
+        let (Some((r0, c0)), Some(_)) = (prev, cell) else {
+            return;
+        };
+        if !crate::TOYTERM_CONFIG.cursor_animation {
+            return;
+        }
+        let cs = self.cell_size;
+        let from = (c0 as f32 * cs.w as f32, r0 as f32 * cs.h as f32);
+        // 動いている途中ならその地点から（連打でも残像が飛ばない）。
+        let from = self
+            .effects
+            .cursor_ghost(self.cursor_px(), now)
+            .map_or(from, |(x, y, _)| (x, y));
+        self.effects.cursor_from = from;
+        self.effects.cursor_start = Some(now);
+    }
+
+    fn cursor_px(&self) -> (f32, f32) {
+        let cs = self.cell_size;
+        self.cursor.map_or((0.0, 0.0), |c| {
+            (c.col as f32 * cs.w as f32, c.row as f32 * cs.h as f32)
+        })
     }
 
     /// カーソル点滅の表示フェーズを切り替える。変化したときだけ再描画を促す。
@@ -705,7 +885,9 @@ impl TerminalView {
         self.draw_queries_scaled.clear();
 
         // clear entire screen
-        {
+        // 枠があるときは draw() が枠ごと塗るので不要（ここで黒を重ねると、
+        // セルが覆わない端数の帯だけ色と透け具合が変わって見える）。
+        if self.frame.is_none() {
             let rect = GlRect {
                 x: -1.0,
                 y: 1.0,
@@ -724,21 +906,13 @@ impl TerminalView {
             if config.scroll_bar_width > 0 {
                 let sb_width = config.scroll_bar_width;
 
-                let mut rect = PixelRect {
+                // 溝（トラック）は描かず、つまみだけを置く。
+                let rect = PixelRect {
                     x: viewport.w.saturating_sub(sb_width) as i32,
-                    y: 0,
+                    y: sb_origin as i32,
                     w: sb_width,
-                    h: viewport.h,
+                    h: sb_length,
                 };
-                let fg = Color::White;
-                let bg = Color::Rgb {
-                    rgba: config.scroll_bar_bg_color,
-                };
-                let vs = rect_vertices(rect.to_gl(viewport), fg, bg);
-                self.vertices_bg.extend_from_slice(&vs);
-
-                rect.y = sb_origin as i32;
-                rect.h = sb_length;
                 let fg = Color::White;
                 let bg = Color::Rgb {
                     rgba: config.scroll_bar_fg_color,
@@ -961,6 +1135,11 @@ impl TerminalView {
             baseline += cell_size.h;
         }
 
+        for (rect, color) in &self.overlays {
+            let vs = rect_vertices(rect.to_gl(viewport), *color, *color);
+            self.vertices_bg.extend_from_slice(&vs);
+        }
+
         if let Some(cursor) = self.cursor {
             if self.view_focused
                 && self.cursor_blink_on
@@ -1034,12 +1213,36 @@ impl TerminalView {
                     rgba: color_to_rgba(self.bg_color) | 0x0000_00FF,
                 };
 
-                for ch in self.preedit.chars() {
+                let accent = Color::Blue;
+                let caret_at = |x: u32, vertices: &mut Vec<CellVertex>| {
+                    let caret = PixelRect {
+                        x: x.saturating_sub(1) as i32,
+                        y: (row * cell_size.h) as i32,
+                        w: 2,
+                        h: cell_size.h,
+                    };
+                    vertices.extend_from_slice(&rect_vertices(
+                        caret.to_gl(viewport),
+                        accent,
+                        accent,
+                    ));
+                };
+                let mut caret_x = None;
+                for (byte, ch) in self.preedit.char_indices() {
                     let ch_width = UnicodeWidthChar::width(ch).unwrap_or(0);
                     if ch_width == 0 {
                         continue;
                     }
                     let cell_width_px = cell_size.w * ch_width as u32;
+                    let in_range = self
+                        .preedit_cursor
+                        .is_some_and(|(start, end)| start < end && start <= byte && byte < end);
+                    if self
+                        .preedit_cursor
+                        .is_some_and(|(start, end)| start == end && start == byte)
+                    {
+                        caret_x = Some(leftline);
+                    }
 
                     // 背景（下の既存文字・カーソルブロックを不透明に塗りつぶす）
                     let rect = PixelRect {
@@ -1052,13 +1255,16 @@ impl TerminalView {
                     self.vertices_fg.extend_from_slice(&vs);
 
                     // 下線（変換中の目印）
+                    // 編集中の範囲は太めの青い下線にして、どこを変換しているか示す。
+                    let thick = if in_range { 3 } else { 2 };
+                    let line_color = if in_range { accent } else { fg };
                     let underline = PixelRect {
                         x: leftline as i32,
-                        y: ((row + 1) * cell_size.h) as i32 - 2,
+                        y: ((row + 1) * cell_size.h) as i32 - thick as i32,
                         w: cell_width_px,
-                        h: 2,
+                        h: thick,
                     };
-                    let vs = rect_vertices(underline.to_gl(viewport), fg, fg);
+                    let vs = rect_vertices(underline.to_gl(viewport), line_color, line_color);
                     self.vertices_fg.extend_from_slice(&vs);
 
                     // グリフ
@@ -1082,6 +1288,16 @@ impl TerminalView {
                     }
 
                     leftline += cell_width_px;
+                }
+                // 末尾にいる縦線（バイト位置が文字列の長さ）も描く。
+                if self
+                    .preedit_cursor
+                    .is_some_and(|(start, end)| start == end && start >= self.preedit.len())
+                {
+                    caret_x = Some(leftline);
+                }
+                if let Some(x) = caret_x {
+                    caret_at(x, &mut self.vertices_fg);
                 }
             }
         }
@@ -1116,11 +1332,46 @@ impl TerminalView {
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
+        let now = Instant::now();
         if self.updated {
             self.rebuild_draw_queries();
+            self.track_cursor(now);
         }
 
         let elapsed = self.clock.elapsed().as_millis() as f32;
+        let (fw, fh) = self.display.get_framebuffer_dimensions();
+        let frame = self.frame.unwrap_or(self.viewport);
+        let frame_gl = frame.to_glium_rect(PhysicalSize::new(fw, fh));
+        let frame_rect = [
+            frame_gl.left as f32,
+            frame_gl.bottom as f32,
+            frame_gl.width as f32,
+            frame_gl.height as f32,
+        ];
+        let screen = [fw as f32, fh as f32];
+        let radius = if self.frame.is_some() {
+            self.corner_radius
+        } else {
+            0.0
+        };
+        let dim = 1.0 - (1.0 - self.effects.dim(now)) * (1.0 - self.effects.fade(now));
+        let flash = self.effects.flash(now);
+        let effect: i32 = match crate::TOYTERM_CONFIG.post_effect.as_str() {
+            "crt" => 1,
+            _ => 0,
+        };
+        // ポップアップの出現：枠の中の頂点だけを下へずらし、薄く描く。
+        let (pop_rect, pop_shift, pop_alpha) = match self.effects.popup_motion(now) {
+            Some((rect, shift_px, alpha)) => {
+                let gl = rect.to_gl(self.viewport);
+                (
+                    [gl.x, gl.y - gl.h, gl.x + gl.w, gl.y],
+                    -(shift_px / self.viewport.h.max(1) as f32) * 2.0,
+                    alpha,
+                )
+            }
+            None => ([0.0f32, 0.0, -1.0, -1.0], 0.0f32, 1.0f32),
+        };
 
         const TRIANGLES: index::NoIndices = index::NoIndices(index::PrimitiveType::TrianglesList);
 
@@ -1138,12 +1389,84 @@ impl TerminalView {
             let g = ((bg >> 16) & 0xff) as f32 / 255.0;
             let b = ((bg >> 8) & 0xff) as f32 / 255.0;
             let a = (bg & 0xff) as f32 / 255.0;
-            // 自分のビューポート矩形だけをクリアする。複数ペインが1つの
-            // フレームバッファを分け合うため全体クリアは使えない（他ペインを
-            // 消す）。枠の隙間はマネージャ側がフレーム全体クリアで塗る。
-            let (fw, fh) = self.display.get_framebuffer_dimensions();
-            let rect = self.viewport.to_glium_rect(PhysicalSize::new(fw, fh));
-            surface.clear(Some(&rect), Some((r, g, b, a)), true, None, None);
+            if self.frame.is_none() {
+                // 自分のビューポート矩形だけをクリアする。複数ペインが1つの
+                // フレームバッファを分け合うため全体クリアは使えない（他ペインを
+                // 消す）。枠の隙間はマネージャ側がフレーム全体クリアで塗る。
+                let rect = self.viewport.to_glium_rect(PhysicalSize::new(fw, fh));
+                surface.clear(Some(&rect), Some((r, g, b, a)), true, None, None);
+            } else if let Some(texture) = self.any_texture() {
+                // 枠（余白込み）を背景色で塗る。clear と同じく合成せずそのまま書く
+                // （ブレンドすると下地の不透明な黒と混ざって透過が消える）。角丸の
+                // 外はシェーダーが捨てるので、マネージャが塗った隙間の色が残る。
+                let _ = (r, g, b, a);
+                let vs = rect_vertices(
+                    PixelRect {
+                        x: 0,
+                        y: 0,
+                        w: frame.w,
+                        h: frame.h,
+                    }
+                    .to_gl(frame),
+                    self.bg_color,
+                    self.bg_color,
+                );
+                let vb = glium::VertexBuffer::new(&self.display, &vs).unwrap();
+                let mut params = glium::DrawParameters {
+                    viewport: Some(frame_gl),
+                    ..glium::DrawParameters::default()
+                };
+                let uniforms = uniform! {
+                    tex: texture.sampled(), timestamp: elapsed, frame_rect: frame_rect,
+                    screen: screen, radius: radius, dim: dim, flash: flash, effect: effect,
+                    pop_rect: pop_rect, pop_shift: pop_shift, pop_alpha: pop_alpha,
+                };
+                surface
+                    .draw(&vb, TRIANGLES, &self.program_cell, &uniforms, &params)
+                    .expect("draw frame");
+                // 文字の領域は既定背景のセルを下地に重ねて塗るので、余白にも同じ
+                // 重ね塗りをして継ぎ目（色と透け具合の段差）を出さない。
+                // 文字の領域の上は各セルが塗るので、余白の4辺だけに重ねる。
+                if !self.skip_default_bg {
+                    let left = self.viewport.x.saturating_sub(frame.x);
+                    let top = self.viewport.y.saturating_sub(frame.y);
+                    // セルが実際に覆う範囲（ビューポートの端数はセルが塗らない）。
+                    let cs = self.cell_size;
+                    let cols = self.lines.first().map_or(0, |l| l.columns()) as u32;
+                    let grid_w = (cols * cs.w).min(self.viewport.w);
+                    let grid_h = (self.lines.len() as u32 * cs.h).min(self.viewport.h);
+                    let right = (frame.x + frame.w).saturating_sub(self.viewport.x + grid_w);
+                    let bottom = (frame.y + frame.h).saturating_sub(self.viewport.y + grid_h);
+                    let strips = [
+                        (0, 0, frame.w, top),
+                        (0, frame.h - bottom, frame.w, bottom),
+                        (0, top, left, frame.h - top - bottom),
+                        (frame.w - right, top, right, frame.h - top - bottom),
+                    ];
+                    let vs: Vec<CellVertex> = strips
+                        .iter()
+                        .filter(|(_, _, w, h)| *w > 0 && *h > 0)
+                        .flat_map(|&(x, y, w, h)| {
+                            rect_vertices(
+                                PixelRect {
+                                    x: x as i32,
+                                    y: y as i32,
+                                    w,
+                                    h,
+                                }
+                                .to_gl(frame),
+                                Color::Background,
+                                Color::Background,
+                            )
+                        })
+                        .collect();
+                    let vb = glium::VertexBuffer::new(&self.display, &vs).unwrap();
+                    params.blend = glium::Blend::alpha_blending();
+                    surface
+                        .draw(&vb, TRIANGLES, &self.program_cell, &uniforms, &params)
+                        .expect("draw frame background");
+                }
+            }
         }
 
         // 通常の文字は等倍なので Nearest（にじみを抑えて輪郭をくっきりさせる）。
@@ -1167,7 +1490,11 @@ impl TerminalView {
                     .magnify_filter(uniforms::MagnifySamplerFilter::Nearest)
                     .minify_filter(uniforms::MinifySamplerFilter::Nearest)
             };
-            let uniforms = uniform! { tex: sampler, timestamp: elapsed };
+            let uniforms = uniform! {
+                tex: sampler, timestamp: elapsed, frame_rect: frame_rect,
+                screen: screen, radius: radius, dim: dim, flash: flash, effect: effect,
+                    pop_rect: pop_rect, pop_shift: pop_shift, pop_alpha: pop_alpha,
+            };
 
             surface
                 .draw(
@@ -1198,6 +1525,52 @@ impl TerminalView {
                 )
                 .expect("draw image");
         }
+
+        // カーソルの残像：半透明のブロックが前の位置から今の位置へ滑る。
+        if self.view_focused && self.cursor_blink_on && self.cursor.is_some() {
+            if let (Some((x, y, life)), Some(texture)) = (
+                self.effects.cursor_ghost(self.cursor_px(), now),
+                self.any_texture(),
+            ) {
+                // アルファ0の白は Special（虹色）と同じ値になるので最低1を残す。
+                let alpha = ((life * 0xB0 as f32) as u32).max(1);
+                let color = Color::Rgb {
+                    rgba: (crate::TOYTERM_CONFIG.color_foreground & 0xFFFF_FF00) | alpha,
+                };
+                let cs = self.cell_size;
+                let vp = self.viewport;
+                let gl = GlRect {
+                    x: (x / vp.w as f32) * 2.0 - 1.0,
+                    y: -(y / vp.h as f32) * 2.0 + 1.0,
+                    w: (cs.w as f32 / vp.w as f32) * 2.0,
+                    h: (cs.h as f32 / vp.h as f32) * 2.0,
+                };
+                let vs = rect_vertices(gl, color, color);
+                let vb = glium::VertexBuffer::new(&self.display, &vs).unwrap();
+                let uniforms = uniform! {
+                    tex: texture.sampled(), timestamp: elapsed, frame_rect: frame_rect,
+                    screen: screen, radius: radius, dim: dim, flash: flash, effect: effect,
+                    pop_rect: pop_rect, pop_shift: pop_shift, pop_alpha: pop_alpha,
+                };
+                surface
+                    .draw(
+                        &vb,
+                        TRIANGLES,
+                        &self.program_cell,
+                        &uniforms,
+                        &self.draw_params,
+                    )
+                    .expect("draw cursor ghost");
+            }
+        }
+    }
+
+    /// シェーダーの tex に渡す何らかのテクスチャ（背景だけの描画では参照されない）。
+    fn any_texture(&self) -> Option<Rc<texture::Texture2d>> {
+        self.draw_queries_bg
+            .first()
+            .or(self.draw_queries_fg.first())
+            .map(|q| q.texture.clone())
     }
 }
 
@@ -1270,6 +1643,17 @@ fn build_font_set(font_size: u32) -> FontSet {
             0,
         );
         fonts.add(FontStyle::Faint, faint_font);
+
+        // サイドバー/ランチャーのファイルアイコン（Nerd Font の私用領域の字）だけを
+        // 抜き出した小さなフォント。OS に Nerd Font が無い環境（Windows 等）でも
+        // 豆腐（□）にならず、どの OS でも同じ形で出る。
+        for style in [FontStyle::Regular, FontStyle::Bold, FontStyle::Faint] {
+            let icons = Font::from_memory(
+                embedded_font_data(include_bytes!("fonts/SymbolsNerdFont-Subset.ttf")),
+                0,
+            );
+            fonts.add(style, icons);
+        }
     }
 
     // 最後の砦：OS に入っている日本語フォント。
@@ -1442,6 +1826,58 @@ fn color_to_rgba(color: Color) -> u32 {
         Color::Foreground => config.color_foreground,
         Color::Background => config.color_background,
         Color::Selection => config.color_selection,
+    }
+}
+
+/// ポップアップ（セル単位の枠 x0, y0, w, h）の右下に落とす影。濃さの違う2層を
+/// ずらして重ね、ぼかし処理なしで柔らかく見せる。枠の外側だけに置く。
+pub(crate) fn popup_shadow(
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    cell: CellSize,
+) -> Vec<(PixelRect, Color)> {
+    let (left, top) = ((x0 as u32 * cell.w) as i32, (y0 as u32 * cell.h) as i32);
+    let (right, bottom) = (left + (w as u32 * cell.w) as i32, top + (h as u32 * cell.h) as i32);
+    let mut out = Vec::new();
+    for (off, alpha) in [(4u32, 0x70u32), (9, 0x38)] {
+        let color = Color::Rgb { rgba: alpha };
+        out.push((
+            PixelRect {
+                x: right,
+                y: top + off as i32,
+                w: off,
+                h: (bottom - top) as u32,
+            },
+            color,
+        ));
+        out.push((
+            PixelRect {
+                x: left + off as i32,
+                y: bottom,
+                w: (right - left) as u32,
+                h: off,
+            },
+            color,
+        ));
+    }
+    out
+}
+
+/// ポップアップの枠に影の分を足した矩形（出現アニメーションの対象範囲）。
+pub(crate) fn popup_rect_with_shadow(
+    x0: usize,
+    y0: usize,
+    w: usize,
+    h: usize,
+    cell: CellSize,
+) -> PixelRect {
+    PixelRect {
+        x: (x0 as u32 * cell.w) as i32,
+        y: (y0 as u32 * cell.h) as i32,
+        w: w as u32 * cell.w + 9,
+        h: h as u32 * cell.h + 9,
     }
 }
 

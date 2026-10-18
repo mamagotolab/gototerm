@@ -112,6 +112,11 @@ impl ReaderPane {
             .draw(surface);
     }
 
+    /// ワークベンチを開いたときのフェードイン。
+    pub fn start_fade_in(&mut self) {
+        self.view.start_fade_in();
+    }
+
     pub fn needs_redraw(&self) -> bool {
         self.view.get().is_some_and(|view| view.needs_redraw())
     }

@@ -360,6 +360,26 @@ fn report_mouse_to_app(mouse_mode: bool, shift: bool, ctrl_url: bool) -> bool {
     mouse_mode && !shift && !ctrl_url
 }
 
+/// 枠を四辺 `padding` px ずつ縮めた文字領域。小さすぎる枠では余白を詰める。
+fn inset_viewport(vp: Viewport, padding: u32) -> Viewport {
+    let p = padding.min(vp.w / 4).min(vp.h / 4);
+    Viewport {
+        x: vp.x + p,
+        y: vp.y + p,
+        w: vp.w - 2 * p,
+        h: vp.h - 2 * p,
+    }
+}
+
+/// スクロールバーのつまみの (上端, 長さ) をピクセルで。offset=0 が最下部。
+fn scroll_bar_geometry(offset: usize, history: usize, screen: usize, height: u32) -> (u32, u32) {
+    let total = (history + screen).max(1) as u64;
+    let h = height as u64;
+    let len = (h * screen as u64 / total).clamp(8.min(h), h);
+    let top = (h - len) * (history - offset.min(history)) as u64 / history.max(1) as u64;
+    (top as u32, len as u32)
+}
+
 fn known_local_cwd(location: Option<ShellLocation>) -> Option<PathBuf> {
     match location {
         Some(ShellLocation::Local(cwd)) => Some(cwd),
@@ -368,7 +388,7 @@ fn known_local_cwd(location: Option<ShellLocation>) -> Option<PathBuf> {
 }
 
 fn resolve_hint_file(token: &str, location: Option<ShellLocation>) -> Option<PathBuf> {
-    resolve_existing_file_token(token, &known_local_cwd(location)?)
+    resolve_clicked_file(token, &known_local_cwd(location)?)
 }
 
 fn is_link_token_char(c: char) -> bool {
@@ -387,6 +407,33 @@ fn looks_like_path(token: &str) -> bool {
 
 fn resolve_existing_file_token(token: &str, cwd: &Path) -> Option<PathBuf> {
     resolve_path_token(token, cwd).filter(|path| path.is_file())
+}
+
+/// クリックされたトークンを実在ファイルに解決する。`path:12` / `path:12:5` の
+/// 行・列番号（Claude Code やコンパイラの出力形式）は外して探す。
+fn resolve_clicked_file(token: &str, cwd: &Path) -> Option<PathBuf> {
+    if let Some(path) = resolve_existing_file_token(token, cwd) {
+        return Some(path);
+    }
+    let mut rest = token;
+    for _ in 0..2 {
+        let (head, tail) = rest.rsplit_once(':')?;
+        if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit()) {
+            return None;
+        }
+        rest = head;
+        if let Some(path) = resolve_existing_file_token(rest, cwd) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// 拡張子が `exts` に含まれるか（大文字小文字は区別しない）。
+fn opens_externally(path: &Path, exts: &[String]) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| exts.iter().any(|x| x.eq_ignore_ascii_case(e)))
 }
 
 pub(crate) fn resolve_path_token(token: &str, cwd: &Path) -> Option<PathBuf> {
@@ -533,6 +580,8 @@ pub struct TerminalWindow {
     /// （Windows では確定 Enter が Commit とキー入力の両方で来る）。
     last_ime_commit: std::time::Instant,
     clicked_file: Option<PathBuf>,
+    scroll_offset: usize,
+    scrolled_at: Option<std::time::Instant>,
 }
 
 /// viewport とフォントから端末セル数を求めて VtTerminal を作る。
@@ -630,6 +679,8 @@ impl TerminalWindow {
             },
             last_ime_commit: std::time::Instant::now() - std::time::Duration::from_secs(10),
             clicked_file: None,
+            scroll_offset: 0,
+            scrolled_at: None,
             link_hints: None,
             tui_copy: None,
             copy_snapshot: None,
@@ -678,6 +729,10 @@ impl TerminalWindow {
             return true;
         }
 
+        if self.terminal.take_bell() && crate::TOYTERM_CONFIG.visual_bell {
+            self.view.flash();
+        }
+
         let (cols, rows) = self.terminal.size();
 
         // 画面が変わったときだけ alacritty のグリッドを取り込んで描画を更新する。
@@ -707,8 +762,8 @@ impl TerminalWindow {
                 // 変換候補ウィンドウをカーソルのセル位置に出す（over-the-spot）。
                 // フォーカス中のペインだけが IME 位置を更新する。
                 self.set_ime_area(
-                    self.viewport().x + cursor.col as u32 * cell_size.w,
-                    self.viewport().y + cursor.row as u32 * cell_size.h,
+                    self.view.viewport().x + cursor.col as u32 * cell_size.w,
+                    self.view.viewport().y + cursor.row as u32 * cell_size.h,
                     cell_size.w,
                     cell_size.h,
                 );
@@ -718,11 +773,11 @@ impl TerminalWindow {
                 view.lines = snapshot.lines;
                 view.cursor = snapshot.cursor;
                 view.images = snapshot.images;
-                view.scroll_bar = None;
                 view.view_focused = self.focused;
             });
         }
 
+        self.update_scroll_bar();
         self.drive_copy_scroll();
         let new_selection_range = if let Some(copy) = &self.tui_copy {
             copy.selection().and_then(|(a, b, block)| {
@@ -779,8 +834,18 @@ impl TerminalWindow {
         self.view.draw(surface);
     }
 
+    /// 余白込みのペイン枠（レイアウトとヒット判定用）。文字の領域は view.viewport()。
     pub fn viewport(&self) -> Viewport {
-        self.view.viewport()
+        self.view.frame.unwrap_or_else(|| self.view.viewport())
+    }
+
+    /// 分割時のフォーカス外ペインとして暗くするか。
+    pub fn set_dimmed(&mut self, dimmed: bool) {
+        self.view.set_dimmed(dimmed);
+    }
+
+    pub fn start_fade_in(&mut self) {
+        self.view.start_fade_in();
     }
 
     /// このペインのシェルの現在の作業ディレクトリ（取れない環境では None）。
@@ -825,7 +890,13 @@ impl TerminalWindow {
 
     pub fn set_viewport(&mut self, new_viewport: Viewport) {
         log::debug!("viewport changed: {:?}", new_viewport);
-        self.view.set_viewport(new_viewport);
+        let config = &crate::TOYTERM_CONFIG;
+        let inner = inset_viewport(new_viewport, config.padding);
+        self.view.update_contents(|view| {
+            view.frame = (inner != new_viewport).then_some(new_viewport);
+            view.corner_radius = config.corner_radius as f32;
+        });
+        self.view.set_viewport(inner);
         self.resize_buffer();
         self.update_ime_position();
     }
@@ -884,7 +955,7 @@ impl TerminalWindow {
 
     fn mouse_cell(&self) -> Option<(usize, usize)> {
         let CursorPosition { x, y } = self.mouse.cursor_pos;
-        let viewport = self.viewport();
+        let viewport = self.view.viewport();
         if x < 0.0 || y < 0.0 || x >= viewport.w as f64 || y >= viewport.h as f64 {
             return None;
         }
@@ -929,17 +1000,49 @@ impl TerminalWindow {
             return;
         }
         if ctrl {
-            let Some(token) = self.token_at(row, col) else {
-                return;
-            };
             let cwd = self
                 .terminal
                 .cwd()
                 .or_else(|| std::env::current_dir().ok())
                 .unwrap_or_else(|| PathBuf::from("."));
-            if let Some(path) = resolve_existing_file_token(&token, &cwd) {
-                self.clicked_file = Some(path);
-            }
+            let Some(path) = self
+                .terminal
+                .path_candidates_at(row, col)
+                .iter()
+                .find_map(|token| resolve_clicked_file(token, &cwd))
+            else {
+                return;
+            };
+            self.open_clicked_file(path);
+        }
+    }
+
+    /// 履歴を見ている間と、スクロールした直後だけスクロールバーを出す。
+    /// 普段は消しておき、画面の右端をすっきりさせる（幅は常に確保済み）。
+    fn update_scroll_bar(&mut self) {
+        const LINGER: std::time::Duration = std::time::Duration::from_millis(900);
+        let (offset, history, screen) = self.terminal.scroll_position();
+        let now = std::time::Instant::now();
+        if offset != self.scroll_offset {
+            self.scroll_offset = offset;
+            self.scrolled_at = Some(now);
+        }
+        let recent = self
+            .scrolled_at
+            .is_some_and(|at| now.duration_since(at) < LINGER);
+        let bar = (history > 0 && (offset > 0 || recent))
+            .then(|| scroll_bar_geometry(offset, history, screen, self.view.viewport().h));
+        if bar != self.view.scroll_bar {
+            self.view.update_contents(|view| view.scroll_bar = bar);
+        }
+    }
+
+    /// ブラウザや画像ビューアで見るファイルはプレビューを挟まず直接開く。
+    fn open_clicked_file(&mut self, path: PathBuf) {
+        if opens_externally(&path, &crate::TOYTERM_CONFIG.open_externally) {
+            open_url(&path.to_string_lossy());
+        } else {
+            self.clicked_file = Some(path);
         }
     }
 
@@ -1010,7 +1113,7 @@ impl TerminalWindow {
     fn update_ime_position(&self) {
         if let Some(cursor) = self.view.cursor {
             let cell_size = self.view.cell_size();
-            let vp = self.viewport();
+            let vp = self.view.viewport();
             self.set_ime_area(
                 vp.x + cursor.col as u32 * cell_size.w,
                 vp.y + cursor.row as u32 * cell_size.h,
@@ -1046,9 +1149,13 @@ impl TerminalWindow {
             // IME（日本語入力など）の状態を処理する。
             WindowEvent::Ime(ime) => match ime {
                 // 変換中の未確定文字列。カーソル位置にインライン表示する。
-                Ime::Preedit(text, _) => {
+                Ime::Preedit(text, cursor) => {
                     let text = text.clone();
-                    self.view.update_contents(|view| view.preedit = text);
+                    let cursor = *cursor;
+                    self.view.update_contents(|view| {
+                        view.preedit = text;
+                        view.preedit_cursor = cursor;
+                    });
                     // 変換中は内容更新が起きないので、ここで候補位置を更新する
                     self.update_ime_position();
                 }
@@ -1077,7 +1184,7 @@ impl TerminalWindow {
             }
 
             WindowEvent::CursorMoved { position, .. } => {
-                let viewport = self.viewport();
+                let viewport = self.view.viewport();
                 let x = position.x - viewport.x as f64;
                 let y = position.y - viewport.y as f64;
                 self.mouse.cursor_pos = CursorPosition { x, y };
@@ -1093,7 +1200,7 @@ impl TerminalWindow {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 let is_inner = {
-                    let viewport = self.viewport();
+                    let viewport = self.view.viewport();
                     let (w, h) = (viewport.w as f64, viewport.h as f64);
                     let CursorPosition { x, y } = self.mouse.cursor_pos;
                     0.0 <= x && x < w && 0.0 <= y && y < h
@@ -1671,7 +1778,7 @@ impl TerminalWindow {
                 self.cancel_link_hints();
                 match target {
                     crate::link_hints::Target::Url(url) => open_url(&url),
-                    crate::link_hints::Target::File(file) => self.clicked_file = Some(file),
+                    crate::link_hints::Target::File(file) => self.open_clicked_file(file),
                 }
             }
             Ok(None) => {}
@@ -2267,8 +2374,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     use super::{
-        dedent_common_indent, meta_prefixed, report_mouse_to_app, resolve_existing_file_token,
-        resolve_path_token, selection_type_for_click, visible_selection,
+        dedent_common_indent, meta_prefixed, opens_externally, report_mouse_to_app, scroll_bar_geometry,
+        resolve_clicked_file, resolve_existing_file_token, resolve_path_token,
+        selection_type_for_click, visible_selection,
     };
     use crate::view::Selection;
     use crate::vt::GridSelection;
@@ -2427,6 +2535,37 @@ mod tests {
         std::fs::write(&file, "fn main() {}").expect("write file");
 
         assert_eq!(resolve_path_token("src/./main.rs", &dir), Some(file));
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn scroll_bar_thumb_tracks_history_position() {
+        // 履歴 100 行・画面 100 行：つまみは半分の長さ。
+        assert_eq!(scroll_bar_geometry(0, 100, 100, 400), (200, 200));
+        assert_eq!(scroll_bar_geometry(100, 100, 100, 400), (0, 200));
+        // 履歴が長くてもつまみは最低 8px。
+        assert_eq!(scroll_bar_geometry(0, 100_000, 10, 400).1, 8);
+    }
+
+    #[test]
+    fn clicked_file_strips_line_and_column_suffix() {
+        let dir = test_dir("linecol");
+        let file = dir.join("out.html");
+        std::fs::create_dir_all(&dir).expect("create dir");
+        std::fs::write(&file, "<p>x</p>").expect("write file");
+
+        assert_eq!(
+            resolve_clicked_file("out.html:12", &dir),
+            Some(file.clone())
+        );
+        assert_eq!(
+            resolve_clicked_file("out.html:12:5", &dir),
+            Some(file.clone())
+        );
+        assert_eq!(resolve_clicked_file("out.html:x", &dir), None);
+        assert!(opens_externally(&file, &["HTML".to_owned()]));
+        assert!(!opens_externally(&dir.join("a.rs"), &["html".to_owned()]));
 
         let _ = std::fs::remove_dir_all(dir);
     }
