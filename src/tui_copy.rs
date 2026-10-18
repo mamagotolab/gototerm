@@ -361,7 +361,8 @@ fn editor_ruler(frame: &Frame, region: &std::ops::Range<usize>) -> bool {
                 && col.bytes().all(|b| b.is_ascii_digit())
         })
     }) && tokens.iter().any(|token| {
-        matches!(*token, "Top" | "Bot" | "All")
+        // Vim/Neovim translate these under a Japanese locale.
+        matches!(*token, "Top" | "Bot" | "All" | "先頭" | "末尾" | "全て")
             || (token.ends_with('%')
                 && token.len() > 1
                 && token[..token.len() - 1].bytes().all(|b| b.is_ascii_digit()))
@@ -529,6 +530,14 @@ mod tests {
             alternate: true,
             scroll: ScrollTrace::default(),
         }
+    }
+    #[test]
+    fn editor_ruler_accepts_japanese_position_words() {
+        for word in ["Top", "Bot", "All", "50%", "先頭", "末尾", "全て"] {
+            let f = frame(&["body", &format!("body.txt   1,1   {word}")]);
+            assert!(editor_ruler(&f, &(0..1)), "{word}");
+        }
+        assert!(!editor_ruler(&frame(&["body", "body.txt   1,1   途中"]), &(0..1)));
     }
     #[test]
     fn explicit_scroll_from_one_line_preserves_repeated_code_and_reverse() {
