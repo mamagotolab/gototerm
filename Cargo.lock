@@ -915,7 +915,7 @@ dependencies = [
 
 [[package]]
 name = "gototerm"
-version = "0.6.26"
+version = "0.6.27"
 dependencies = [
  "alacritty_terminal",
  "arboard",
