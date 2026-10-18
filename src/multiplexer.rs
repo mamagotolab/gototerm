@@ -2264,15 +2264,17 @@ impl Multiplexer {
         let mut marks = Vec::new();
         let mut badges = Vec::new();
         for tab in &mut self.tabs {
-            let path = match tab.root.focused_leaf_mut().pane_location() {
+            let leaf = tab.root.focused_leaf_mut();
+            let path = match leaf.pane_location() {
                 ShellLocation::Local(path) | ShellLocation::Remote { path, .. } => path,
             };
-            titles.push(
+            // AI のセッション中はセッション名、それ以外はフォルダ名。
+            titles.push(leaf.agent_title().unwrap_or_else(|| {
                 path.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
                     .filter(|name| !name.is_empty())
-                    .unwrap_or_else(|| "shell".into()),
-            );
+                    .unwrap_or_else(|| "shell".into())
+            }));
             marks.push(project_mark_color(&path));
             let mut kinds = Vec::new();
             tab.root

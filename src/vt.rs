@@ -282,6 +282,8 @@ pub struct EventProxy {
     winsize: Arc<Mutex<WindowSize>>,
     /// BEL を受けたら立つ。描画側が take_bell で拾って画面を光らせる。
     bell: Arc<AtomicBool>,
+    /// アプリが OSC 0/2 で設定した端末タイトル（Claude Code のセッション名など）。
+    title: Arc<Mutex<Option<String>>>,
 }
 
 impl EventProxy {
@@ -315,6 +317,8 @@ impl EventListener for EventProxy {
             // OSC 52 の書き込み（SSH 先の nvim 等のコピー）をローカルのクリップボードへ。
             // 読み取りは alacritty の既定（OnlyCopy）で拒否される。
             AlacEvent::Bell => self.bell.store(true, Ordering::SeqCst),
+            AlacEvent::Title(title) => *self.title.lock().unwrap() = Some(title),
+            AlacEvent::ResetTitle => *self.title.lock().unwrap() = None,
             AlacEvent::ClipboardStore(alacritty_terminal::term::ClipboardType::Clipboard, text) => {
                 crate::window::set_clipboard(&text);
             }
@@ -405,6 +409,7 @@ pub struct VtTerminal {
     exited: Arc<AtomicBool>,
     dirty: Arc<AtomicBool>,
     bell: Arc<AtomicBool>,
+    title: Arc<Mutex<Option<String>>>,
     /// テキスト領域の現在寸法。`TextAreaSizeRequest` 応答に使う（resize で更新）。
     winsize: Arc<Mutex<WindowSize>>,
     /// Sixel で描かれた画像。グリッドとは別に保持し、描画時に重ねる。
@@ -1263,10 +1268,12 @@ impl VtTerminal {
 
         let winsize = Arc::new(Mutex::new(window_size(cols, lines, cell_w, cell_h)));
         let bell = Arc::new(AtomicBool::new(false));
+        let title: Arc<Mutex<Option<String>>> = Default::default();
         let proxy = EventProxy {
             writer: writer.clone(),
             winsize: winsize.clone(),
             bell: bell.clone(),
+            title: title.clone(),
         };
         let size = GridSize { cols, lines };
         let term_config = Config {
@@ -1380,6 +1387,7 @@ impl VtTerminal {
             exited,
             dirty,
             bell,
+            title,
             winsize,
             images,
             gt_messages,
@@ -1453,6 +1461,11 @@ impl VtTerminal {
 
     pub fn take_dirty(&self) -> bool {
         self.dirty.swap(false, Ordering::SeqCst)
+    }
+
+    /// アプリが設定した端末タイトル。
+    pub fn title(&self) -> Option<String> {
+        self.title.lock().unwrap().clone()
     }
 
     /// 前回以降に BEL を受けたか（受けていれば true を返し、フラグを下げる）。
@@ -2246,6 +2259,7 @@ mod tests {
             writer,
             winsize: Arc::new(Mutex::new(window_size(cols, 4, 9, 18))),
             bell: Default::default(),
+            title: Default::default(),
         };
         let mut term = Term::new(Config::default(), &GridSize { cols, lines: 4 }, proxy);
         let mut processor: Processor = Processor::new();
@@ -2358,6 +2372,7 @@ mod tests {
             writer,
             winsize,
             bell: Default::default(),
+            title: Default::default(),
         };
         let mut term = Term::new(
             Config::default(),
@@ -2456,6 +2471,7 @@ mod tests {
             writer,
             winsize,
             bell: Default::default(),
+            title: Default::default(),
         };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
@@ -3835,6 +3851,7 @@ mod tests {
             writer,
             winsize,
             bell: Default::default(),
+            title: Default::default(),
         };
 
         let size = GridSize {
@@ -3862,6 +3879,7 @@ mod tests {
             writer,
             winsize: winsize.clone(),
             bell: Default::default(),
+            title: Default::default(),
         };
         let term = Arc::new(Mutex::new(Term::new(
             Config::default(),
@@ -3904,6 +3922,7 @@ mod tests {
             writer,
             winsize,
             bell: Default::default(),
+            title: Default::default(),
         };
         let mut term = Term::new(Config::default(), &GridSize { cols: 20, lines: 5 }, proxy);
         let mut processor: Processor = Processor::new();

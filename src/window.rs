@@ -360,6 +360,18 @@ fn report_mouse_to_app(mouse_mode: bool, shift: bool, ctrl_url: bool) -> bool {
     mouse_mode && !shift && !ctrl_url
 }
 
+/// 端末タイトルからタブに出す名前を取り出す。Claude Code は先頭に状態の記号
+/// （✳ や点字のスピナー）を付けるので、最初の文字・数字より前を落とす。
+fn clean_agent_title(title: &str) -> Option<String> {
+    let name: String = title
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .chars()
+        .filter(|c| !c.is_control())
+        .collect();
+    let name = name.trim();
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 /// 枠を四辺 `padding` px ずつ縮めた文字領域。小さすぎる枠では余白を詰める。
 fn inset_viewport(vp: Viewport, padding: u32) -> Viewport {
     let p = padding.min(vp.w / 4).min(vp.h / 4);
@@ -867,6 +879,20 @@ impl TerminalWindow {
 
     pub(crate) fn activity(&self) -> &PaneActivity {
         &self.activity
+    }
+
+    /// AI エージェントのセッション中なら、そのアプリが付けた端末タイトル
+    /// （Claude Code の `-n` の名前など）。fish 等もタイトルを送るので、フックで
+    /// セッション中と分かっているペインだけで使い、終わったらフォルダ名に戻す。
+    pub(crate) fn agent_title(&self) -> Option<String> {
+        use crate::task_activity::ActivityKind;
+        if matches!(
+            self.activity.kind,
+            ActivityKind::NoSignal | ActivityKind::SessionEnded
+        ) {
+            return None;
+        }
+        clean_agent_title(&self.terminal.title()?)
     }
 
     pub(crate) fn observed_location(&self) -> Option<ShellLocation> {
@@ -2374,7 +2400,7 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     use super::{
-        dedent_common_indent, meta_prefixed, opens_externally, report_mouse_to_app, scroll_bar_geometry,
+        dedent_common_indent, meta_prefixed, opens_externally, report_mouse_to_app, scroll_bar_geometry, clean_agent_title,
         resolve_clicked_file, resolve_existing_file_token, resolve_path_token,
         selection_type_for_click, visible_selection,
     };
@@ -2537,6 +2563,13 @@ mod tests {
         assert_eq!(resolve_path_token("src/./main.rs", &dir), Some(file));
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn agent_title_drops_status_symbols() {
+        assert_eq!(clean_agent_title("✳ 見積もり作成").as_deref(), Some("見積もり作成"));
+        assert_eq!(clean_agent_title("⠂ note記事").as_deref(), Some("note記事"));
+        assert_eq!(clean_agent_title("✳ "), None);
     }
 
     #[test]
