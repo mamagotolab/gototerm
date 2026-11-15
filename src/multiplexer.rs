@@ -1888,6 +1888,9 @@ pub struct Multiplexer {
     /// マウスが乗っているタブ（ホバー表示用）と、その「×」の上か。
     hover_tab: Option<usize>,
     hover_close: bool,
+    /// 右端の「残n 優先n」の位置（x, 幅）。押すと gototask の画面を開く。
+    task_slot: Option<(i32, u32)>,
+    hover_tasks: bool,
     task_summary: Option<crate::task_link::TaskSummary>,
     #[cfg(unix)]
     open_socket: Option<crate::task_link::OpenSocket>,
@@ -1985,6 +1988,8 @@ impl Multiplexer {
             tab_slots: Vec::new(),
             hover_tab: None,
             hover_close: false,
+            task_slot: None,
+            hover_tasks: false,
             task_summary: Some(crate::task_link::TaskSummary::from_config(
                 &crate::TOYTERM_CONFIG.task_file,
             )),
@@ -2443,8 +2448,8 @@ impl Multiplexer {
         }
         let bar = self.bar_viewport();
         let signature = format!(
-            "{}x{}:{}:{titles:?}:{counts:?}:{badges:?}:{marks:?}:{:?}:{}",
-            bar.w, bar.h, self.focus, self.hover_tab, self.hover_close
+            "{}x{}:{}:{titles:?}:{counts:?}:{badges:?}:{marks:?}:{:?}:{}:{}",
+            bar.w, bar.h, self.focus, self.hover_tab, self.hover_close, self.hover_tasks
         );
         if signature == self.status_signature {
             return;
@@ -2502,6 +2507,7 @@ impl Multiplexer {
 
         // 右端の残タスク集計（gototask）。優先があれば赤。
         let mut right_w = 0;
+        self.task_slot = None;
         if let Some((open, important)) = counts {
             let rest = format!("残{open}");
             let imp = format!("優先{important}");
@@ -2509,6 +2515,21 @@ impl Multiplexer {
             if total < bar.w as i32 / 2 {
                 right_w = total;
                 let x = bar.w as i32 - total + cw;
+                // 押せる場所：数字の両脇に半文字ずつ足した幅。ホバーで淡く明るくする。
+                let slot = PixelRect {
+                    x: x - cw / 2,
+                    y: 4,
+                    w: (total - cw) as u32,
+                    h: bar.h.saturating_sub(8),
+                };
+                if self.hover_tasks {
+                    layer.rects.extend(rounded_rect(
+                        slot,
+                        (bar.h / 4).clamp(4, 8),
+                        mix(0xFFFFFFFF, config.color_background, 0.07),
+                    ));
+                }
+                self.task_slot = Some((slot.x, slot.w));
                 layer
                     .texts
                     .push((x, text_top, rest.clone(), text_dim, bar_bg));
@@ -3255,24 +3276,37 @@ impl Multiplexer {
             .then(|| tab_at(&self.tab_slots, self.cursor_pos.x as i32, cell_w))
             .flatten();
         let hovered = hit.map(|(index, _)| index);
+        let hover_tasks = in_bar && self.cursor_on_tasks();
         if in_bar {
-            self.window.set_cursor_icon(if hovered.is_some() {
-                winit::window::CursorIcon::Pointer
-            } else {
-                winit::window::CursorIcon::Default
-            });
+            self.window
+                .set_cursor_icon(if hovered.is_some() || hover_tasks {
+                    winit::window::CursorIcon::Pointer
+                } else {
+                    winit::window::CursorIcon::Default
+                });
         }
         // 「×」は選択中かホバー中のタブにだけ出す。
         let hover_close = hit.is_some_and(|(_, on_close)| on_close);
-        if hovered != self.hover_tab || hover_close != self.hover_close {
-            let left_bar = self.hover_tab.is_some() && !in_bar;
+        if hovered != self.hover_tab
+            || hover_close != self.hover_close
+            || hover_tasks != self.hover_tasks
+        {
+            let left_bar = (self.hover_tab.is_some() || self.hover_tasks) && !in_bar;
             self.hover_tab = hovered;
             self.hover_close = hover_close;
+            self.hover_tasks = hover_tasks;
             self.update_status_bar();
             if left_bar {
                 self.focused_root().focused_leaf_mut().refresh_cursor_icon();
             }
         }
+    }
+
+    /// マウスが右端の「残n 優先n」の上か。
+    fn cursor_on_tasks(&self) -> bool {
+        let x = self.cursor_pos.x as i32;
+        self.task_slot
+            .is_some_and(|(left, w)| x >= left && x < left + w as i32)
     }
 
     /// タブの「×」を出しているか（選択中かホバー中・幅が足りるとき）。
@@ -3760,6 +3794,10 @@ impl Multiplexer {
                     state: ElementState::Pressed,
                     ..
                 } => {
+                    if self.cursor_in_bar() && self.cursor_on_tasks() {
+                        self.open_tasks();
+                        return;
+                    }
                     if self.cursor_in_bar() {
                         let cell_w = self.status_view.cell_size().w;
                         match tab_at(&self.tab_slots, self.cursor_pos.x as i32, cell_w) {

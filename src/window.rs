@@ -1246,12 +1246,7 @@ impl TerminalWindow {
                 let y = position.y - viewport.y as f64;
                 self.mouse.cursor_pos = CursorPosition { x, y };
                 if self.context_menu.is_some() {
-                    let menu = self.context_menu.as_mut().unwrap();
-                    let hovered = menu.item_at(x as i32, y as i32);
-                    if hovered != menu.hovered {
-                        menu.hovered = hovered;
-                        self.refresh_text_overlays();
-                    }
+                    self.hover_context_menu(x as i32, y as i32);
                     return;
                 }
                 if self.mouse.selecting {
@@ -1273,13 +1268,24 @@ impl TerminalWindow {
                     if *state == ElementState::Pressed {
                         self.swallow_release = true;
                         let CursorPosition { x, y } = self.mouse.cursor_pos;
-                        let picked = self
-                            .context_menu
-                            .as_ref()
-                            .and_then(|menu| menu.item(menu.item_at(x as i32, y as i32)?));
-                        self.close_context_menu();
-                        if let Some(item) = picked.filter(|_| *button == MouseButton::Left) {
-                            self.run_menu_item(item);
+                        let (x, y) = (x as i32, y as i32);
+                        let menu = self.context_menu.as_ref().unwrap();
+                        let picked = match &menu.sub {
+                            Some((_, sub)) if sub.contains(x, y) => {
+                                sub.item_at(x, y).and_then(|i| sub.item(i))
+                            }
+                            _ => menu.item_at(x, y).and_then(|i| menu.item(i)),
+                        };
+                        match picked.filter(|_| *button == MouseButton::Left) {
+                            // サブメニューを持つ項目は、押しても閉じずに横へ開く。
+                            Some(item) if item.has_submenu() => {
+                                self.hover_context_menu(x, y);
+                            }
+                            Some(item) => {
+                                self.close_context_menu();
+                                self.run_menu_item(item);
+                            }
+                            None => self.close_context_menu(),
                         }
                     }
                     return;
@@ -2234,16 +2240,8 @@ impl TerminalWindow {
         if self.mouse_cell().is_none() {
             return;
         }
-        let item = |item: MenuItem, enabled: bool| Entry::Item {
-            item,
-            enabled,
-            shortcut: item
-                .shortcut()
-                .and_then(keybindings::binding_label)
-                .unwrap_or_default(),
-        };
         let history = !self.tui_app_screen();
-        let entries = vec![
+        let mut entries = vec![
             item(MenuItem::Copy, self.has_selection()),
             item(MenuItem::Paste, true),
             Entry::Separator,
@@ -2257,6 +2255,12 @@ impl TerminalWindow {
             Entry::Separator,
             item(MenuItem::ClosePane, true),
         ];
+        if gtask_installed() {
+            entries.splice(
+                entries.len() - 2..entries.len() - 2,
+                [Entry::Separator, item(MenuItem::Gototask, true)],
+            );
+        }
         let vp = self.view.viewport();
         let cell = self.view.cell_size();
         let CursorPosition { x, y } = self.mouse.cursor_pos;
@@ -2274,6 +2278,74 @@ impl TerminalWindow {
         self.refresh_text_overlays();
     }
 
+    /// gototask のサブメニュー。コマンドを打ち込む項目は、シェルが前面にいるときだけ押せる
+    /// （Claude Code などに文字が流れないように）。
+    fn gototask_entries(&self) -> Vec<crate::context_menu::Entry> {
+        use crate::context_menu::{Entry, MenuItem};
+        let shell = !self.tui_app_screen() && self.terminal.foreground_is_shell();
+        vec![
+            item(
+                MenuItem::TaskOpen,
+                !crate::TOYTERM_CONFIG.task_url.trim().is_empty(),
+            ),
+            Entry::Separator,
+            item(MenuItem::TaskToday, shell),
+            item(MenuItem::TaskList, shell),
+            item(MenuItem::TaskAdd, shell),
+            item(MenuItem::TaskDone, shell),
+            Entry::Separator,
+            item(MenuItem::TaskHelp, shell),
+        ]
+    }
+
+    /// マウスの位置でホバーを更新する。サブメニューを持つ項目に乗ったら横に開き、
+    /// 他の項目に移ったら閉じる。サブメニューへ移る途中で外へ出ても開いたままにする。
+    fn hover_context_menu(&mut self, x: i32, y: i32) {
+        let Some(menu) = self.context_menu.as_ref() else {
+            return;
+        };
+        let in_sub = menu.sub.as_ref().is_some_and(|(_, sub)| sub.contains(x, y));
+        let hovered = menu.item_at(x, y);
+        let open_sub = hovered
+            .filter(|&i| menu.item(i).is_some_and(|it| it.has_submenu()))
+            .filter(|&i| menu.sub.as_ref().is_none_or(|(at, _)| *at != i));
+        let sub_entries = open_sub.map(|_| self.gototask_entries());
+        let vp = self.view.viewport();
+        let menu = self.context_menu.as_mut().unwrap();
+        let before = (
+            menu.hovered,
+            menu.sub.as_ref().map(|(i, s)| (*i, s.hovered)),
+        );
+        if in_sub {
+            let (_, sub) = menu.sub.as_mut().unwrap();
+            sub.hovered = sub.item_at(x, y);
+        } else {
+            if hovered.is_some() || menu.sub.is_none() {
+                menu.hovered = hovered;
+            }
+            if let (Some(index), Some(entries)) = (open_sub, sub_entries) {
+                menu.open_sub(index, entries, vp.w, vp.h);
+            } else if hovered.is_some()
+                && menu
+                    .sub
+                    .as_ref()
+                    .is_some_and(|(at, _)| Some(*at) != hovered)
+            {
+                menu.sub = None;
+            }
+            if let Some((_, sub)) = menu.sub.as_mut() {
+                sub.hovered = None;
+            }
+        }
+        let after = (
+            menu.hovered,
+            menu.sub.as_ref().map(|(i, s)| (*i, s.hovered)),
+        );
+        if before != after {
+            self.refresh_text_overlays();
+        }
+    }
+
     fn close_context_menu(&mut self) {
         if self.context_menu.take().is_some() {
             self.refresh_text_overlays();
@@ -2288,13 +2360,47 @@ impl TerminalWindow {
         let Some(menu) = self.context_menu.as_mut() else {
             return;
         };
+        // サブメニューにホバーがあれば、上下と Enter はそちらを動かす。
+        let in_sub = menu
+            .sub
+            .as_ref()
+            .is_some_and(|(_, sub)| sub.hovered.is_some());
+        let hovered = menu.hovered.and_then(|i| menu.item(i));
         match code {
             KeyCode::ArrowDown | KeyCode::ArrowUp => {
-                menu.move_hover(code == KeyCode::ArrowDown);
+                let down = code == KeyCode::ArrowDown;
+                match menu.sub.as_mut() {
+                    Some((_, sub)) if in_sub => sub.move_hover(down),
+                    _ => {
+                        menu.move_hover(down);
+                        menu.sub = None;
+                    }
+                }
                 self.refresh_text_overlays();
             }
+            KeyCode::ArrowRight | KeyCode::Enter | KeyCode::NumpadEnter
+                if !in_sub && hovered.is_some_and(|item| item.has_submenu()) =>
+            {
+                let index = menu.hovered.unwrap();
+                let entries = self.gototask_entries();
+                let vp = self.view.viewport();
+                let menu = self.context_menu.as_mut().unwrap();
+                menu.open_sub(index, entries, vp.w, vp.h);
+                if let Some((_, sub)) = menu.sub.as_mut() {
+                    sub.move_hover(true);
+                }
+                self.refresh_text_overlays();
+            }
+            KeyCode::ArrowLeft if menu.sub.is_some() => {
+                menu.sub = None;
+                self.refresh_text_overlays();
+            }
+            KeyCode::ArrowRight | KeyCode::ArrowLeft => {}
             KeyCode::Enter | KeyCode::NumpadEnter => {
-                let item = menu.hovered.and_then(|i| menu.item(i));
+                let item = match &menu.sub {
+                    Some((_, sub)) if in_sub => sub.hovered.and_then(|i| sub.item(i)),
+                    _ => hovered,
+                };
                 self.close_context_menu();
                 if let Some(item) = item {
                     self.run_menu_item(item);
@@ -2327,7 +2433,44 @@ impl TerminalWindow {
                 // シェルにプロンプトを出し直してもらう（Ctrl+L＝画面の描き直し）。
                 self.terminal.write(b"\x0c");
             }
+            MenuItem::Gototask => {}
+            MenuItem::TaskToday | MenuItem::TaskList | MenuItem::TaskHelp => {
+                let command = item.command().unwrap_or_default();
+                self.type_command(&format!("{command}\r"), 0);
+            }
+            MenuItem::TaskAdd => {
+                // 選択中の文字があれば題名に入れる。どちらも Enter は押さず、直してから確定できる。
+                let title = self
+                    .tui_copy
+                    .as_ref()
+                    .and_then(|c| c.text())
+                    .or_else(|| self.terminal.tracked_selection_text().map(|(_, t)| t))
+                    .map(|t| t.split_whitespace().collect::<Vec<_>>().join(" "))
+                    .unwrap_or_default();
+                self.clear_mouse_selection();
+                let back = if title.is_empty() { 1 } else { 0 };
+                self.type_command(&format!("gtask add {}", shell_quote(&title)), back);
+            }
+            MenuItem::TaskDone => self.type_command("gtask done ", 0),
             other => self.menu_request = other.shortcut(),
+        }
+    }
+
+    /// シェルの入力行にコマンドを打ち込み、カーソルを `back` 文字ぶん左へ戻す。
+    fn type_command(&mut self, text: &str, back: usize) {
+        self.end_tui_copy();
+        if self.terminal.copy_mode_active() {
+            self.terminal.toggle_copy_mode();
+        }
+        self.terminal.scroll_to_bottom();
+        self.terminal.write(text.as_bytes());
+        let left: &[u8] = if self.terminal.application_cursor_mode() {
+            b"\x1bOD"
+        } else {
+            b"\x1b[D"
+        };
+        for _ in 0..back {
+            self.terminal.write(left);
         }
     }
 
@@ -2450,101 +2593,24 @@ impl TerminalWindow {
     /// 右クリックメニュー（最上層）と検索欄（最下行）を端末の上に描く。
     fn refresh_text_overlays(&mut self) {
         use crate::terminal::Color;
-        use crate::view::{rounded_rect, PixelRect, PopupLayer};
+        use crate::view::{PixelRect, PopupLayer};
         let (cols, rows) = self.terminal.size();
         let mut texts = Vec::new();
         let mut layer = None;
         let mut popup = None;
         if let Some(menu) = &self.context_menu {
-            let [bg, border, accent, disabled, keys] = menu_palette();
-            let m = menu.metrics;
             let mut out = PopupLayer::default();
-            let panel = PixelRect {
-                x: menu.x,
-                y: menu.y,
-                w: menu.w,
-                h: menu.h,
-            };
-            // 影：少しずつ広げた薄い角丸を重ね、下へ落ちるぼかしに見せる。
+            draw_menu(menu, &mut out);
+            if let Some((_, sub)) = &menu.sub {
+                draw_menu(sub, &mut out);
+            }
+            // 出現の動きは最初に開いた枠だけにかける（サブメニューはそのまま出す）。
             const SHADOW: u32 = 10;
-            for k in (1..=SHADOW).rev() {
-                let grow = PixelRect {
-                    x: panel.x - k as i32,
-                    y: panel.y - k as i32 + 5,
-                    w: panel.w + k * 2,
-                    h: panel.h + k * 2,
-                };
-                out.rects
-                    .extend(rounded_rect(grow, m.radius + k, Color::Rgb { rgba: 0x0B }));
-            }
-            out.rects.extend(rounded_rect(panel, m.radius, border));
-            let inner = PixelRect {
-                x: panel.x + 1,
-                y: panel.y + 1,
-                w: panel.w - 2,
-                h: panel.h - 2,
-            };
-            out.rects
-                .extend(rounded_rect(inner, m.radius.saturating_sub(1), bg));
-            for row in menu.rows() {
-                match &menu.entries[row.index] {
-                    crate::context_menu::Entry::Separator => out.rects.push((
-                        PixelRect {
-                            x: panel.x + m.pad_x as i32 / 2,
-                            y: row.top + row.height as i32 / 2,
-                            w: panel.w - m.pad_x,
-                            h: 1,
-                        },
-                        border,
-                    )),
-                    crate::context_menu::Entry::Item {
-                        item,
-                        enabled,
-                        shortcut,
-                    } => {
-                        if menu.hovered == Some(row.index) {
-                            let inset = (m.pad_x / 3).max(4);
-                            let hover = PixelRect {
-                                x: panel.x + inset as i32,
-                                y: row.top + 1,
-                                w: panel.w - inset * 2,
-                                h: row.height - 2,
-                            };
-                            out.rects
-                                .extend(rounded_rect(hover, (m.radius / 2).max(4), accent));
-                        }
-                        let text_top = row.top + (row.height as i32 - m.cell_h as i32) / 2;
-                        let fg = if *enabled {
-                            Color::BrightWhite
-                        } else {
-                            disabled
-                        };
-                        out.texts.push((
-                            panel.x + m.pad_x as i32,
-                            text_top,
-                            item.label().to_string(),
-                            fg,
-                            bg,
-                        ));
-                        if !shortcut.is_empty() {
-                            let sw = crate::launcher::display_width(shortcut) as u32 * m.cell_w;
-                            let fg = if *enabled { keys } else { disabled };
-                            out.texts.push((
-                                panel.x + (panel.w - m.pad_x - sw) as i32,
-                                text_top,
-                                shortcut.clone(),
-                                fg,
-                                bg,
-                            ));
-                        }
-                    }
-                }
-            }
             popup = Some(PixelRect {
-                x: panel.x - SHADOW as i32,
-                y: panel.y - SHADOW as i32,
-                w: panel.w + SHADOW * 2,
-                h: panel.h + SHADOW * 2 + 5,
+                x: menu.x - SHADOW as i32,
+                y: menu.y - SHADOW as i32,
+                w: menu.w + SHADOW * 2,
+                h: menu.h + SHADOW * 2 + 5,
             });
             layer = Some(out);
         }
@@ -2598,6 +2664,132 @@ impl TerminalWindow {
         self.terminal
             .write(format!("\x1b[<{button};{col};{row}{m}").as_bytes());
     }
+}
+
+/// メニュー1枚（影・枠・項目）を描く。
+fn draw_menu(menu: &crate::context_menu::ContextMenu, out: &mut crate::view::PopupLayer) {
+    use crate::terminal::Color;
+    use crate::view::{rounded_rect, PixelRect};
+    let [bg, border, accent, disabled, keys] = menu_palette();
+    let m = menu.metrics;
+    let panel = PixelRect {
+        x: menu.x,
+        y: menu.y,
+        w: menu.w,
+        h: menu.h,
+    };
+    // 影：少しずつ広げた薄い角丸を重ね、下へ落ちるぼかしに見せる。
+    const SHADOW: u32 = 10;
+    for k in (1..=SHADOW).rev() {
+        let grow = PixelRect {
+            x: panel.x - k as i32,
+            y: panel.y - k as i32 + 5,
+            w: panel.w + k * 2,
+            h: panel.h + k * 2,
+        };
+        out.rects
+            .extend(rounded_rect(grow, m.radius + k, Color::Rgb { rgba: 0x0B }));
+    }
+    out.rects.extend(rounded_rect(panel, m.radius, border));
+    let inner = PixelRect {
+        x: panel.x + 1,
+        y: panel.y + 1,
+        w: panel.w - 2,
+        h: panel.h - 2,
+    };
+    out.rects
+        .extend(rounded_rect(inner, m.radius.saturating_sub(1), bg));
+    for row in menu.rows() {
+        match &menu.entries[row.index] {
+            crate::context_menu::Entry::Separator => out.rects.push((
+                PixelRect {
+                    x: panel.x + m.pad_x as i32 / 2,
+                    y: row.top + row.height as i32 / 2,
+                    w: panel.w - m.pad_x,
+                    h: 1,
+                },
+                border,
+            )),
+            crate::context_menu::Entry::Item {
+                item,
+                enabled,
+                shortcut,
+            } => {
+                if menu.hovered == Some(row.index) {
+                    let inset = (m.pad_x / 3).max(4);
+                    let hover = PixelRect {
+                        x: panel.x + inset as i32,
+                        y: row.top + 1,
+                        w: panel.w - inset * 2,
+                        h: row.height - 2,
+                    };
+                    out.rects
+                        .extend(rounded_rect(hover, (m.radius / 2).max(4), accent));
+                }
+                let text_top = row.top + (row.height as i32 - m.cell_h as i32) / 2;
+                let fg = if *enabled {
+                    Color::BrightWhite
+                } else {
+                    disabled
+                };
+                out.texts.push((
+                    panel.x + m.pad_x as i32,
+                    text_top,
+                    item.label().to_string(),
+                    fg,
+                    bg,
+                ));
+                if !shortcut.is_empty() {
+                    let sw = crate::launcher::display_width(shortcut) as u32 * m.cell_w;
+                    let fg = if *enabled { keys } else { disabled };
+                    out.texts.push((
+                        panel.x + (panel.w - m.pad_x - sw) as i32,
+                        text_top,
+                        shortcut.clone(),
+                        fg,
+                        bg,
+                    ));
+                }
+            }
+        }
+    }
+}
+
+/// メニューの項目。右側にはキー割り当てか、gototask のコマンドか、サブメニューの印を出す。
+fn item(item: crate::context_menu::MenuItem, enabled: bool) -> crate::context_menu::Entry {
+    let shortcut = if item.has_submenu() {
+        "▸".to_string()
+    } else {
+        item.shortcut()
+            .and_then(keybindings::binding_label)
+            .or_else(|| item.command().map(str::to_string))
+            .unwrap_or_default()
+    };
+    crate::context_menu::Entry::Item {
+        item,
+        enabled,
+        shortcut,
+    }
+}
+
+/// PATH に gtask（gototask のコマンド）があるか。最初の1回だけ調べる。
+fn gtask_installed() -> bool {
+    static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *FOUND.get_or_init(|| {
+        let names: &[&str] = if cfg!(windows) {
+            &["gtask.exe", "gtask.cmd", "gtask.bat"]
+        } else {
+            &["gtask"]
+        };
+        std::env::var_os("PATH").is_some_and(|path| {
+            std::env::split_paths(&path).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
+        })
+    })
+}
+
+/// シェルに渡す引数を一重引用符で囲む（bash・zsh・fish のどれでも同じ意味になる書き方）。
+fn shell_quote(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 /// 右クリックメニューの色：(面, 枠線と区切り, ホバー, 無効な項目, ショートカット)。
@@ -2669,6 +2861,13 @@ fn dedent_common_indent(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn shell_quote_keeps_quotes_literal() {
+        assert_eq!(super::shell_quote(""), "''");
+        assert_eq!(super::shell_quote("見積もり"), "'見積もり'");
+        assert_eq!(super::shell_quote("it's"), "'it'\\''s'");
+    }
+
     #[test]
     fn copy_stop_notice_is_complete_at_narrow_widths() {
         let reason = "本文の連続性を確認できません。保持済みの範囲はコピーできます";

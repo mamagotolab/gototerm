@@ -1436,6 +1436,16 @@ impl VtTerminal {
         self.initial_mutt
     }
 
+    /// 前面にいるのが起動したシェル自身か（何かのコマンドを動かしている最中でないか）。
+    /// Linux 以外は調べられないので true（呼び出し側で TUI の画面かどうかも見る）。
+    pub(crate) fn foreground_is_shell(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        if let (Some(leader), Some(child)) = (self.master.process_group_leader(), self.child_pid) {
+            return leader as i64 == child as i64;
+        }
+        true
+    }
+
     pub(crate) fn foreground_is_nvim(&self) -> bool {
         #[cfg(target_os = "linux")]
         if let Some(pid) = self.master.process_group_leader() {

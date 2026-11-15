@@ -15,6 +15,14 @@ pub(crate) enum MenuItem {
     SplitDown,
     NewTab,
     ClosePane,
+    /// 「gototask ▸」：選ぶと横にサブメニューが開く。
+    Gototask,
+    TaskOpen,
+    TaskToday,
+    TaskList,
+    TaskAdd,
+    TaskDone,
+    TaskHelp,
 }
 
 impl MenuItem {
@@ -29,6 +37,13 @@ impl MenuItem {
             MenuItem::SplitDown => "下に分割",
             MenuItem::NewTab => "新しいタブ",
             MenuItem::ClosePane => "閉じる",
+            MenuItem::Gototask => "gototask",
+            MenuItem::TaskOpen => "タスク画面を開く",
+            MenuItem::TaskToday => "今日のタスク",
+            MenuItem::TaskList => "未完了の一覧",
+            MenuItem::TaskAdd => "タスクを追加",
+            MenuItem::TaskDone => "済にする",
+            MenuItem::TaskHelp => "コマンドの一覧",
         }
     }
 
@@ -44,7 +59,26 @@ impl MenuItem {
             MenuItem::SplitDown => Some(ShortcutAction::SplitHorizontal),
             MenuItem::NewTab => Some(ShortcutAction::NewTab),
             MenuItem::ClosePane => Some(ShortcutAction::ClosePane),
+            MenuItem::TaskOpen => Some(ShortcutAction::OpenTasks),
+            _ => None,
         }
+    }
+
+    /// gototask の項目が打ち込むコマンド（右側に出して、コマンドを思い出せるようにする）。
+    pub(crate) fn command(self) -> Option<&'static str> {
+        match self {
+            MenuItem::TaskToday => Some("gtask today"),
+            MenuItem::TaskList => Some("gtask ls"),
+            MenuItem::TaskAdd => Some("gtask add"),
+            MenuItem::TaskDone => Some("gtask done"),
+            MenuItem::TaskHelp => Some("gtask -h"),
+            _ => None,
+        }
+    }
+
+    /// 選ぶと横にサブメニューを開く項目か。
+    pub(crate) fn has_submenu(self) -> bool {
+        self == MenuItem::Gototask
     }
 }
 
@@ -113,6 +147,8 @@ pub(crate) struct ContextMenu {
     pub(crate) h: u32,
     /// ホバー中の項目（entries の番号）。
     pub(crate) hovered: Option<usize>,
+    /// 開いているサブメニューと、それを開いた項目の番号。
+    pub(crate) sub: Option<(usize, Box<ContextMenu>)>,
 }
 
 /// 画面の端からの最小の空き。
@@ -169,7 +205,34 @@ impl ContextMenu {
             w,
             h,
             hovered: None,
+            sub: None,
         }
+    }
+
+    /// 点がこの枠の中か。
+    pub(crate) fn contains(&self, px: i32, py: i32) -> bool {
+        px >= self.x && px < self.x + self.w as i32 && py >= self.y && py < self.y + self.h as i32
+    }
+
+    /// 項目 `index` の横にサブメニューを開く。右に入らなければ左へ。
+    pub(crate) fn open_sub(&mut self, index: usize, entries: Vec<Entry>, view_w: u32, view_h: u32) {
+        let Some(row) = self.rows().into_iter().find(|row| row.index == index) else {
+            return;
+        };
+        let mut sub = ContextMenu::new(entries, 0, 0, view_w, view_h, self.metrics);
+        // 親の枠に少し重ね、1行目が開いた項目の高さにそろうように置く。
+        let overlap = 4;
+        let right = self.x + self.w as i32 - overlap;
+        sub.x = if right + sub.w as i32 + EDGE <= view_w as i32 {
+            right
+        } else {
+            (self.x + overlap - sub.w as i32).max(EDGE.min(view_w as i32 - sub.w as i32).max(0))
+        };
+        let top = row.top - self.metrics.pad_y as i32;
+        sub.y = top
+            .min(view_h as i32 - sub.h as i32 - EDGE)
+            .max(EDGE.min(view_h as i32 - sub.h as i32).max(0));
+        self.sub = Some((index, Box::new(sub)));
     }
 
     /// 各行（項目と区切り）の位置。
@@ -307,5 +370,22 @@ mod tests {
         assert_eq!(menu.hovered, Some(1));
         menu.move_hover(false);
         assert_eq!(menu.hovered, Some(1));
+    }
+
+    #[test]
+    fn submenu_opens_beside_its_row_and_flips_left_at_the_edge() {
+        let m = metrics();
+        let mut menu = ContextMenu::new(sample(), 100, 50, 1000, 800, m);
+        menu.open_sub(3, sample(), 1000, 800);
+        let (at, sub) = menu.sub.as_ref().unwrap();
+        assert_eq!(*at, 3);
+        assert_eq!(sub.x, menu.x + menu.w as i32 - 4, "親の右に少し重ねて開く");
+        let row = menu.rows()[3].top;
+        assert_eq!(sub.rows()[0].top, row, "1行目が開いた項目の高さにそろう");
+        // 右に入らなければ左へ
+        let mut edge = ContextMenu::new(sample(), 1000, 50, 1000, 800, m);
+        edge.open_sub(1, sample(), 1000, 800);
+        let (_, sub) = edge.sub.as_ref().unwrap();
+        assert!(sub.x + sub.w as i32 <= edge.x + 4);
     }
 }
