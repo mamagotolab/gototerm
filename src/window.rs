@@ -2772,24 +2772,79 @@ fn item(item: crate::context_menu::MenuItem, enabled: bool) -> crate::context_me
     }
 }
 
-/// PATH に gtask（gototask のコマンド）があるか。最初の1回だけ調べる。
+/// gtask（gototask のコマンド）が使えるか。最初の1回だけ調べる。
+/// Windows は PATH 上のファイルに加えて、PowerShell のプロファイルに書いた
+/// `function gtask` / `Set-Alias gtask` も対象にする（PowerShell を起動して
+/// Get-Command で調べる方法は、隠し PowerShell 起動が Defender に検出されるので使わない）。
 fn gtask_installed() -> bool {
     static FOUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *FOUND.get_or_init(|| {
         let names: &[&str] = if cfg!(windows) {
-            &["gtask.exe", "gtask.cmd", "gtask.bat"]
+            &["gtask.exe", "gtask.cmd", "gtask.bat", "gtask.ps1"]
         } else {
             &["gtask"]
         };
-        std::env::var_os("PATH").is_some_and(|path| {
+        let on_path = std::env::var_os("PATH").is_some_and(|path| {
             std::env::split_paths(&path).any(|dir| names.iter().any(|n| dir.join(n).is_file()))
-        })
+        });
+        on_path || (cfg!(windows) && powershell_profiles_define_gtask())
     })
 }
 
-/// シェルに渡す引数を一重引用符で囲む（bash・zsh・fish のどれでも同じ意味になる書き方）。
+/// PowerShell のプロファイル（7 と 5.1、OneDrive に移ったドキュメントも）のどれかに gtask の定義があるか。
+fn powershell_profiles_define_gtask() -> bool {
+    let mut docs = Vec::new();
+    for var in [
+        "OneDrive",
+        "OneDriveConsumer",
+        "OneDriveCommercial",
+        "USERPROFILE",
+    ] {
+        if let Some(base) = std::env::var_os(var) {
+            let base = std::path::PathBuf::from(base);
+            docs.push(base.join("Documents"));
+            docs.push(base.join("ドキュメント"));
+        }
+    }
+    docs.iter()
+        .flat_map(|d| [d.join("PowerShell"), d.join("WindowsPowerShell")])
+        .flat_map(|d| ["Microsoft.PowerShell_profile.ps1", "profile.ps1"].map(|f| d.join(f)))
+        .filter_map(|p| std::fs::read(p).ok())
+        .any(|bytes| profile_defines_gtask(&String::from_utf8_lossy(&bytes)))
+}
+
+/// PowerShell スクリプトの中に `function gtask` か gtask のエイリアス定義があるか（コメント行は除く）。
+fn profile_defines_gtask(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line
+            .trim()
+            .trim_start_matches('\u{feff}')
+            .to_ascii_lowercase();
+        if line.starts_with('#') {
+            return false;
+        }
+        let mut words = line.split_whitespace();
+        match words.next() {
+            Some("function" | "filter") => words.next().is_some_and(|name| {
+                let name = name.split(['{', '(']).next().unwrap_or_default();
+                name.trim_start_matches("global:") == "gtask"
+            }),
+            Some("set-alias" | "new-alias" | "sal" | "nal") => {
+                words.any(|w| w.trim_matches(['\'', '"']) == "gtask")
+            }
+            _ => false,
+        }
+    })
+}
+
+/// シェルに渡す引数を一重引用符で囲む。Linux 等は bash・zsh・fish のどれでも同じ意味になる書き方、
+/// Windows は PowerShell の書き方（中の ' は '' にする）。
 fn shell_quote(text: &str) -> String {
-    format!("'{}'", text.replace('\'', "'\\''"))
+    if cfg!(windows) {
+        format!("'{}'", text.replace('\'', "''"))
+    } else {
+        format!("'{}'", text.replace('\'', "'\\''"))
+    }
 }
 
 /// 右クリックメニューの色：(面, 枠線と区切り, ホバー, 無効な項目, ショートカット)。
@@ -2865,7 +2920,21 @@ mod tests {
     fn shell_quote_keeps_quotes_literal() {
         assert_eq!(super::shell_quote(""), "''");
         assert_eq!(super::shell_quote("見積もり"), "'見積もり'");
-        assert_eq!(super::shell_quote("it's"), "'it'\\''s'");
+        let quoted = if cfg!(windows) { "'it''s'" } else { "'it'\\''s'" };
+        assert_eq!(super::shell_quote("it's"), quoted);
+    }
+
+    #[test]
+    fn powershell_profile_gtask_definitions_are_found() {
+        use super::profile_defines_gtask as defines;
+        assert!(defines("function gtask { python C:\\gototask\\gototask @args }"));
+        assert!(defines("\u{feff}Function gtask{ py gototask @args }"));
+        assert!(defines("function global:gtask($a) {}"));
+        assert!(defines("Set-Alias -Name gtask -Value C:\\tools\\gtask.ps1"));
+        assert!(defines("New-Alias gtask 'C:\\tools\\gtask.ps1'"));
+        assert!(!defines("# function gtask { }"));
+        assert!(!defines("function gtasks { }"));
+        assert!(!defines("Set-Alias gt gototerm"));
     }
 
     #[test]
