@@ -23,6 +23,9 @@ pub struct Config {
 
     // タブバー（複数タブのときだけ表示）の文字サイズ
     pub status_bar_font_size: u32,
+    // タブバーの位置。"top"（上・既定）か "bottom"（下）。
+    #[serde(default = "default_tab_bar_position")]
+    pub tab_bar_position: String,
 
     // ワークベンチ左サイドバーの幅比率（表示中のみ使用）
     pub sidebar_ratio: f64,
@@ -145,6 +148,7 @@ impl Default for Config {
             font_size: 18,
 
             status_bar_font_size: 16,
+            tab_bar_position: default_tab_bar_position(),
             sidebar_ratio: 0.25,
             preview_ratio: default_preview_ratio(),
             watch_ignore: vec![
@@ -274,6 +278,17 @@ pub fn build() -> Config {
         .unwrap()
         .try_deserialize()
         .expect("Failed to build config")
+}
+
+fn default_tab_bar_position() -> String {
+    "top".to_owned()
+}
+
+impl Config {
+    /// タブバーを下に置くか（tab_bar_position = "bottom"）。
+    pub fn tab_bar_bottom(&self) -> bool {
+        self.tab_bar_position.trim().eq_ignore_ascii_case("bottom")
+    }
 }
 
 pub(crate) fn find_config_file() -> Option<PathBuf> {

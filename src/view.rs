@@ -445,6 +445,10 @@ mod lazy_tests {
 
 pub struct TerminalView {
     pub(crate) hint_labels: Vec<(usize, usize, String)>,
+    /// 端末の上に重ねる文字（検索欄・右クリックメニュー）：(行, 列, 文字, 前景, 背景)。
+    pub(crate) text_overlays: Vec<(usize, usize, String, Color, Color)>,
+    /// 端末の一番上（文字・画像より後）に描く層。右クリックメニュー用。
+    pub(crate) popup_layer: Option<PopupLayer>,
     /// セル背景の上・文字の下に重ねる矩形（ビュー内のピクセル座標）。タブの
     /// 下線や色印、行のホバーなど、セル単位では描けない細い装飾に使う。
     pub(crate) overlays: Vec<(PixelRect, Color)>,
@@ -496,6 +500,7 @@ pub struct TerminalView {
     draw_queries_bg: Vec<DrawQuery<CellVertex>>,
     draw_queries_scaled: Vec<DrawQuery<CellVertex>>,
     draw_queries_img: Vec<DrawQuery<ImageVertex>>,
+    draw_queries_popup: Vec<DrawQuery<CellVertex>>,
     clock: std::time::Instant,
 }
 
@@ -649,6 +654,8 @@ impl TerminalView {
             preedit_cursor: None,
             selection_range: None,
             hint_labels: Vec::new(),
+            text_overlays: Vec::new(),
+            popup_layer: None,
             overlays: Vec::new(),
             scroll_bar,
             bg_color: Color::Black,
@@ -671,6 +678,7 @@ impl TerminalView {
             draw_queries_bg: Vec::new(),
             draw_queries_scaled: Vec::new(),
             draw_queries_img: Vec::new(),
+            draw_queries_popup: Vec::new(),
             clock: std::time::Instant::now(),
         }
     }
@@ -883,6 +891,7 @@ impl TerminalView {
         self.draw_queries_fg.clear();
         self.draw_queries_bg.clear();
         self.draw_queries_scaled.clear();
+        self.draw_queries_popup.clear();
 
         // clear entire screen
         // 枠があるときは draw() が枠ごと塗るので不要（ここで黒を重ねると、
@@ -926,31 +935,43 @@ impl TerminalView {
 
         // Paint a temporary copy, leaving terminal text and selections untouched.
         let mut overlay_lines;
-        let lines = if self.hint_labels.is_empty() {
+        let lines = if self.hint_labels.is_empty() && self.text_overlays.is_empty() {
             &self.lines
         } else {
             overlay_lines = self.lines.clone();
-            for (row, col, text) in &self.hint_labels {
-                let Some(line) = overlay_lines.get_mut(*row) else {
+            let hints = self
+                .hint_labels
+                .iter()
+                .map(|(row, col, text)| (*row, *col, text.as_str(), Color::Black, Color::Yellow));
+            let extra = self
+                .text_overlays
+                .iter()
+                .map(|(row, col, text, fg, bg)| (*row, *col, text.as_str(), *fg, *bg));
+            for (row, col, text, fg, bg) in hints.chain(extra) {
+                let Some(line) = overlay_lines.get_mut(row) else {
                     continue;
                 };
                 let cells = line.cells_mut();
-                let end = (col + text.len()).min(cells.len());
+                let text_w = crate::launcher::display_width(text);
+                let end = (col + text_w).min(cells.len());
                 let mut clear = Vec::new();
                 for (i, cell) in cells.iter().enumerate() {
                     let glyph_end = i + cell.width as usize;
-                    if cell.width > 0 && i < end && glyph_end > *col {
+                    if cell.width > 0 && i < end && glyph_end > col {
                         clear.extend(i..glyph_end.min(cells.len()));
                     }
                 }
                 for i in clear {
                     cells[i] = Cell::new_ascii(' ');
                 }
-                for (i, ch) in text.chars().enumerate() {
-                    if let Some(cell) = cells.get_mut(col + i) {
-                        *cell = Cell::new_ascii(ch);
-                        cell.attr.fg = Color::Black;
-                        cell.attr.bg = Color::Yellow;
+                // 全角は2セル使う。行からはみ出す文字は描かない。
+                let fit = cells.len().saturating_sub(col).min(text_w);
+                for (i, cell) in crate::launcher::column_cells(text, fg, bg, fit)
+                    .into_iter()
+                    .enumerate()
+                {
+                    if let Some(slot) = cells.get_mut(col + i) {
+                        *slot = cell;
                     }
                 }
             }
@@ -1328,7 +1349,67 @@ impl TerminalView {
             });
         }
 
+        if let Some(layer) = self.popup_layer.take() {
+            let vs = self.popup_vertices(&layer, viewport, timestamp);
+            self.popup_layer = Some(layer);
+            if !vs.is_empty() {
+                let vb = glium::VertexBuffer::new(&self.display, &vs).unwrap();
+                self.draw_queries_popup.push(DrawQuery {
+                    vertices: vb,
+                    texture: self.cache.texture(),
+                });
+            }
+        }
+
         self.updated = false;
+    }
+
+    /// 最上層の面と文字の頂点。文字はセルの升目に縛られず、指定ピクセルに置く。
+    fn popup_vertices(
+        &mut self,
+        layer: &PopupLayer,
+        viewport: Viewport,
+        timestamp: u64,
+    ) -> Vec<CellVertex> {
+        let mut vs = Vec::new();
+        for (rect, color) in &layer.rects {
+            vs.extend_from_slice(&rect_vertices(rect.to_gl(viewport), *color, *color));
+        }
+        let cell_w = self.cell_size.w as i32;
+        for (x, top, text, fg, bg) in &layer.texts {
+            let baseline = top + self.cell_max_over;
+            let mut left = *x;
+            for ch in text.chars() {
+                let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as i32;
+                if w == 0 {
+                    continue;
+                }
+                if let Ok(Some((region, metrics))) =
+                    self.cache
+                        .get_or_insert(ch, FontStyle::Regular, &self.fonts, timestamp)
+                {
+                    if !region.is_empty() {
+                        let texture = self.cache.texture();
+                        let rect = PixelRect {
+                            x: left + (metrics.horiBearingX >> 6) as i32,
+                            y: baseline - (metrics.horiBearingY >> 6) as i32,
+                            w: region.w,
+                            h: region.h,
+                        };
+                        let uv = region.to_uv(texture.width(), texture.height());
+                        vs.extend_from_slice(&glyph_vertices(
+                            rect.to_gl(viewport),
+                            uv,
+                            *fg,
+                            *bg,
+                            0,
+                        ));
+                    }
+                }
+                left += cell_w * w;
+            }
+        }
+        vs
     }
 
     pub fn draw(&mut self, surface: &mut glium::Frame) {
@@ -1562,6 +1643,29 @@ impl TerminalView {
                     )
                     .expect("draw cursor ghost");
             }
+        }
+
+        // 右クリックメニュー：文字・画像・カーソルより後に、出現アニメーション付きで描く。
+        for query in &self.draw_queries_popup {
+            let sampler = query
+                .texture
+                .sampled()
+                .magnify_filter(uniforms::MagnifySamplerFilter::Nearest)
+                .minify_filter(uniforms::MinifySamplerFilter::Nearest);
+            let uniforms = uniform! {
+                tex: sampler, timestamp: elapsed, frame_rect: frame_rect,
+                screen: screen, radius: radius, dim: dim, flash: flash, effect: effect,
+                pop_rect: pop_rect, pop_shift: pop_shift, pop_alpha: pop_alpha,
+            };
+            surface
+                .draw(
+                    &query.vertices,
+                    TRIANGLES,
+                    &self.program_cell,
+                    &uniforms,
+                    &self.draw_params,
+                )
+                .expect("draw popup layer");
         }
     }
 
@@ -1839,7 +1943,10 @@ pub(crate) fn popup_shadow(
     cell: CellSize,
 ) -> Vec<(PixelRect, Color)> {
     let (left, top) = ((x0 as u32 * cell.w) as i32, (y0 as u32 * cell.h) as i32);
-    let (right, bottom) = (left + (w as u32 * cell.w) as i32, top + (h as u32 * cell.h) as i32);
+    let (right, bottom) = (
+        left + (w as u32 * cell.w) as i32,
+        top + (h as u32 * cell.h) as i32,
+    );
     let mut out = Vec::new();
     for (off, alpha) in [(4u32, 0x70u32), (9, 0x38)] {
         let color = Color::Rgb { rgba: alpha };
@@ -1890,6 +1997,93 @@ pub(crate) fn panel_bg_color() -> Color {
     Color::Rgb {
         rgba: (bg & 0xFFFF_FF00) | 0xFF,
     }
+}
+
+/// 色 a と b を t の割合で混ぜた不透明色（a, b は 0xRRGGBBAA）。
+pub(crate) fn mix_color(a: u32, b: u32, t: f32) -> Color {
+    let ch = |rgba: u32, shift: u32| ((rgba >> shift) & 0xFF) as f32;
+    let mut out = 0xFF;
+    for shift in [24, 16, 8] {
+        let v = ch(a, shift) * t + ch(b, shift) * (1.0 - t);
+        out |= (v.round().clamp(0.0, 255.0) as u32) << shift;
+    }
+    Color::Rgb { rgba: out }
+}
+
+/// 端末の上に重ねる面と文字（ビュー内のピクセル座標）。
+#[derive(Clone, Default)]
+pub(crate) struct PopupLayer {
+    pub(crate) rects: Vec<(PixelRect, Color)>,
+    /// (左端x, 行の上端y, 文字, 文字色, 下地の色)。1文字の送りはセル幅×表示幅。
+    pub(crate) texts: Vec<(i32, i32, String, Color, Color)>,
+}
+
+/// 角丸の矩形を、横に細切れにした矩形の集まりで表す。角の縁の1画素は
+/// 覆う割合で薄くし（簡易アンチエイリアス）、ギザギザを目立たせない。
+pub(crate) fn rounded_rect(rect: PixelRect, radius: u32, color: Color) -> Vec<(PixelRect, Color)> {
+    let rgba = color_to_rgba(color);
+    let alpha = (rgba & 0xFF) as f32;
+    let with_alpha = |a: f32| Color::Rgb {
+        rgba: (rgba & 0xFFFF_FF00) | (a.round().clamp(1.0, 255.0) as u32),
+    };
+    let r = radius.min(rect.w / 2).min(rect.h / 2);
+    let mut out = Vec::new();
+    if r == 0 {
+        out.push((rect, color));
+        return out;
+    }
+    let rf = r as f32;
+    for yy in 0..r {
+        let dy = rf - yy as f32 - 0.5;
+        let edge = rf - (rf * rf - dy * dy).max(0.0).sqrt();
+        let full = edge.ceil() as u32;
+        let part = edge.floor() as u32;
+        let coverage = full as f32 - edge;
+        for y in [rect.y + yy as i32, rect.y + rect.h as i32 - 1 - yy as i32] {
+            if rect.w > full * 2 {
+                out.push((
+                    PixelRect {
+                        x: rect.x + full as i32,
+                        y,
+                        w: rect.w - full * 2,
+                        h: 1,
+                    },
+                    color,
+                ));
+            }
+            if part < full && coverage > 0.02 {
+                let c = with_alpha(alpha * coverage);
+                out.push((
+                    PixelRect {
+                        x: rect.x + part as i32,
+                        y,
+                        w: 1,
+                        h: 1,
+                    },
+                    c,
+                ));
+                out.push((
+                    PixelRect {
+                        x: rect.x + rect.w as i32 - 1 - part as i32,
+                        y,
+                        w: 1,
+                        h: 1,
+                    },
+                    c,
+                ));
+            }
+        }
+    }
+    out.push((
+        PixelRect {
+            x: rect.x,
+            y: rect.y + r as i32,
+            w: rect.w,
+            h: rect.h - r * 2,
+        },
+        color,
+    ));
+    out
 }
 
 #[derive(Clone, Copy)]

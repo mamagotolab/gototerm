@@ -567,6 +567,19 @@ pub fn reset_ime_cursor_area_cache() {
 
 pub struct TerminalWindow {
     link_hints: Option<crate::link_hints::LinkHints>,
+    /// 右クリックメニュー（開いている間はマウス・キーをここで受ける）。
+    context_menu: Option<crate::context_menu::ContextMenu>,
+    /// メニューで使ったクリックの「離し」を端末へ流さないための印。
+    swallow_release: bool,
+    /// メニューで選ばれた、マネージャが行う操作（分割・タブなど）。
+    menu_request: Option<ShortcutAction>,
+    /// コピーモードの検索欄に入力中の (検索語, 前方か)。
+    search_input: Option<(String, bool)>,
+    search_preedit: String,
+    /// n / N で繰り返す直前の検索。
+    last_search: Option<(String, bool)>,
+    /// 「見つかりません」などの一行表示。次のキーで消える。
+    search_message: Option<String>,
     tui_copy: Option<crate::tui_copy::TuiCopy>,
     copy_snapshot: Option<crate::vt::Snapshot>,
     copy_drag_origin: Option<(usize, usize)>,
@@ -694,6 +707,13 @@ impl TerminalWindow {
             scroll_offset: 0,
             scrolled_at: None,
             link_hints: None,
+            context_menu: None,
+            swallow_release: false,
+            menu_request: None,
+            search_input: None,
+            search_preedit: String::new(),
+            last_search: None,
+            search_message: None,
             tui_copy: None,
             copy_snapshot: None,
             copy_drag_origin: None,
@@ -899,6 +919,11 @@ impl TerminalWindow {
         self.terminal
             .location()
             .or_else(|| self.terminal.cwd().map(ShellLocation::Local))
+    }
+
+    /// 右クリックメニューで選ばれた、マネージャ側の操作（分割・新しいタブ・閉じる）。
+    pub(crate) fn take_menu_request(&mut self) -> Option<ShortcutAction> {
+        self.menu_request.take()
     }
 
     pub fn take_clicked_file(&mut self) -> Option<PathBuf> {
@@ -1161,6 +1186,12 @@ impl TerminalWindow {
     /// CloseRequested / Resized / RedrawRequested / AboutToWait といった
     /// ウィンドウ全体の制御はマネージャ側が持ち、ここでは扱わない。
     pub fn process_window_event(&mut self, event: &WindowEvent) {
+        if self.search_input.is_some() {
+            if let WindowEvent::Ime(ime) = event {
+                self.handle_search_ime(ime);
+                return;
+            }
+        }
         if self.local_input_mode() && matches!(event, WindowEvent::Ime(_)) {
             self.view.update_contents(|view| view.preedit.clear());
             return;
@@ -1214,6 +1245,15 @@ impl TerminalWindow {
                 let x = position.x - viewport.x as f64;
                 let y = position.y - viewport.y as f64;
                 self.mouse.cursor_pos = CursorPosition { x, y };
+                if self.context_menu.is_some() {
+                    let menu = self.context_menu.as_mut().unwrap();
+                    let hovered = menu.item_at(x as i32, y as i32);
+                    if hovered != menu.hovered {
+                        menu.hovered = hovered;
+                        self.refresh_text_overlays();
+                    }
+                    return;
+                }
                 if self.mouse.selecting {
                     self.update_mouse_selection();
                     if let Some(end) = self.mouse_cell() {
@@ -1225,6 +1265,25 @@ impl TerminalWindow {
             }
 
             WindowEvent::MouseInput { state, button, .. } => {
+                if *state == ElementState::Released && self.swallow_release {
+                    self.swallow_release = false;
+                    return;
+                }
+                if self.context_menu.is_some() {
+                    if *state == ElementState::Pressed {
+                        self.swallow_release = true;
+                        let CursorPosition { x, y } = self.mouse.cursor_pos;
+                        let picked = self
+                            .context_menu
+                            .as_ref()
+                            .and_then(|menu| menu.item(menu.item_at(x as i32, y as i32)?));
+                        self.close_context_menu();
+                        if let Some(item) = picked.filter(|_| *button == MouseButton::Left) {
+                            self.run_menu_item(item);
+                        }
+                    }
+                    return;
+                }
                 let is_inner = {
                     let viewport = self.view.viewport();
                     let (w, h) = (viewport.w as f64, viewport.h as f64);
@@ -1250,6 +1309,17 @@ impl TerminalWindow {
                         self.modifiers.shift_key(),
                         *button == MouseButton::Left && self.ctrl_url_under_mouse(),
                     );
+                // 右クリックはメニューを開く（アプリがマウスを使っている間はアプリへ。
+                // Shift+右クリックならメニュー）。今の選択は消さずに残す。
+                if *button == MouseButton::Right
+                    && *state == ElementState::Pressed
+                    && !report_to_app
+                    && self.search_input.is_none()
+                {
+                    self.swallow_release = true;
+                    self.open_context_menu();
+                    return;
+                }
                 let report = match state {
                     ElementState::Pressed => report_to_app,
                     // 押下をアプリへ送った後にCtrlを押しても、解放は同じ相手へ送る。
@@ -1523,6 +1593,14 @@ impl TerminalWindow {
             PhysicalKey::Unidentified(_) => return,
         };
 
+        if self.context_menu.is_some() {
+            self.handle_context_menu_key(keycode);
+            return;
+        }
+        if self.search_input.is_some() {
+            self.handle_search_key(key_event, keycode);
+            return;
+        }
         if self.link_hints.is_some() {
             self.handle_link_hint_key(key_event);
             return;
@@ -1533,6 +1611,25 @@ impl TerminalWindow {
         }
 
         if self.copy_mode_active() {
+            if self.search_message.take().is_some() {
+                self.refresh_text_overlays();
+            }
+            // 履歴の検索（vim と同じ / ? n N）。TUI 画面のコピーでは履歴がないので使わない。
+            if self.tui_copy.is_none() && !self.modifiers.control_key() {
+                if let winit::keyboard::Key::Character(c) = &key_event.logical_key {
+                    match c.as_str() {
+                        "/" | "?" => {
+                            self.start_search(c.as_str() == "/");
+                            return;
+                        }
+                        "n" | "N" => {
+                            self.repeat_search(c.as_str() == "n");
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             self.handle_copy_mode_key(keycode);
             return;
         }
@@ -1722,7 +1819,8 @@ impl TerminalWindow {
     }
 
     pub(crate) fn local_input_mode(&self) -> bool {
-        self.copy_mode_active() || self.link_hints.is_some()
+        (self.copy_mode_active() || self.link_hints.is_some() || self.context_menu.is_some())
+            && self.search_input.is_none()
     }
 
     fn cancel_link_hints(&mut self) {
@@ -1871,6 +1969,10 @@ impl TerminalWindow {
     }
 
     fn exit_copy_mode(&mut self) {
+        self.search_input = None;
+        self.search_preedit.clear();
+        self.search_message = None;
+        self.refresh_text_overlays();
         exit_terminal_copy_mode(&self.terminal, &mut self.copy_keyboard);
         self.end_tui_copy();
         self.window.set_ime_allowed(true);
@@ -2122,6 +2224,350 @@ impl TerminalWindow {
         }
     }
 
+    fn has_selection(&self) -> bool {
+        self.tui_copy.as_ref().and_then(|c| c.text()).is_some()
+            || self.terminal.tracked_selection_text().is_some()
+    }
+
+    fn open_context_menu(&mut self) {
+        use crate::context_menu::{ContextMenu, Entry, MenuItem, Metrics};
+        if self.mouse_cell().is_none() {
+            return;
+        }
+        let item = |item: MenuItem, enabled: bool| Entry::Item {
+            item,
+            enabled,
+            shortcut: item
+                .shortcut()
+                .and_then(keybindings::binding_label)
+                .unwrap_or_default(),
+        };
+        let history = !self.tui_app_screen();
+        let entries = vec![
+            item(MenuItem::Copy, self.has_selection()),
+            item(MenuItem::Paste, true),
+            Entry::Separator,
+            item(MenuItem::Search, history),
+            item(MenuItem::ClearHistory, true),
+            item(MenuItem::Reset, true),
+            Entry::Separator,
+            item(MenuItem::SplitRight, true),
+            item(MenuItem::SplitDown, true),
+            item(MenuItem::NewTab, true),
+            Entry::Separator,
+            item(MenuItem::ClosePane, true),
+        ];
+        let vp = self.view.viewport();
+        let cell = self.view.cell_size();
+        let CursorPosition { x, y } = self.mouse.cursor_pos;
+        self.context_menu = Some(ContextMenu::new(
+            entries,
+            x as i32,
+            y as i32,
+            vp.w,
+            vp.h,
+            Metrics::new(cell.w, cell.h),
+        ));
+        self.window.set_ime_allowed(false);
+        self.window
+            .set_cursor_icon(winit::window::CursorIcon::Default);
+        self.refresh_text_overlays();
+    }
+
+    fn close_context_menu(&mut self) {
+        if self.context_menu.take().is_some() {
+            self.refresh_text_overlays();
+            self.refresh_cursor_icon();
+            if self.focused {
+                self.window.set_ime_allowed(!self.local_input_mode());
+            }
+        }
+    }
+
+    fn handle_context_menu_key(&mut self, code: KeyCode) {
+        let Some(menu) = self.context_menu.as_mut() else {
+            return;
+        };
+        match code {
+            KeyCode::ArrowDown | KeyCode::ArrowUp => {
+                menu.move_hover(code == KeyCode::ArrowDown);
+                self.refresh_text_overlays();
+            }
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                let item = menu.hovered.and_then(|i| menu.item(i));
+                self.close_context_menu();
+                if let Some(item) = item {
+                    self.run_menu_item(item);
+                }
+            }
+            _ => self.close_context_menu(),
+        }
+    }
+
+    fn run_menu_item(&mut self, item: crate::context_menu::MenuItem) {
+        use crate::context_menu::MenuItem;
+        match item {
+            MenuItem::Copy => self.copy_clipboard(),
+            MenuItem::Paste => {
+                self.clear_mouse_selection();
+                self.terminal.scroll_to_bottom();
+                self.paste_clipboard();
+            }
+            MenuItem::Search => {
+                self.end_tui_copy();
+                if !self.terminal.copy_mode_active() {
+                    self.terminal.toggle_copy_mode();
+                }
+                // 新しい出力に近い方から探す。
+                self.start_search(false);
+            }
+            MenuItem::ClearHistory => self.terminal.clear_history(),
+            MenuItem::Reset => {
+                self.terminal.reset();
+                // シェルにプロンプトを出し直してもらう（Ctrl+L＝画面の描き直し）。
+                self.terminal.write(b"\x0c");
+            }
+            other => self.menu_request = other.shortcut(),
+        }
+    }
+
+    fn start_search(&mut self, forward: bool) {
+        self.search_input = Some((String::new(), forward));
+        self.search_preedit.clear();
+        self.search_message = None;
+        self.refresh_text_overlays();
+        self.window.set_ime_allowed(true);
+        reset_ime_cursor_area_cache();
+        self.update_search_ime_position();
+    }
+
+    fn end_search_input(&mut self) {
+        self.search_input = None;
+        self.search_preedit.clear();
+        self.view.update_contents(|view| view.preedit.clear());
+        self.window.set_ime_allowed(!self.local_input_mode());
+        self.refresh_text_overlays();
+    }
+
+    fn handle_search_key(&mut self, key: &KeyEvent, code: KeyCode) {
+        if !self.search_preedit.is_empty() {
+            return;
+        }
+        match code {
+            KeyCode::Escape => self.end_search_input(),
+            KeyCode::Enter | KeyCode::NumpadEnter => {
+                // IME の確定に使った Enter は検索の実行にしない。
+                if self.last_ime_commit.elapsed() < std::time::Duration::from_millis(50) {
+                    return;
+                }
+                let Some((query, forward)) = self.search_input.take() else {
+                    return;
+                };
+                self.end_search_input();
+                if !query.is_empty() {
+                    self.run_search(query, forward, false);
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some((query, _)) = self.search_input.as_mut() {
+                    if query.pop().is_none() {
+                        self.end_search_input();
+                        return;
+                    }
+                }
+                self.refresh_text_overlays();
+            }
+            _ => {
+                if self.modifiers.control_key() || self.modifiers.alt_key() {
+                    return;
+                }
+                if let (Some(text), Some((query, _))) = (&key.text, self.search_input.as_mut()) {
+                    query.extend(text.chars().filter(|c| !c.is_control()));
+                    self.refresh_text_overlays();
+                }
+            }
+        }
+    }
+
+    fn handle_search_ime(&mut self, ime: &Ime) {
+        match ime {
+            Ime::Preedit(text, _) => {
+                self.search_preedit = text.clone();
+                self.update_search_ime_position();
+            }
+            Ime::Commit(text) => {
+                if let Some((query, _)) = self.search_input.as_mut() {
+                    query.push_str(text);
+                }
+                self.search_preedit.clear();
+                self.last_ime_commit = std::time::Instant::now();
+            }
+            Ime::Enabled | Ime::Disabled => {
+                self.search_preedit.clear();
+                reset_ime_cursor_area_cache();
+                self.update_search_ime_position();
+            }
+        }
+        self.refresh_text_overlays();
+    }
+
+    /// IME の候補窓を検索欄（最下行）の入力位置に出す。
+    fn update_search_ime_position(&self) {
+        let Some((query, _)) = &self.search_input else {
+            return;
+        };
+        let (_, rows) = self.terminal.size();
+        let cell_size = self.view.cell_size();
+        let vp = self.view.viewport();
+        let col = 1 + crate::launcher::display_width(query) as u32;
+        self.set_ime_area(
+            vp.x + col * cell_size.w,
+            vp.y + rows.saturating_sub(1) as u32 * cell_size.h,
+            cell_size.w,
+            cell_size.h,
+        );
+    }
+
+    fn run_search(&mut self, query: String, forward: bool, skip_current: bool) {
+        let found = self
+            .terminal
+            .copy_mode_search(&query, forward, skip_current);
+        self.search_message = (!found).then(|| format!(" 見つかりません: {query} "));
+        self.last_search = Some((query, forward));
+        self.refresh_text_overlays();
+    }
+
+    /// n＝前回と同じ向き、N＝逆向きに次の一致へ。
+    fn repeat_search(&mut self, same_direction: bool) {
+        if let Some((query, forward)) = self.last_search.clone() {
+            let direction = if same_direction { forward } else { !forward };
+            self.run_search(query, direction, true);
+            // 向きは最初の検索のまま覚えておく（N を続けても反転しない）。
+            self.last_search = Some((self.last_search.take().unwrap().0, forward));
+        }
+    }
+
+    /// 右クリックメニュー（最上層）と検索欄（最下行）を端末の上に描く。
+    fn refresh_text_overlays(&mut self) {
+        use crate::terminal::Color;
+        use crate::view::{rounded_rect, PixelRect, PopupLayer};
+        let (cols, rows) = self.terminal.size();
+        let mut texts = Vec::new();
+        let mut layer = None;
+        let mut popup = None;
+        if let Some(menu) = &self.context_menu {
+            let [bg, border, accent, disabled, keys] = menu_palette();
+            let m = menu.metrics;
+            let mut out = PopupLayer::default();
+            let panel = PixelRect {
+                x: menu.x,
+                y: menu.y,
+                w: menu.w,
+                h: menu.h,
+            };
+            // 影：少しずつ広げた薄い角丸を重ね、下へ落ちるぼかしに見せる。
+            const SHADOW: u32 = 10;
+            for k in (1..=SHADOW).rev() {
+                let grow = PixelRect {
+                    x: panel.x - k as i32,
+                    y: panel.y - k as i32 + 5,
+                    w: panel.w + k * 2,
+                    h: panel.h + k * 2,
+                };
+                out.rects
+                    .extend(rounded_rect(grow, m.radius + k, Color::Rgb { rgba: 0x0B }));
+            }
+            out.rects.extend(rounded_rect(panel, m.radius, border));
+            let inner = PixelRect {
+                x: panel.x + 1,
+                y: panel.y + 1,
+                w: panel.w - 2,
+                h: panel.h - 2,
+            };
+            out.rects
+                .extend(rounded_rect(inner, m.radius.saturating_sub(1), bg));
+            for row in menu.rows() {
+                match &menu.entries[row.index] {
+                    crate::context_menu::Entry::Separator => out.rects.push((
+                        PixelRect {
+                            x: panel.x + m.pad_x as i32 / 2,
+                            y: row.top + row.height as i32 / 2,
+                            w: panel.w - m.pad_x,
+                            h: 1,
+                        },
+                        border,
+                    )),
+                    crate::context_menu::Entry::Item {
+                        item,
+                        enabled,
+                        shortcut,
+                    } => {
+                        if menu.hovered == Some(row.index) {
+                            let inset = (m.pad_x / 3).max(4);
+                            let hover = PixelRect {
+                                x: panel.x + inset as i32,
+                                y: row.top + 1,
+                                w: panel.w - inset * 2,
+                                h: row.height - 2,
+                            };
+                            out.rects
+                                .extend(rounded_rect(hover, (m.radius / 2).max(4), accent));
+                        }
+                        let text_top = row.top + (row.height as i32 - m.cell_h as i32) / 2;
+                        let fg = if *enabled {
+                            Color::BrightWhite
+                        } else {
+                            disabled
+                        };
+                        out.texts.push((
+                            panel.x + m.pad_x as i32,
+                            text_top,
+                            item.label().to_string(),
+                            fg,
+                            bg,
+                        ));
+                        if !shortcut.is_empty() {
+                            let sw = crate::launcher::display_width(shortcut) as u32 * m.cell_w;
+                            let fg = if *enabled { keys } else { disabled };
+                            out.texts.push((
+                                panel.x + (panel.w - m.pad_x - sw) as i32,
+                                text_top,
+                                shortcut.clone(),
+                                fg,
+                                bg,
+                            ));
+                        }
+                    }
+                }
+            }
+            popup = Some(PixelRect {
+                x: panel.x - SHADOW as i32,
+                y: panel.y - SHADOW as i32,
+                w: panel.w + SHADOW * 2,
+                h: panel.h + SHADOW * 2 + 5,
+            });
+            layer = Some(out);
+        }
+        let bottom = rows.saturating_sub(1);
+        let pad = |mut text: String| {
+            let w = crate::launcher::display_width(&text);
+            text.extend(std::iter::repeat_n(' ', cols.saturating_sub(w)));
+            text
+        };
+        if let Some((query, forward)) = &self.search_input {
+            let prefix = if *forward { "/" } else { "?" };
+            let text = pad(format!("{prefix}{query}{}_", self.search_preedit));
+            texts.push((bottom, 0, text, Color::BrightWhite, Color::BrightBlack));
+        } else if let Some(message) = &self.search_message {
+            texts.push((bottom, 0, message.clone(), Color::Black, Color::Yellow));
+        }
+        self.view.set_popup_rect(popup);
+        self.view.update_contents(|view| {
+            view.text_overlays = texts;
+            view.popup_layer = layer;
+        });
+    }
+
     fn paste_clipboard(&mut self) {
         let text = get_clipboard();
         log::debug!("paste: {:?}", text);
@@ -2152,6 +2598,27 @@ impl TerminalWindow {
         self.terminal
             .write(format!("\x1b[<{button};{col};{row}{m}").as_bytes());
     }
+}
+
+/// 右クリックメニューの色：(面, 枠線と区切り, ホバー, 無効な項目, ショートカット)。
+/// 面は背景色を少し明るくした不透明色（壁紙が透けると文字が読みにくい）。
+/// 薄い文字も暗くしすぎない（にじんで解像度が落ちたように見えるため）。
+fn menu_palette() -> [crate::terminal::Color; 5] {
+    use crate::terminal::Color;
+    use crate::view::mix_color as mix;
+    let config = &crate::TOYTERM_CONFIG;
+    let (fg, bg) = (config.color_foreground, config.color_background);
+    [
+        mix(0xFFFFFFFF, bg, 0.06),
+        Color::Rgb {
+            rgba: (config.color_bright_black & 0xFFFF_FF00) | 0xA0,
+        },
+        Color::Rgb {
+            rgba: (config.color_blue & 0xFFFF_FF00) | 0x50,
+        },
+        mix(fg, bg, 0.5),
+        mix(fg, bg, 0.72),
+    ]
 }
 
 fn dedent_common_indent(text: &str) -> String {
@@ -2400,9 +2867,9 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
     use super::{
-        dedent_common_indent, meta_prefixed, opens_externally, report_mouse_to_app, scroll_bar_geometry, clean_agent_title,
-        resolve_clicked_file, resolve_existing_file_token, resolve_path_token,
-        selection_type_for_click, visible_selection,
+        clean_agent_title, dedent_common_indent, meta_prefixed, opens_externally,
+        report_mouse_to_app, resolve_clicked_file, resolve_existing_file_token, resolve_path_token,
+        scroll_bar_geometry, selection_type_for_click, visible_selection,
     };
     use crate::view::Selection;
     use crate::vt::GridSelection;
@@ -2567,7 +3034,10 @@ mod tests {
 
     #[test]
     fn agent_title_drops_status_symbols() {
-        assert_eq!(clean_agent_title("✳ 見積もり作成").as_deref(), Some("見積もり作成"));
+        assert_eq!(
+            clean_agent_title("✳ 見積もり作成").as_deref(),
+            Some("見積もり作成")
+        );
         assert_eq!(clean_agent_title("⠂ note記事").as_deref(), Some("note記事"));
         assert_eq!(clean_agent_title("✳ "), None);
     }

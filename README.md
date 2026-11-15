@@ -444,6 +444,7 @@ shell = ["/usr/bin/fish"]          # 起動するシェル（省略時は $SHELL
 east_asian_width_ambiguous = 1     # 曖昧幅文字を全角(2マス)扱いなら 1、半角扱いなら 0
 scroll_bar_width = 5               # スクロールバーの幅(px)。0 で非表示
 status_bar_font_size = 16          # タブバー（複数タブのときだけ表示）の文字サイズ
+tab_bar_position = "top"           # タブバーの位置。"top"（上・既定）か "bottom"（下）
 cursor_blink = true                # カーソルを点滅させるか
 cursor_thickness = 8               # バー/下線カーソルの太さ(px)。ブロックカーソルには影響しない
 ```

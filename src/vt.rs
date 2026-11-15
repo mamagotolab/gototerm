@@ -1527,6 +1527,16 @@ impl VtTerminal {
     }
 
     /// スクロールバック（履歴）を消去する。
+    /// 端末を初期状態に戻す（文字化け・色の崩れ・モードの残りを直す）。
+    /// 画面と履歴も消える。シェル自体はそのまま動き続ける。
+    pub(crate) fn reset(&self) {
+        use alacritty_terminal::vte::ansi::Handler as _;
+        let mut term = self.term.lock().unwrap();
+        term.reset_state();
+        *self.selection_drag.lock().unwrap() = None;
+        self.dirty.store(true, Ordering::SeqCst);
+    }
+
     pub fn clear_history(&self) {
         let mut term = self.term.lock().unwrap();
         term.grid_mut().clear_history();
@@ -1609,6 +1619,50 @@ impl VtTerminal {
             term.selection = Some(selection);
         }
         self.dirty.store(true, Ordering::SeqCst);
+    }
+
+    /// コピーモードで履歴を文字検索し、見つかった箇所へカーソルを移して選択する
+    /// （そのまま y でコピーできる）。`skip_current` は n/N 用で、今いる一致を飛ばす。
+    /// 見つからなければ false。入力はそのままの文字として探す（正規表現にしない）。
+    pub(crate) fn copy_mode_search(&self, query: &str, forward: bool, skip_current: bool) -> bool {
+        use alacritty_terminal::index::{Boundary, Direction};
+        use alacritty_terminal::term::search::RegexSearch;
+        if query.is_empty() {
+            return false;
+        }
+        let Ok(mut regex) = RegexSearch::new(&escape_search_text(query)) else {
+            return false;
+        };
+        let mut term = self.term.lock().unwrap();
+        let cursor = term.vi_mode_cursor.point;
+        let (origin, direction, side) = match (forward, skip_current) {
+            (true, true) => (
+                cursor.add(&*term, Boundary::None, 1),
+                Direction::Right,
+                Side::Left,
+            ),
+            (true, false) => (cursor, Direction::Right, Side::Left),
+            (false, true) => (
+                cursor.sub(&*term, Boundary::None, 1),
+                Direction::Left,
+                Side::Right,
+            ),
+            (false, false) => (cursor, Direction::Left, Side::Right),
+        };
+        let Some(found) = term.search_next(&mut regex, origin, direction, side, None) else {
+            return false;
+        };
+        let (start, end) = if found.start() <= found.end() {
+            (*found.start(), *found.end())
+        } else {
+            (*found.end(), *found.start())
+        };
+        term.vi_goto_point(start);
+        let mut selection = AlacSelection::new(SelectionType::Simple, start, Side::Left);
+        selection.update(end, Side::Right);
+        term.selection = Some(selection);
+        self.dirty.store(true, Ordering::SeqCst);
+        true
     }
 
     /// 現在のスクロールバック表示量（行）。0=最下部。選択を絶対行に
@@ -1753,6 +1807,18 @@ impl VtTerminal {
 // ============================================================================
 // 描画アダプタ：alacritty のグリッドを既存の描画形式(Line/Cell)へ変換する
 // ============================================================================
+
+/// 検索語を正規表現の記号として扱わず、そのままの文字として探すための変換。
+pub(crate) fn escape_search_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if "\\.+*?()|[]{}^$#&-~".contains(ch) {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    out
+}
 
 use crate::terminal::{
     Cell as TCell, Color as TColor, Cursor as TCursor, CursorStyle, GraphicAttribute, Line as TLine,
@@ -3231,6 +3297,31 @@ mod tests {
         assert!(f.rows[0].wrapped);
         assert_eq!(f.rows[1].cells[0], "語");
     }
+    #[test]
+    fn copy_mode_search_finds_history_text_and_repeats() {
+        let command = vec!["sh".into(), "-c".into(), "exit 0".into()];
+        let terminal = VtTerminal::new(20, 4, 9, 18, Path::new("."), Some(&command));
+        let mut processor: Processor = Processor::new();
+        for line in ["エラー a.c", "ok", "x.y エラー", "ok", "ok", "ok", "ok"] {
+            processor.advance(
+                &mut *terminal.term.lock().unwrap(),
+                format!("{line}\r\n").as_bytes(),
+            );
+        }
+        terminal.toggle_copy_mode();
+        // 下から上へ：新しい方の「エラー」が先に見つかる
+        assert!(terminal.copy_mode_search("エラー", false, false));
+        assert_eq!(terminal.tracked_selection_text().unwrap().1, "エラー");
+        let first = terminal.term.lock().unwrap().vi_mode_cursor.point;
+        assert!(terminal.copy_mode_search("エラー", false, true));
+        let second = terminal.term.lock().unwrap().vi_mode_cursor.point;
+        assert!(second.line < first.line);
+        // 記号は正規表現ではなく文字として探す
+        assert!(terminal.copy_mode_search("x.y", false, false));
+        assert!(!terminal.copy_mode_search("a+c", false, false));
+        assert!(!terminal.copy_mode_search("存在しない", true, false));
+    }
+
     #[test]
     fn copy_mode_selection_crosses_scrollback_without_moving_anchor() {
         let command = vec!["sh".into(), "-c".into(), "exit 0".into()];

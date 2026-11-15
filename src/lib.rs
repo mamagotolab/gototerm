@@ -12,6 +12,7 @@ mod input;
 mod keybindings;
 mod file_style;
 mod launcher;
+mod context_menu;
 mod link_hints;
 mod preview;
 mod reader;

@@ -98,6 +98,15 @@ pub(crate) fn lookup(modifiers: ModifiersState, key: KeyCode) -> Option<Shortcut
         .copied()
 }
 
+/// 操作に割り当てたキーの表示名（例 "Ctrl+Shift+C"）。複数あれば短い方。
+pub(crate) fn binding_label(action: ShortcutAction) -> Option<String> {
+    KEYBINDINGS
+        .iter()
+        .filter(|(_, bound)| **bound == action)
+        .map(|(key, _)| key.display())
+        .min_by_key(|label| (label.len(), label.clone()))
+}
+
 fn build_or_exit() -> HashMap<KeyBinding, ShortcutAction> {
     match build() {
         Ok(bindings) => bindings,

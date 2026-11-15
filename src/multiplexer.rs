@@ -27,8 +27,8 @@ use crate::session_review::{SessionReview, SessionReviewOutcome, SessionSummary}
 use crate::sidebar::{Sidebar, SidebarKeyResult, SidebarRequest};
 use crate::task_activity::{sanitize_display_text, ActivityKind, PaneId};
 use crate::task_overview::{OverviewOutcome, TaskOverview, TaskRow};
-use crate::terminal::{Cell, Color, Line};
-use crate::view::{PixelRect, TerminalView, Viewport};
+use crate::terminal::{Color, Line};
+use crate::view::{TerminalView, Viewport};
 use crate::vt::ShellLocation;
 use crate::window::TerminalWindow;
 use crate::Display;
@@ -317,6 +317,111 @@ fn synchronize_focused_tab_workbench<T>(
     }
 }
 
+fn shortcut_action(shortcut: ShortcutAction) -> Option<Action> {
+    match shortcut {
+        ShortcutAction::NewTab => Some(Action::NewTab),
+        ShortcutAction::OpenLauncher => Some(Action::OpenLauncher),
+        ShortcutAction::OpenTaskOverview => Some(Action::OpenTaskOverview),
+        ShortcutAction::OpenTasks => Some(Action::OpenTasks),
+        ShortcutAction::ClosePane => Some(Action::CloseFocused),
+        ShortcutAction::NextTab => Some(Action::NextTab),
+        ShortcutAction::PrevTab => Some(Action::PrevTab),
+        ShortcutAction::SelectTab(index) => Some(Action::SelectTab(index)),
+        ShortcutAction::SplitVertical => Some(Action::SplitVertical),
+        ShortcutAction::SplitHorizontal => Some(Action::SplitHorizontal),
+        ShortcutAction::ToggleSidebar => Some(Action::ToggleSidebar),
+        ShortcutAction::ToggleFollow => Some(Action::ToggleFollow),
+        ShortcutAction::FocusLeft => Some(Action::Focus(Dir::Left)),
+        ShortcutAction::FocusDown => Some(Action::Focus(Dir::Down)),
+        ShortcutAction::FocusUp => Some(Action::Focus(Dir::Up)),
+        ShortcutAction::FocusRight => Some(Action::Focus(Dir::Right)),
+        ShortcutAction::ResizeUp => Some(Action::Resize(Dir::Up)),
+        ShortcutAction::ResizeDown => Some(Action::Resize(Dir::Down)),
+        ShortcutAction::ResizeLeft => Some(Action::Resize(Dir::Left)),
+        ShortcutAction::ResizeRight => Some(Action::Resize(Dir::Right)),
+        ShortcutAction::IncreaseFont => Some(Action::ChangeFont(1)),
+        ShortcutAction::DecreaseFont => Some(Action::ChangeFont(-1)),
+        ShortcutAction::Copy
+        | ShortcutAction::Paste
+        | ShortcutAction::ClearHistory
+        | ShortcutAction::CopyMode
+        | ShortcutAction::LinkHints => None,
+    }
+}
+
+/// タブバーに並ぶ1枚のタブの位置（タブバー内のピクセル）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TabSlot {
+    index: usize,
+    x: i32,
+    w: u32,
+}
+
+/// タブを左から等分に並べる（Ghostty 風に幅いっぱい・ただし広がりすぎない）。
+/// 入りきらないときは選択中のタブが見える範囲を出す。
+fn layout_tabs(count: usize, focus: usize, avail: u32, cell_w: u32) -> Vec<TabSlot> {
+    if count == 0 || avail == 0 {
+        return Vec::new();
+    }
+    let cell_w = cell_w.max(1);
+    let (min_w, max_w) = (cell_w * 12, cell_w * 32);
+    let visible = ((avail / min_w).max(1) as usize).min(count);
+    let w = (avail / visible as u32).min(max_w);
+    let first = if count > visible {
+        focus.saturating_sub(visible - 1).min(count - visible)
+    } else {
+        0
+    };
+    (0..visible)
+        .map(|i| TabSlot {
+            index: first + i,
+            x: (i as u32 * w) as i32,
+            w,
+        })
+        .collect()
+}
+
+/// 題名を表示幅 `max` 列に収める（はみ出す分は「…」）。
+fn fit_title(title: &str, max: usize) -> String {
+    if crate::launcher::display_width(title) <= max {
+        return title.to_string();
+    }
+    if max == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in title.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
+        if used + w + 1 > max {
+            break;
+        }
+        out.push(ch);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
+/// タブの「×」の位置 (x, 幅)。狭いタブには出さない。
+fn tab_close_box(slot: &TabSlot, cell_w: u32) -> Option<(i32, u32)> {
+    let size = cell_w * 2;
+    (slot.w >= cell_w * 10).then(|| {
+        (
+            slot.x + slot.w as i32 - size as i32 - cell_w as i32 / 2,
+            size,
+        )
+    })
+}
+
+/// x にあるタブの番号と、その「×」の上か。
+fn tab_at(slots: &[TabSlot], x: i32, cell_w: u32) -> Option<(usize, bool)> {
+    let slot = slots.iter().find(|s| x >= s.x && x < s.x + s.w as i32)?;
+    let on_close =
+        tab_close_box(slot, cell_w).is_some_and(|(cx, cw)| x >= cx && x < cx + cw as i32);
+    Some((slot.index, on_close))
+}
+
 fn adjacent_tab_index(focus: usize, tab_count: usize, next: bool) -> usize {
     if next {
         (focus + 1) % tab_count
@@ -374,14 +479,6 @@ fn capture_workspace_location(
 }
 
 /// 太さ（bold: 1=太字 / 0=通常 / -1=淡色）を指定した文字セル。
-fn column_cells_styled(text: &str, fg: Color, bg: Color, width: usize, bold: i8) -> Vec<Cell> {
-    let mut cells = crate::launcher::column_cells(text, fg, bg, width);
-    for cell in &mut cells {
-        cell.attr.bold = bold;
-    }
-    cells
-}
-
 /// プロジェクト（フォルダ）ごとに決まる色印。同じ場所のタブは同じ色になる。
 /// 赤・黄は状態表示（警告・許可待ち）と紛れるので使わない。
 fn project_mark_color(path: &Path) -> Color {
@@ -994,6 +1091,30 @@ impl PaneTreeNode for Node {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn tabs_fill_the_bar_and_keep_the_focused_tab_visible() {
+        use super::{layout_tabs, tab_at};
+        // 3枚・幅1000px・セル10px → 1枚 320px（上限32セル）
+        let slots = layout_tabs(3, 0, 1000, 10);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|s| (s.index, s.x, s.w))
+                .collect::<Vec<_>>(),
+            vec![(0, 0, 320), (1, 320, 320), (2, 640, 320)]
+        );
+        // 20枚は入りきらない → 8枚（最小12セル）、選択中の15番まで見える
+        let slots = layout_tabs(20, 15, 1000, 10);
+        assert_eq!(slots.len(), 8);
+        assert_eq!(slots.last().unwrap().index, 15);
+        // 当たり判定：本体と「×」、タブの外
+        let slots = layout_tabs(2, 0, 400, 10);
+        assert_eq!(tab_at(&slots, 5, 10), Some((0, false)));
+        assert_eq!(tab_at(&slots, 200 - 10, 10), Some((0, true)));
+        assert_eq!(tab_at(&slots, 210, 10), Some((1, false)));
+        assert_eq!(tab_at(&slots, 450, 10), None);
+    }
+
     #[test]
     fn workspace_capture_requires_observed_location_and_keeps_distinct_cwds() {
         use crate::workspace_sets::SavedNode;
@@ -1762,6 +1883,11 @@ pub struct Multiplexer {
     viewport: Viewport,
     status_view: TerminalView,
     status_signature: String,
+    /// タブバーに並んでいるタブの位置（クリック・ホバーの判定用）。
+    tab_slots: Vec<TabSlot>,
+    /// マウスが乗っているタブ（ホバー表示用）と、その「×」の上か。
+    hover_tab: Option<usize>,
+    hover_close: bool,
     task_summary: Option<crate::task_link::TaskSummary>,
     #[cfg(unix)]
     open_socket: Option<crate::task_link::OpenSocket>,
@@ -1856,6 +1982,9 @@ impl Multiplexer {
             viewport,
             status_view,
             status_signature: String::new(),
+            tab_slots: Vec::new(),
+            hover_tab: None,
+            hover_close: false,
             task_summary: Some(crate::task_link::TaskSummary::from_config(
                 &crate::TOYTERM_CONFIG.task_file,
             )),
@@ -2197,16 +2326,54 @@ impl Multiplexer {
         if self.tabs.len() <= 1 && self.task_counts().is_none() {
             0
         } else {
-            self.status_view.cell_size().h
+            self.bar_px()
         }
     }
 
-    /// 端末群が使える領域（タブバーの下）。
-    fn content_viewport(&self) -> Viewport {
-        let h = self.status_bar_height();
+    /// タブバーの高さ（px）。文字の行より広く取り、文字は上下中央に置く。
+    fn bar_px(&self) -> u32 {
+        let h = self.status_view.cell_size().h;
+        (h * 2).max(h + 12)
+    }
+
+    /// タブバーの領域（表示していなくても位置は決まる）。
+    fn bar_viewport(&self) -> Viewport {
+        let h = self.bar_px();
+        let y = if crate::TOYTERM_CONFIG.tab_bar_bottom() {
+            self.viewport.h.saturating_sub(h)
+        } else {
+            0
+        };
         Viewport {
             x: 0,
-            y: h,
+            y,
+            w: self.viewport.w,
+            h,
+        }
+    }
+
+    /// マウスがタブバーの上にあるか。
+    fn cursor_in_bar(&self) -> bool {
+        let h = self.status_bar_height();
+        if h == 0 {
+            return false;
+        }
+        let bar = self.bar_viewport();
+        let y = self.cursor_pos.y;
+        y >= bar.y as f64 && y < (bar.y + bar.h) as f64
+    }
+
+    /// 端末群が使える領域（タブバーを除いた残り）。
+    fn content_viewport(&self) -> Viewport {
+        let h = self.status_bar_height();
+        let top = if crate::TOYTERM_CONFIG.tab_bar_bottom() {
+            0
+        } else {
+            h
+        };
+        Viewport {
+            x: 0,
+            y: top,
             w: self.viewport.w,
             h: self.viewport.h.saturating_sub(h),
         }
@@ -2214,12 +2381,7 @@ impl Multiplexer {
 
     /// 全タブのビューポートを再計算する（タブバーの有無が変わったときも）。
     fn refresh_layout(&mut self) {
-        let bar = Viewport {
-            x: 0,
-            y: 0,
-            w: self.viewport.w,
-            h: self.status_view.cell_size().h,
-        };
+        let bar = self.bar_viewport();
         self.status_view.set_viewport(bar);
 
         let content = self.content_viewport();
@@ -2254,12 +2416,10 @@ impl Multiplexer {
         }
         let counts = self.task_counts();
         if self.tabs.len() <= 1 && counts.is_none() {
+            self.tab_slots.clear();
             return;
         }
 
-        const BAR_BG: Color = Color::Background;
-        let cell = self.status_view.cell_size();
-        let cols = (self.viewport.w / cell.w).max(1) as usize;
         let mut titles = Vec::new();
         let mut marks = Vec::new();
         let mut badges = Vec::new();
@@ -2281,130 +2441,201 @@ impl Multiplexer {
                 .for_each_leaf_ref(&mut |w| kinds.push(w.activity().kind));
             badges.push(tab_badge(&kinds));
         }
+        let bar = self.bar_viewport();
         let signature = format!(
-            "{cols}:{}:{titles:?}:{counts:?}:{badges:?}:{marks:?}",
-            self.focus
+            "{}x{}:{}:{titles:?}:{counts:?}:{badges:?}:{marks:?}:{:?}:{}",
+            bar.w, bar.h, self.focus, self.hover_tab, self.hover_close
         );
         if signature == self.status_signature {
             return;
         }
         self.status_signature = signature;
-        let visible = (cols / 4).max(1).min(self.tabs.len());
-        let first = if self.tabs.len() > visible {
-            self.focus.saturating_sub(visible - 1)
-        } else {
-            0
-        };
-        let width = (cols / visible).clamp(1, 26);
-        // 選択中のタブは塗りつぶさず、薄い面＋青い下線で示す。
-        let active_bg = Color::Rgb {
-            rgba: (crate::TOYTERM_CONFIG.color_bright_black & 0xFFFF_FF00) | 0x70,
-        };
-        let mut cells = Vec::new();
-        let mut overlays = Vec::new();
-        for (i, title) in titles.iter().enumerate().skip(first).take(visible) {
-            let active = i == self.focus;
-            let bg = if active { active_bg } else { BAR_BG };
-            let x = (cells.len() as u32 * cell.w) as i32;
-            let badge = badges[i];
-            // 先頭1列は色印の場所、末尾2列は状態バッジの場所。
-            // 記号の表示幅を測って場所を取る（全角の記号でも欠けないように）。
-            let badge_w = match badge {
-                Some((mark, _)) if width >= 8 => 1 + crate::launcher::display_width(mark),
-                _ => 0,
-            };
-            let number = format!("{:02} ", i + 1);
-            let mut tab_cells = column_cells_styled(" ", Color::White, bg, 1.min(width), 0);
-            if width > 1 {
-                tab_cells.extend(column_cells_styled(
-                    &number,
-                    // 細字（Thin）や暗すぎる色はにじんで見えるので使わない。
-                    // 強弱は通常の太さのまま、色の明るさだけで付ける。
-                    if active { Color::Blue } else { Color::White },
-                    bg,
-                    (width - 1).min(3),
-                    0,
-                ));
-            }
-            // 状態バッジはタイトルの直後に置く（右端だと隣のタブの印に見える）。
-            if width > 4 + badge_w {
-                let title_w = crate::launcher::display_width(title).min(width - 4 - badge_w);
-                tab_cells.extend(column_cells_styled(
-                    title,
-                    if active {
-                        Color::BrightWhite
-                    } else {
-                        Color::White
-                    },
-                    bg,
-                    title_w,
-                    if active { 1 } else { 0 },
-                ));
-            }
-            if let Some((mark, color)) = badge.filter(|_| badge_w > 0) {
-                tab_cells.extend(column_cells_styled(" ", color, bg, 1, 0));
-                tab_cells.extend(column_cells_styled(mark, color, bg, badge_w - 1, 0));
-            }
-            tab_cells.resize_with(width, || {
-                crate::launcher::column_cells(" ", Color::White, bg, 1)[0]
-            });
-            if width > 1 {
-                overlays.push((
-                    PixelRect {
-                        x: x + 2,
-                        y: (cell.h / 4) as i32,
-                        w: 3,
-                        h: (cell.h / 2).max(1),
-                    },
-                    marks[i],
-                ));
-            }
-            if active {
-                overlays.push((
-                    PixelRect {
-                        x,
-                        y: cell.h as i32 - 2,
-                        w: width as u32 * cell.w,
-                        h: 2,
-                    },
-                    Color::Blue,
-                ));
-            }
-            cells.extend(tab_cells);
-        }
-        // 右端にタスク集計（gototask）。優先があれば赤で目立たせる。
-        let mut right = Vec::new();
-        if let Some((open, important)) = counts {
-            let rest = format!(" 残{open} ");
-            let imp = format!("優先{important} ");
-            let rest_w = crate::launcher::display_width(&rest);
-            let imp_w = crate::launcher::display_width(&imp);
-            if rest_w + imp_w < cols {
-                right.extend(crate::launcher::column_cells(&rest, Color::White, BAR_BG, rest_w));
-                let color = if important > 0 { Color::Red } else { Color::White };
-                right.extend(crate::launcher::column_cells(&imp, color, BAR_BG, imp_w));
-            }
-        }
-        let left_cols = cols - right.len();
-        cells.truncate(left_cols);
-        // 右端の集計に重なる装飾は切り詰める。
-        let limit = (left_cols as u32 * cell.w) as i32;
-        overlays.retain_mut(|(rect, _)| {
-            rect.w = rect.w.min(limit.saturating_sub(rect.x).max(0) as u32);
-            rect.w > 0
-        });
-        cells.resize_with(left_cols, || {
-            crate::launcher::column_cells(" ", Color::White, BAR_BG, 1)[0]
-        });
-        cells.extend(right);
+        self.draw_tab_bar(titles, marks, badges, counts);
+    }
 
+    /// タブバーを描く（Ghostty 風：幅いっぱいの等分タブ・選択中は角丸の面・間に細い線）。
+    /// 文字はセルの升目に縛られない最上層に置き、バーの上下中央にそろえる。
+    fn draw_tab_bar(
+        &mut self,
+        titles: Vec<String>,
+        marks: Vec<Color>,
+        badges: Vec<Option<(&'static str, Color)>>,
+        counts: Option<(usize, usize)>,
+    ) {
+        use crate::view::{mix_color as mix, rounded_rect, PixelRect, PopupLayer};
+        let config = &crate::TOYTERM_CONFIG;
+        let (fg, bg) = (config.color_foreground, config.color_background);
+        let bar_bg = mix(0x000000FF, bg, 0.18);
+        let active_bg = mix(0xFFFFFFFF, bg, 0.14);
+        let hover_bg = mix(0xFFFFFFFF, bg, 0.07);
+        let line = mix(0xFFFFFFFF, bg, 0.12);
+        let dim = mix(fg, bg, 0.55);
+        let text_dim = mix(fg, bg, 0.78);
+
+        let cell = self.status_view.cell_size();
+        let bar = self.bar_viewport();
+        let (cw, bh) = (cell.w as i32, bar.h as i32);
+        let text_top = (bh - cell.h as i32) / 2;
+        let width = |text: &str| crate::launcher::display_width(text) as i32 * cw;
+
+        let mut layer = PopupLayer::default();
+        layer.rects.push((
+            PixelRect {
+                x: 0,
+                y: 0,
+                w: bar.w,
+                h: bar.h,
+            },
+            bar_bg,
+        ));
+        // 端末との境目に細い線（バーが上なら下端、下なら上端）。
+        let edge_y = if config.tab_bar_bottom() { 0 } else { bh - 1 };
+        layer.rects.push((
+            PixelRect {
+                x: 0,
+                y: edge_y,
+                w: bar.w,
+                h: 1,
+            },
+            line,
+        ));
+
+        // 右端の残タスク集計（gototask）。優先があれば赤。
+        let mut right_w = 0;
+        if let Some((open, important)) = counts {
+            let rest = format!("残{open}");
+            let imp = format!("優先{important}");
+            let total = width(&rest) + cw + width(&imp) + cw * 2;
+            if total < bar.w as i32 / 2 {
+                right_w = total;
+                let x = bar.w as i32 - total + cw;
+                layer
+                    .texts
+                    .push((x, text_top, rest.clone(), text_dim, bar_bg));
+                let color = if important > 0 { Color::Red } else { text_dim };
+                layer
+                    .texts
+                    .push((x + width(&rest) + cw, text_top, imp, color, bar_bg));
+            }
+        }
+
+        let avail = (bar.w as i32 - right_w).max(0) as u32;
+        let slots = if self.tabs.len() > 1 {
+            layout_tabs(self.tabs.len(), self.focus, avail, cell.w)
+        } else {
+            Vec::new()
+        };
+        let pill = |slot: &TabSlot| PixelRect {
+            x: slot.x + 3,
+            y: 4,
+            w: slot.w.saturating_sub(6),
+            h: bar.h.saturating_sub(8),
+        };
+        let radius = (bar.h / 4).clamp(4, 8);
+        for (n, slot) in slots.iter().enumerate() {
+            let i = slot.index;
+            let active = i == self.focus;
+            let hovered = self.hover_tab == Some(i);
+            let face = if active {
+                Some(active_bg)
+            } else if hovered {
+                Some(hover_bg)
+            } else {
+                None
+            };
+            if let Some(face) = face {
+                layer.rects.extend(rounded_rect(pill(slot), radius, face));
+            }
+            // 隣り合う2枚がどちらも面なしのときだけ、間に細い縦線。
+            if let Some(next) = slots.get(n + 1) {
+                let plain = |j: usize| j != self.focus && self.hover_tab != Some(j);
+                if plain(i) && plain(next.index) {
+                    layer.rects.push((
+                        PixelRect {
+                            x: next.x,
+                            y: bh / 4,
+                            w: 1,
+                            h: (bh / 2) as u32,
+                        },
+                        line,
+                    ));
+                }
+            }
+            let text_bg = face.unwrap_or(bar_bg);
+            // プロジェクトの色印（左端の細い縦棒）。
+            layer.rects.extend(rounded_rect(
+                PixelRect {
+                    x: slot.x + 3 + cw / 2 + 2,
+                    y: bh / 2 - (cell.h as i32 * 3 / 10),
+                    w: 3,
+                    h: cell.h * 6 / 10,
+                },
+                1,
+                marks[i],
+            ));
+            // 「×」の分を除いた幅に「01 題名 ▲」を中央寄せで置く。
+            let close = tab_close_box(slot, cell.w).filter(|_| active || hovered);
+            let left = slot.x + cw * 2;
+            let right = close.map_or(slot.x + slot.w as i32 - cw * 2, |(cx, _)| cx - cw / 2);
+            let room = (right - left).max(0);
+            let number = format!("{:02}", i + 1);
+            let badge = badges[i];
+            let badge_w = badge.map_or(0, |(mark, _)| cw + width(mark));
+            let title_room = room - width(&number) - cw - badge_w;
+            let title = fit_title(&titles[i], (title_room / cw).max(0) as usize);
+            let total = width(&number) + cw + width(&title) + badge_w;
+            let mut x = left + ((room - total) / 2).max(0);
+            let number_color = if active { Color::Blue } else { dim };
+            layer
+                .texts
+                .push((x, text_top, number.clone(), number_color, text_bg));
+            x += width(&number) + cw;
+            let title_color = if active { Color::BrightWhite } else { text_dim };
+            layer
+                .texts
+                .push((x, text_top, title.clone(), title_color, text_bg));
+            x += width(&title);
+            if let Some((mark, color)) = badge.filter(|_| title_room > 0) {
+                layer
+                    .texts
+                    .push((x + cw, text_top, mark.to_string(), color, text_bg));
+            }
+            if let Some((cx, size)) = close {
+                let on = hovered && self.hover_close;
+                if on {
+                    let box_h = cell.h + 4;
+                    layer.rects.extend(rounded_rect(
+                        PixelRect {
+                            x: cx,
+                            y: (bh - box_h as i32) / 2,
+                            w: size,
+                            h: box_h,
+                        },
+                        radius.min(5),
+                        mix(0xFFFFFFFF, bg, 0.2),
+                    ));
+                }
+                let color = if on { Color::BrightWhite } else { dim };
+                let glyph_x = cx + (size as i32 - cw) / 2;
+                layer
+                    .texts
+                    .push((glyph_x, text_top, "×".to_string(), color, text_bg));
+            }
+        }
+        self.tab_slots = slots;
+
+        let cols = (bar.w / cell.w.max(1)).max(1) as usize;
         self.status_view.update_contents(|view| {
-            view.bg_color = BAR_BG;
-            view.overlays = overlays;
-            view.lines = vec![Line::from_cells(cells, false)];
+            view.bg_color = Color::Background;
+            view.overlays = Vec::new();
+            view.lines = vec![Line::from_cells(
+                crate::launcher::column_cells(" ", Color::White, Color::Background, cols),
+                false,
+            )];
             view.images = Vec::new();
             view.cursor = None;
             view.selection_range = None;
+            view.popup_layer = Some(layer);
         });
     }
 
@@ -2417,35 +2648,7 @@ impl Multiplexer {
             PhysicalKey::Unidentified(_) => return None,
         };
 
-        match keybindings::lookup(self.modifiers, code)? {
-            ShortcutAction::NewTab => Some(Action::NewTab),
-            ShortcutAction::OpenLauncher => Some(Action::OpenLauncher),
-            ShortcutAction::OpenTaskOverview => Some(Action::OpenTaskOverview),
-            ShortcutAction::OpenTasks => Some(Action::OpenTasks),
-            ShortcutAction::ClosePane => Some(Action::CloseFocused),
-            ShortcutAction::NextTab => Some(Action::NextTab),
-            ShortcutAction::PrevTab => Some(Action::PrevTab),
-            ShortcutAction::SelectTab(index) => Some(Action::SelectTab(index)),
-            ShortcutAction::SplitVertical => Some(Action::SplitVertical),
-            ShortcutAction::SplitHorizontal => Some(Action::SplitHorizontal),
-            ShortcutAction::ToggleSidebar => Some(Action::ToggleSidebar),
-            ShortcutAction::ToggleFollow => Some(Action::ToggleFollow),
-            ShortcutAction::FocusLeft => Some(Action::Focus(Dir::Left)),
-            ShortcutAction::FocusDown => Some(Action::Focus(Dir::Down)),
-            ShortcutAction::FocusUp => Some(Action::Focus(Dir::Up)),
-            ShortcutAction::FocusRight => Some(Action::Focus(Dir::Right)),
-            ShortcutAction::ResizeUp => Some(Action::Resize(Dir::Up)),
-            ShortcutAction::ResizeDown => Some(Action::Resize(Dir::Down)),
-            ShortcutAction::ResizeLeft => Some(Action::Resize(Dir::Left)),
-            ShortcutAction::ResizeRight => Some(Action::Resize(Dir::Right)),
-            ShortcutAction::IncreaseFont => Some(Action::ChangeFont(1)),
-            ShortcutAction::DecreaseFont => Some(Action::ChangeFont(-1)),
-            ShortcutAction::Copy
-            | ShortcutAction::Paste
-            | ShortcutAction::ClearHistory
-            | ShortcutAction::CopyMode
-            | ShortcutAction::LinkHints => None,
-        }
+        shortcut_action(keybindings::lookup(self.modifiers, code)?)
     }
 
     fn handle_action(&mut self, action: Action) {
@@ -3034,6 +3237,70 @@ impl Multiplexer {
         }
     }
 
+    /// 右クリックメニューで選ばれた分割・タブ等の操作を行う。
+    fn handle_menu_request(&mut self) {
+        let Some(request) = self.focused_root().focused_leaf_mut().take_menu_request() else {
+            return;
+        };
+        if let Some(action) = shortcut_action(request) {
+            self.handle_action(action);
+        }
+    }
+
+    /// タブバー上のマウス：押せるタブを明るくし、カーソルを指の形にする。
+    fn update_tab_hover(&mut self) {
+        let in_bar = self.cursor_in_bar();
+        let cell_w = self.status_view.cell_size().w;
+        let hit = in_bar
+            .then(|| tab_at(&self.tab_slots, self.cursor_pos.x as i32, cell_w))
+            .flatten();
+        let hovered = hit.map(|(index, _)| index);
+        if in_bar {
+            self.window.set_cursor_icon(if hovered.is_some() {
+                winit::window::CursorIcon::Pointer
+            } else {
+                winit::window::CursorIcon::Default
+            });
+        }
+        // 「×」は選択中かホバー中のタブにだけ出す。
+        let hover_close = hit.is_some_and(|(_, on_close)| on_close);
+        if hovered != self.hover_tab || hover_close != self.hover_close {
+            let left_bar = self.hover_tab.is_some() && !in_bar;
+            self.hover_tab = hovered;
+            self.hover_close = hover_close;
+            self.update_status_bar();
+            if left_bar {
+                self.focused_root().focused_leaf_mut().refresh_cursor_icon();
+            }
+        }
+    }
+
+    /// タブの「×」を出しているか（選択中かホバー中・幅が足りるとき）。
+    fn close_visible(&self, index: usize) -> bool {
+        index == self.focus || self.hover_tab == Some(index)
+    }
+
+    /// タブを丸ごと閉じる（中の全ペインのシェルを終わらせる）。
+    fn close_tab(&mut self, index: usize) {
+        if index >= self.tabs.len() {
+            return;
+        }
+        if index == self.focus {
+            self.focused_root().focused_leaf_mut().focus_changed(false);
+        }
+        let mut removed = remove_tab(&mut self.tabs, &mut self.focus, index);
+        removed.root.for_each_leaf(&mut |w| w.close_pty());
+        if self.tabs.is_empty() {
+            self.exited = true;
+            return;
+        }
+        self.hover_tab = None;
+        self.hover_close = false;
+        self.focused_root().focused_leaf_mut().focus_changed(true);
+        self.apply_focused_tab_workbench();
+        self.update_status_bar();
+    }
+
     fn handle_clicked_file(&mut self) {
         let Some(path) = self.focused_root().take_clicked_file() else {
             return;
@@ -3439,6 +3706,7 @@ impl Multiplexer {
                             .focused_leaf_mut()
                             .process_window_event(wev);
                         self.handle_clicked_file();
+                        self.handle_menu_request();
                         return;
                     }
                     if let Some(action) = self.parse_shortcut(key) {
@@ -3485,12 +3753,24 @@ impl Multiplexer {
                     self.tabs[focus_tab]
                         .root
                         .for_each_leaf(&mut |w| w.process_window_event(wev));
+                    self.update_tab_hover();
                 }
 
                 WindowEvent::MouseInput {
                     state: ElementState::Pressed,
                     ..
                 } => {
+                    if self.cursor_in_bar() {
+                        let cell_w = self.status_view.cell_size().w;
+                        match tab_at(&self.tab_slots, self.cursor_pos.x as i32, cell_w) {
+                            Some((index, true)) if self.close_visible(index) => {
+                                self.close_tab(index)
+                            }
+                            Some((index, _)) => self.handle_action(Action::SelectTab(index)),
+                            None => {}
+                        }
+                        return;
+                    }
                     if self.sidebar.contains(self.cursor_pos) {
                         self.focus_sidebar();
                         if let Some(request) = self.sidebar.on_click(self.cursor_pos) {
@@ -3533,6 +3813,7 @@ impl Multiplexer {
                         .focused_leaf_mut()
                         .process_window_event(wev);
                     self.handle_clicked_file();
+                    self.handle_menu_request();
                 }
 
                 WindowEvent::MouseWheel { delta, .. } => {
@@ -3605,6 +3886,7 @@ impl Multiplexer {
                             .focused_leaf_mut()
                             .process_window_event(wev);
                         self.handle_clicked_file();
+                        self.handle_menu_request();
                     }
                 }
             },
