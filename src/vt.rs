@@ -2812,6 +2812,23 @@ mod tests {
         assert_eq!(before.rows, after.rows);
     }
 
+    /// Windows の実機テストは同梱 ConPTY（テスト実行ファイルの隣に置く）が前提。
+    /// 無いと OS の ConPTY がスクロールを描き直しに変え、原因の分かりにくい失敗になる。
+    fn require_bundled_conpty() {
+        #[cfg(windows)]
+        {
+            let exe = std::env::current_exe().unwrap();
+            let dir = exe.parent().unwrap();
+            for name in ["conpty.dll", "OpenConsole.exe"] {
+                assert!(
+                    dir.join(name).is_file(),
+                    "{name} not found next to {}; OS ConPTY would replace scrolling with redraws",
+                    exe.display()
+                );
+            }
+        }
+    }
+
     fn verify_nvim_copy_with_mouse_scroll(
         relative_numbers: bool,
         height: usize,
@@ -2821,6 +2838,7 @@ mod tests {
     ) {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
+        require_bundled_conpty();
         let dir = std::env::temp_dir().join(format!(
             "gototerm-nvim-copy-{}-{relative_numbers}-{height}-{number_width}-{ruler}",
             std::process::id()
@@ -2981,6 +2999,7 @@ mod tests {
     fn live_nvim_copy_with_relative_numbers_and_wrapped_rows() {
         use crate::tui_copy::TuiCopy;
         use std::time::{Duration, Instant};
+        require_bundled_conpty();
         let dir = std::env::temp_dir().join(format!("gototerm-nvim-wrap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("body.txt");

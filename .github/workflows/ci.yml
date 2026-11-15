@@ -58,8 +58,18 @@ jobs:
         shell: pwsh
         run: |
           & ./.github/scripts/install-conpty.ps1 -Destination target/release
-          New-Item -ItemType Directory -Force target/debug/deps | Out-Null
-          Copy-Item target/release/conpty.dll, target/release/OpenConsole.exe target/debug/deps
+          # テスト実行ファイルの置き場所は cargo の版で変わる（1.100 で target/debug/deps
+          # から target/debug/build/<pkg>/<hash>/out へ移った）。決め打ちせず cargo に聞く。
+          $exes = cargo test --no-run --message-format=json |
+            ForEach-Object { $_ | ConvertFrom-Json } |
+            Where-Object { $_.reason -eq 'compiler-artifact' -and $_.executable } |
+            ForEach-Object { $_.executable }
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not $exes) { throw 'no test executables reported by cargo' }
+          $exes | Split-Path -Parent | Sort-Object -Unique | ForEach-Object {
+            Copy-Item target/release/conpty.dll, target/release/OpenConsole.exe $_
+            Write-Host "bundled ConPTY copied to $_"
+          }
 
       - name: Test
         run: cargo test
