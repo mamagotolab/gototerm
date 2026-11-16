@@ -503,6 +503,26 @@ color_background = 0x1A1B26B0   # Tokyo Night 背景＋ B0 = 176/255 ≈ 0.69（
 # 目安: FF=不透明 / CC≈0.80 / B0≈0.69 / A0≈0.63 / 80=半分
 ```
 
+### テーマ（Ghostty / Alacritty の配色をそのまま使う）
+
+`theme` に名前かファイルのパスを書くと、他の端末の配色テーマを読み込みます。
+
+```toml
+theme = "Dracula"                               # 名前で探す
+# theme = "~/.config/alacritty/alacritty.toml"  # 今の Alacritty の色をそのまま
+background_opacity = 0.9                        # 背景の不透明度（0.0〜1.0・省略可）
+```
+
+- **読める形式**：Ghostty のテーマ（`palette = 0=#…` の形）と、Alacritty の TOML（`[colors.primary]` `[colors.normal]` `[colors.bright]` `[colors.selection]`）。色以外の行は無視します。
+- **探す場所**（名前で書いたとき・上から順）：
+  - gototerm の設定フォルダの `themes/`（Linux：`~/.config/gototerm/themes/`、Windows：`%APPDATA%\gototerm\themes\`）
+  - Linux のみ：`~/.config/ghostty/themes/`、`/usr/share/ghostty/themes/`（Ghostty を入れていれば数百種類がそのまま使えます）
+  - ファイル名は `名前`・`名前.toml`・`名前.conf` の順に探します。
+- **テーマ集**：[iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes) の `ghostty/` か `alacritty/` から、好きなファイルを `themes/` に置きます。
+- **優先順**：既定 → テーマ → `config.toml` に書いた `color_*`。テーマの一部の色だけ変えたいときは、その色だけ書きます。
+- **背景の透け具合**：テーマの背景は不透明なので、既定の透け具合（`B0`）を引き継ぎます。変えるときは `background_opacity` を書きます。
+- 見つからない・読めないときは既定の配色のまま起動し、ログに警告を残します。設定の変更は再起動で反映されます。
+
 ### 配色（前景・選択・16 色）
 
 既定の配色は **[Tokyo Night](https://github.com/folke/tokyonight.nvim)（Night バリアント）** です。

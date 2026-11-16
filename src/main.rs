@@ -20,10 +20,6 @@ fn main() {
         }
     }
 
-    // Make sure that configuration errors are detected earlier
-    lazy_static::initialize(&gototerm::TOYTERM_CONFIG);
-    gototerm::initialize_keybindings();
-
     // Setup env_logger
     let our_logs = concat!(module_path!(), "=debug");
     let env = env_logger::Env::default().default_filter_or(our_logs);
@@ -37,6 +33,11 @@ fn main() {
         builder.target(env_logger::Target::Pipe(Box::new(target)));
     }
     builder.init();
+
+    // Make sure that configuration errors are detected earlier
+    // （ログの準備の後に読む：theme が見つからない等の警告をログに残すため）
+    lazy_static::initialize(&gototerm::TOYTERM_CONFIG);
+    gototerm::initialize_keybindings();
 
     let event_loop = winit::event_loop::EventLoopBuilder::new()
         .build()

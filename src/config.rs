@@ -65,6 +65,14 @@ pub struct Config {
     #[serde(default)]
     pub open_socket: bool,
 
+    // 他の端末の配色テーマ（名前かファイルのパス）。空なら使わない。
+    // ここで書いた color_* はテーマより優先される。
+    #[serde(default)]
+    pub theme: String,
+    // 背景の不透明度（0.0〜1.0）。指定するとテーマ・color_background のアルファを置き換える。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_opacity: Option<f64>,
+
     // RRGGBBAA
     pub color_background: u32,
     pub color_foreground: u32,
@@ -175,6 +183,8 @@ impl Default for Config {
             visual_bell: true,
             post_effect: default_post_effect(),
             open_socket: false,
+            theme: String::new(),
+            background_opacity: None,
 
             scroll_bar_width: 5,
             // 既定の配色は Tokyo Night（Night バリアント）。
@@ -261,6 +271,10 @@ fn default_agents() -> Vec<AgentDef> {
 }
 
 pub fn build() -> Config {
+    build_from(find_config_file())
+}
+
+fn build_from(config_path: Option<PathBuf>) -> Config {
     let mut builder = ::config::Config::builder();
 
     // default config
@@ -268,16 +282,79 @@ pub fn build() -> Config {
     let default_source = ::config::Config::try_from(&default_config).unwrap();
     builder = builder.add_source(default_source);
 
+    // theme：既定とユーザー設定の間に挟む（ユーザーが書いた color_* が勝つ）
+    if let Some(path) = &config_path {
+        if let Some(theme) = theme_source(path, default_config.color_background) {
+            builder = builder.add_source(theme);
+        }
+    }
+
     // user config
-    if let Some(config_path) = find_config_file() {
+    if let Some(config_path) = config_path {
         builder = builder.add_source(config::File::from(config_path).required(false));
     }
 
-    builder
+    let mut config: Config = builder
         .build()
         .unwrap()
         .try_deserialize()
-        .expect("Failed to build config")
+        .expect("Failed to build config");
+    if let Some(opacity) = config.background_opacity {
+        config.color_background = with_opacity(config.color_background, opacity);
+    }
+    config
+}
+
+/// ユーザー設定の `theme` を読み、テーマの色を `color_* = 0x…` の TOML 片にする。
+/// テーマの背景は不透明なので、アルファは既定の背景のもの（半透明）を引き継ぐ。
+fn theme_source(
+    config_path: &std::path::Path,
+    default_background: u32,
+) -> Option<config::File<config::FileSourceString, config::FileFormat>> {
+    let name = ::config::Config::builder()
+        .add_source(config::File::from(config_path.to_path_buf()).required(false))
+        .build()
+        .ok()?
+        .get_string("theme")
+        .ok()?;
+    if name.trim().is_empty() {
+        return None;
+    }
+    let Some(path) = crate::theme::resolve(&name, config_path.parent()) else {
+        log::warn!("theme {name:?} が見つかりません（themes フォルダかパスを確認してください）");
+        return None;
+    };
+    let text = match std::fs::read(&path) {
+        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(error) => {
+            log::warn!("theme {} を読めません: {error}", path.display());
+            return None;
+        }
+    };
+    let colors = crate::theme::parse(&text);
+    if colors.is_empty() {
+        log::warn!("theme {} に読める色がありません", path.display());
+        return None;
+    }
+    log::info!("theme {} を読み込みました（{}色）", path.display(), colors.len());
+    let toml = colors
+        .iter()
+        .map(|(key, rgba)| {
+            let rgba = if key == "color_background" {
+                (rgba & 0xFFFF_FF00) | (default_background & 0xFF)
+            } else {
+                *rgba
+            };
+            format!("{key} = 0x{rgba:08X}\n")
+        })
+        .collect::<String>();
+    Some(config::File::from_str(&toml, config::FileFormat::Toml))
+}
+
+/// 0xRRGGBBAA のアルファを不透明度（0.0〜1.0）で置き換える。
+fn with_opacity(rgba: u32, opacity: f64) -> u32 {
+    let alpha = (opacity.clamp(0.0, 1.0) * 255.0).round() as u32;
+    (rgba & 0xFFFF_FF00) | alpha
 }
 
 fn default_tab_bar_position() -> String {
@@ -435,5 +512,31 @@ mod tests {
             resolve_file_open(&[], None),
             OpenMethod::SystemDefault
         ));
+    }
+
+    #[test]
+    fn theme_sits_between_defaults_and_user_colors() {
+        let dir = std::env::temp_dir().join(format!("gototerm-config-theme-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("themes")).unwrap();
+        std::fs::write(
+            dir.join("themes").join("Sample"),
+            "palette = 1=#112233\npalette = 2=#445566\nbackground = #000000\n",
+        )
+        .unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "theme = \"Sample\"\ncolor_green = 0xABCDEFFF\n").unwrap();
+        let config = super::build_from(Some(path.clone()));
+        assert_eq!(config.color_red, 0x112233FF); // テーマ
+        assert_eq!(config.color_green, 0xABCDEFFF); // ユーザー設定が勝つ
+        assert_eq!(config.color_background, 0x000000B0); // 既定の透け具合を引き継ぐ
+        assert_eq!(config.color_blue, super::Config::default().color_blue); // テーマに無い色は既定
+
+        std::fs::write(&path, "theme = \"Sample\"\nbackground_opacity = 1.0\n").unwrap();
+        assert_eq!(super::build_from(Some(path.clone())).color_background, 0x000000FF);
+
+        std::fs::write(&path, "theme = \"missing-theme-xyz\"\n").unwrap();
+        let config = super::build_from(Some(path));
+        assert_eq!(config.color_red, super::Config::default().color_red);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

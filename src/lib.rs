@@ -24,6 +24,7 @@ mod task_activity;
 mod task_link;
 mod task_overview;
 mod terminal;
+mod theme;
 mod timeline;
 mod tui_copy;
 mod utils;
